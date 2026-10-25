@@ -138,7 +138,7 @@ int64_t hip_custom_communicator_all_reduce(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& weight,
@@ -156,7 +156,7 @@ int64_t hip_custom_communicator_all_reduce_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& residual,
@@ -176,7 +176,7 @@ int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
@@ -202,7 +202,7 @@ int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& weight,
@@ -220,7 +220,7 @@ int64_t hip_custom_communicator_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& residual,
@@ -240,7 +240,7 @@ int64_t hip_custom_communicator_add_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
@@ -266,4 +266,4 @@ int64_t hip_custom_communicator_add_attn_res_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization);
+    const std::string& quantization, int64_t pack_bytes);

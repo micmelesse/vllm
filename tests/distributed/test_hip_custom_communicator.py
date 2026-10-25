@@ -88,6 +88,10 @@ WIDTHS: dict[Op, tuple[int, ...]] = {
     "all_reduce_add_rms_norm": (HIDDEN, LATENT),
     "all_reduce_add_attn_res_rms_norm": (HIDDEN,),
 }
+# WIDTHS NOT WHOLE 16-BYTE PACKS (bf16): 7004 whole 8-byte packs, 3585 whole 2-byte
+# packs alone; a build at a pack wider than the row's refuses it by name (row_not_packs),
+# one at the row's pack takes it.
+ODD_WIDTHS = (7004, 3585)
 # AttnRes layers as Kimi-K3 runs them, (has_prefix, num_blocks, write_index): one
 # that updates the prefix, and a block-write layer where the sum starts it.
 AttnResLayer = tuple[bool, int, int]
@@ -492,6 +496,7 @@ def _call(
                     tile_n=norm_config.tile_n,
                     tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
+                    pack_bytes=norm_config.pack_bytes,
                 )
             ]
         if op == "all_reduce_add_rms_norm":
@@ -515,6 +520,7 @@ def _call(
                     tile_n=norm_config.tile_n,
                     tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
+                    pack_bytes=norm_config.pack_bytes,
                 )
             )
         assert args.blocks is not None
@@ -543,6 +549,7 @@ def _call(
             tile_n=norm_config.tile_n,
             tile_k=norm_config.tile_k,
             quantization=norm_config.quantization,
+            pack_bytes=norm_config.pack_bytes,
         )
         return [out, prefix, args.blocks]
     if forcing is None:
@@ -589,6 +596,7 @@ def _call(
                 tile_n=config.tile_n,
                 tile_k=config.tile_k,
                 quantization=config.quantization,
+                pack_bytes=config.pack_bytes,
             )
         ]
     if op == "all_reduce_rms_norm":
@@ -611,6 +619,7 @@ def _call(
                 tile_n=config.tile_n,
                 tile_k=config.tile_k,
                 quantization=config.quantization,
+                pack_bytes=config.pack_bytes,
             )
         ]
     if op == "all_reduce_add_rms_norm":
@@ -634,6 +643,7 @@ def _call(
                 tile_n=config.tile_n,
                 tile_k=config.tile_k,
                 quantization=config.quantization,
+                pack_bytes=config.pack_bytes,
             )
         )
     assert args.blocks is not None
@@ -662,6 +672,7 @@ def _call(
         tile_n=config.tile_n,
         tile_k=config.tile_k,
         quantization=config.quantization,
+        pack_bytes=config.pack_bytes,
     )
     return [out, prefix, args.blocks]
 
@@ -753,6 +764,7 @@ def _forced(
         tile_n=int(build["tile_n"]),
         tile_k=int(build["tile_k"]),
         quantization=quantization,
+        pack_bytes=int(build["pack_bytes"]),
     )
 
 
@@ -989,6 +1001,7 @@ def _built_configs(kernel: str) -> list[Config]:
             tile_n=int(b["tile_n"]),
             tile_k=int(b["tile_k"]),
             quantization=cast(Quantization, b["quantization"]),
+            pack_bytes=int(b["pack_bytes"]),
         )
         for b in build_info().templates[kernel].builds
     ]
@@ -1016,7 +1029,7 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
                         comm, rank, op, Variant(kernel, config.algorithm), shape, config
                     )
             continue
-        for hidden in WIDTHS[op]:
+        for hidden in (*WIDTHS[op], *ODD_WIDTHS):
             for rows in (1, 33):
                 ran = _eager(
                     comm, rank, op, rows, hidden, torch.bfloat16, forcing, layer, rows
@@ -1571,7 +1584,7 @@ def test_the_builds_are_the_tables_configs() -> None:
 
     table = json.loads(_TABLE.read_text())["gfx950"]
     fields = ("algorithm", "block_x", "block_y", "block_z", "waves_per_eu")
-    fields += ("tile_m", "tile_n", "tile_k", "quantization")
+    fields += ("tile_m", "tile_n", "tile_k", "quantization", "pack_bytes")
     want: dict[str, list[dict[str, int | str]]] = {}
     for c in table["configs"]:
         b = {f: c[f] for f in fields}

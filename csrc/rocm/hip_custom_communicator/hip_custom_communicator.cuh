@@ -714,8 +714,9 @@ enum class Error : int {
   lds_too_large = 35,
   scratch_too_large = 36,
   unfenced_too_small = 37,
+  pack_out_of_range = 38,
 };
-constexpr int kNumErrors = 38;
+constexpr int kNumErrors = 39;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -732,7 +733,8 @@ constexpr const char* to_string(Error e) {
     case Error::world_not_built:
       return "world_not_built: the world size is not 2, 4 or 8";
     case Error::row_not_packs:
-      return "row_not_packs: the row is not whole 16-byte packs";
+      return "row_not_packs: the row is not whole packs of the config's pack_bytes (a "
+             "build at a narrower pack takes it)";
     case Error::template_not_this_ops:
       return "template_not_this_ops: the forced template is not this op's";
     case Error::row_too_wide:
@@ -789,8 +791,8 @@ constexpr const char* to_string(Error e) {
       return "inner_stride_not_one: a buffer's innermost stride is not 1 (the "
              "loads are packs)";
     case Error::row_stride_not_packs:
-      return "row_stride_not_packs: a buffer's row stride is not whole 16-byte "
-             "packs";
+      return "row_stride_not_packs: a buffer's row stride is not whole packs of the "
+             "config's pack_bytes (a build at a narrower pack takes it)";
     case Error::row_narrower_than_world:
       return "row_narrower_than_world: a two-shot row has fewer packs than "
              "ranks, so a rank's "
@@ -822,6 +824,9 @@ constexpr const char* to_string(Error e) {
       return "unfenced_too_small: a pushed one-shot's tile does not fit the unfenced "
              "region: a row of it past a slot's kUnfencedSlotBytes of payload, or its "
              "grid's rows past a bank's kUnfencedBlocks";
+    case Error::pack_out_of_range:
+      return "pack_out_of_range: a config's pack_bytes is not 2, 4, 8 or 16 (a load the "
+             "hardware has, up to its widest), or is less than an element of the dtype";
   }
   return "unknown";
 }
@@ -894,7 +899,10 @@ constexpr bool x_alone(const Dim3& d) { return d.y == 1 && d.z == 1; }
 // the reduced dimension a step (AttnRes's sources a step); `quantization`, what
 // crosses the links (common.cuh's QUANTIZATION): a two-shot's build is listed
 // as it is and moving INT4 (two configs of the table), forced like any field or
-// named by a tuned point. One type an op, so a config
+// named by a tuned point; `pack_bytes`, a pack's bytes, the unit every load, sum and store moves
+// (PACK_BYTES: 16, the widest load, or 8, 4 or 2, a row's that is not whole wider packs, so
+// every row has a build whose loads are aligned: PyTorch's and vLLM's vector width by alignment,
+// tuned here like the tile). One type an op, so a config
 // cannot cross ops, though three hold the same fields. all_reduce: a tile a
 // work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
@@ -904,6 +912,7 @@ struct AllReduceBuildConfig {
   int tile_m;
   int tile_n;
   int quantization = Quantization::exact;  // a Quantization
+  int pack_bytes = kBuild.memory.pack_bytes;  // a pack's bytes (PACK_BYTES)
   bool operator==(const AllReduceBuildConfig&) const = default;
 };
 // all_reduce_rms_norm.
@@ -914,6 +923,7 @@ struct AllReduceRmsNormBuildConfig {
   int tile_m;
   int tile_n;
   int quantization = Quantization::exact;  // a Quantization
+  int pack_bytes = kBuild.memory.pack_bytes;  // a pack's bytes (PACK_BYTES)
   bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_rms_norm.
@@ -924,6 +934,7 @@ struct AllReduceAddRmsNormBuildConfig {
   int tile_m;
   int tile_n;
   int quantization = Quantization::exact;  // a Quantization
+  int pack_bytes = kBuild.memory.pack_bytes;  // a pack's bytes (PACK_BYTES)
   bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
@@ -935,6 +946,7 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_n;
   int tile_k;
   int quantization = Quantization::exact;  // a Quantization
+  int pack_bytes = kBuild.memory.pack_bytes;  // a pack's bytes (PACK_BYTES)
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 using BuildConfig =
@@ -976,6 +988,17 @@ constexpr int tile_n_of(const BuildConfig& b) {
 constexpr int quantization_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.quantization; }, b);
 }
+constexpr int pack_bytes_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.pack_bytes; }, b);
+}
+// WHAT A BUILD'S INSTANCE IS COMPILED MOVING: its quantization, but an INT4 build at a pack
+// narrower than the widest compiles its exact body (INT4's word is a pack of 8 values,
+// common.cuh's QUANTIZATION), which never runs: the call is refused by name
+// (quantization_not_supported), as an INT4 one-shot is. builds.py's instances alike.
+template <typename B>
+constexpr int compiled_quantization(const B& b) {
+  return b.pack_bytes == kBuild.memory.pack_bytes ? b.quantization : Quantization::exact;
+}
 // The same build, moving `q` across the links.
 constexpr BuildConfig quantized(BuildConfig b, int q) {
   std::visit([q](auto& f) { f.quantization = q; }, b);
@@ -983,9 +1006,10 @@ constexpr BuildConfig quantized(BuildConfig b, int q) {
 }
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
-// A row of `elems` of `dtype` in 16-byte packs.
-constexpr int64_t packs_of(int64_t elems, DType dtype) {
-  return elems * elem_bytes(dtype) / kBuild.memory.pack_bytes;
+// A row of `elems` of `dtype` in packs of `pack` bytes, the last short where the row is not
+// whole packs (a build whose pack does not divide a call's row is refused, row_not_packs).
+constexpr int64_t packs_of(int64_t elems, DType dtype, int64_t pack) {
+  return (elems * elem_bytes(dtype) + pack - 1) / pack;
 }
 
 }  // namespace hip_custom_communicator
@@ -2824,7 +2848,7 @@ inline std::optional<Template> template_named(std::string_view name) {
 // no K), the quantization exact or int4. Each limit is the hardware's (STANDARDS 3.2).
 inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, Dim3 grid,
                                           Dim3 block, int waves_per_eu, int tile_m, int tile_n,
-                                          int tile_k, int quantization) {
+                                          int tile_k, int quantization, int pack_bytes) {
   if (op_of(fn) != o || !has_algorithm(fn, algorithm)) return Error::no_such_template;
   if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
@@ -2837,17 +2861,22 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
   const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm ||
                      o == OpType::add_attn_res_rms_norm;
   if (!has_k && tile_k != 1) return Error::field_not_this_templates;
+  // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest); an element's at least is
+  // the call's (refused): the dtype is not known here.
+  if (pack_bytes < 2 || pack_bytes > kBuild.memory.pack_bytes ||
+      (pack_bytes & (pack_bytes - 1)) != 0)
+    return Error::pack_out_of_range;
   BuildConfig b = AllReduceBuildConfig{algorithm, block, waves_per_eu, tile_m, tile_n,
-                                       quantization};
+                                       quantization, pack_bytes};
   if (o == OpType::all_reduce_rms_norm || o == OpType::rms_norm)
     b = AllReduceRmsNormBuildConfig{algorithm, block, waves_per_eu, tile_m, tile_n,
-                                    quantization};
+                                    quantization, pack_bytes};
   if (o == OpType::all_reduce_add_rms_norm || o == OpType::add_rms_norm)
     b = AllReduceAddRmsNormBuildConfig{algorithm, block, waves_per_eu, tile_m, tile_n,
-                                       quantization};
+                                       quantization, pack_bytes};
   if (has_k)
     b = AllReduceAddAttnResRmsNormBuildConfig{algorithm, block, waves_per_eu, tile_m,
-                                              tile_n, tile_k, quantization};
+                                              tile_n, tile_k, quantization, pack_bytes};
   return Chosen{fn, {b, {grid}}};
 }
 
@@ -2862,32 +2891,33 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
 // of what the partials holds): the plain two-shot its slice of every row; a
 // column two-shot the whole reduced tensor (each rank's columns at their
 // place); a row two-shot its rank's rows, twice where it leaves two results
-// (out and the residual). A one-shot reads the inputs and keeps nothing. THE
-// ADD-RMSNORM ROW TWO-SHOT's rows each carry their scale in a pack before the
-// row (kernels/all_reduce_add_rms_norm.cuh, its exact body: a row with its
-// scale, one buffer), a pack a row more.
-constexpr int64_t kScaleSlotPacks = 1;
+// (out and the residual). A one-shot reads the inputs and keeps nothing; `packs` a
+// row's in packs of `pack` bytes (the build's). THE ADD-RMSNORM ROW TWO-SHOT's rows each
+// carry their scale in a slot of kScaleSlotBytes before the row (common.cuh;
+// kernels/all_reduce_add_rms_norm.cuh, its exact body: a row with its scale, one
+// buffer), its row whole kScaleSlotBytes so the next row's scale is aligned
+// (scale_slot_row).
 constexpr int64_t partials_need(Template t, int algorithm, int64_t m, int64_t packs,
-                                int world) {
+                                int world, int64_t pack) {
   if (!is_two_shot(algorithm)) return 0;
   if (t == Template::all_reduce)
-    return m * ((packs + world - 1) / world) * kBuild.memory.pack_bytes;
-  if (slices_columns(t, algorithm)) return m * packs * kBuild.memory.pack_bytes;
-  const int64_t row_packs =
+    return m * ((packs + world - 1) / world) * pack;
+  if (slices_columns(t, algorithm)) return m * packs * pack;
+  const int64_t row_bytes =
       t == Template::all_reduce_add_rms_norm && !is_push(algorithm)
-          ? packs + kScaleSlotPacks
-          : packs;
-  return (m + world - 1) / world * row_packs * kBuild.memory.pack_bytes;
+          ? scale_slot_row(packs * pack) + kScaleSlotBytes
+          : packs * pack;
+  return (m + world - 1) / world * row_bytes;
 }
 
 // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its
-// rows starting on whole packs ({stride_m, stride_n} a buffer, in elements of
-// `dtype`; a vector's stride_m 0).
+// rows starting on whole packs of `pack` bytes, the build's ({stride_m, stride_n} a
+// buffer, in elements of `dtype`; a vector's stride_m 0).
 inline std::optional<Error> layout_refused(
-    DType dtype, std::initializer_list<std::pair<int64_t, int64_t>> strides) {
+    DType dtype, int64_t pack, std::initializer_list<std::pair<int64_t, int64_t>> strides) {
   for (const auto& [m, n] : strides) {
     if (n != 1) return Error::inner_stride_not_one;
-    if (m * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0)
+    if (m * elem_bytes(dtype) % pack != 0)
       return Error::row_stride_not_packs;
   }
   return std::nullopt;
@@ -2905,14 +2935,20 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (h && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (own_error) return own_error;
-  if (n * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0)
-    return Error::row_not_packs;
+  // THE BUILD'S PACK: at least an element, and whole packs a row (an aligned load of the
+  // pack's width: a row that is not whole packs starts the next off them; a narrower
+  // build's takes it).
+  const int64_t pack = pack_bytes_of(c.build);
+  if (pack < elem_bytes(dtype)) return Error::pack_out_of_range;
+  if (n * elem_bytes(dtype) % pack != 0) return Error::row_not_packs;
   // INT4 ON A ONE-SHOT, which reads its peers' inputs as they are: named before
-  // the build lookup, which lists no such build.
+  // the build lookup, which lists no such build; INT4 AT A NARROWER PACK than the
+  // widest: the format's word is a pack of 8 values (common.cuh's QUANTIZATION).
   const bool int4 = quantization_of(c.build) == Quantization::int4;
   const int algorithm = algorithm_of(c.build);
   if (int4 && (is_one_shot(algorithm) || algorithm == Algorithm::rows ||
-               (fn == Template::all_reduce && !is_push(algorithm))))
+               (fn == Template::all_reduce && !is_push(algorithm)) ||
+               pack != kBuild.memory.pack_bytes))
     return Error::quantization_not_supported;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its block, its
   // waves, its tile.
@@ -2923,14 +2959,18 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
     return Error::waves_not_built;
   if (!built(fn, c.build)) return Error::tile_not_built;
   // A PUSHED ONE-SHOT IN THE UNFENCED REGION, its capacity (not a build's rule: any tile and
-  // grid is built): a row of a block's tile in a slot of kUnfencedSlotBytes of payload, a
-  // block's TILE_M rows of a bank's kUnfencedBlocks.
+  // grid is built): a row of a block's tile in a slot's lines, a line a pack of at most
+  // kLinePayloadBytes (a narrower pack its line alone: kernels/all_reduce.cuh), a slot
+  // kUnfencedSlotBytes / kLinePayloadBytes lines; a block's TILE_M rows of a bank's
+  // kUnfencedBlocks.
+  const int64_t line_pack = pack < kLinePayloadBytes ? pack : kLinePayloadBytes;
   if (algorithm == Algorithm::one_shot_push &&
-      (tile_n_of(c.build) * elem_bytes(dtype) > kUnfencedSlotBytes ||
+      ((tile_n_of(c.build) * elem_bytes(dtype) + line_pack - 1) / line_pack >
+           kUnfencedSlotBytes / kLinePayloadBytes ||
        int64_t{c.launch.grid.x} * tile_m_of(c.build) > kUnfencedBlocks))
     return Error::unfenced_too_small;
   if (!h) return std::nullopt;
-  const int64_t packs = packs_of(n, dtype);
+  const int64_t packs = packs_of(n, dtype, pack);
   // An INT4 payload lies in the region that holds it exact (common.cuh's
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
   // most one row of the partials's elements (its every view's bound); the flat walk's
@@ -2943,7 +2983,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
                                                      Quantization::int4, m, world),
                                          row)) > h->staging_bytes())
     return Error::staging_too_small;
-  const int64_t partials = partials_need(fn, algorithm, m, packs, world);
+  const int64_t partials = partials_need(fn, algorithm, m, packs, world, pack);
   if (int4 && (flat ? int4_payload_bytes(1, share)
                : int4_groups_a_thread(fn, algorithm)
                    ? int4_payload_bytes((m + world - 1) / world, row)
@@ -3024,8 +3064,8 @@ struct Config {
   int64_t unfenced_size_n{};
   int64_t scales_stride_m{};
   int64_t scales_size_m{};
-  // THE MACHINE, the host's facts and no call's (HARDWARE, BUILD): a wave's lanes and a pack's
-  // bytes, handed to every kernel as its WAVE_SIZE and PACK_BYTES (kernel_pointer and each launch).
+  // THE MACHINE'S WAVE, the host's fact and no call's (HARDWARE), handed to every kernel as its
+  // WAVE_SIZE; the BUILD'S PACK, its bytes, as its PACK_BYTES (kernel_pointer and each launch).
   int wave_size{kTarget.wave_size};
   int pack_bytes{kBuild.memory.pack_bytes};
 };
@@ -3145,6 +3185,7 @@ void with_config_build(const Config& config, F& f) {
           b.tile_m = config.tile_m;
           b.tile_n = config.tile_n;
           b.quantization = config.quantization;
+          b.pack_bytes = config.pack_bytes;
           if constexpr (requires { b.tile_k; }) b.tile_k = config.tile_k;
           return b;
         }(), [&](auto b) {
@@ -3164,7 +3205,8 @@ void with_config_build(const Config& config, F& f) {
                 if constexpr (requires { B.tile_k; }) c.tile_k = B.tile_k;
                 c.block = B.block;
                 c.waves_per_eu = B.waves_per_eu;
-                c.quantization = B.quantization;
+                c.quantization = compiled_quantization(B);
+                c.pack_bytes = B.pack_bytes;
                 c.contiguous = CONTIGUOUS;
                 c.chunked = CHUNKED;
                 c.tail = TAIL;
@@ -3175,7 +3217,7 @@ void with_config_build(const Config& config, F& f) {
             // THE INSTANCES a build has: contiguous or strided (the plain two-shots), chunked or not
             // (the norms and AttnRes), with a tail or not (the INT4 two-shots).
             const auto tailed = [&]<bool CONTIGUOUS, bool CHUNKED>() {
-              if constexpr (B.quantization == Quantization::int4 &&
+              if constexpr (compiled_quantization(B) == Quantization::int4 &&
                             is_two_shot(B.algorithm)) {
                 if (config.tail) layout.template operator()<CONTIGUOUS, CHUNKED, true>();
                 else layout.template operator()<CONTIGUOUS, CHUNKED, false>();
@@ -3280,7 +3322,7 @@ inline std::variant<Config, Error> all_reduce_config(
   // row of its slice a row). Rounding up costs a two-shot at most one pack a
   // slot, so the band one row less than the inputs' rows always fits.
   const int64_t row_bytes = n * elem_bytes(dtype);
-  const int64_t pack = kBuild.memory.pack_bytes;
+  const int64_t pack = a.pack_bytes;  // the build's
   const int64_t packs = n * elem_bytes(dtype) / pack;
   const int64_t slice_bytes = (packs + world - 1) / world * pack;
   const auto slot_packs = [&](int64_t rows) {
@@ -3404,8 +3446,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, algorithm, m,
-                           n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
-                           world) /
+                           n * elem_bytes(dtype) / pack_bytes_of(c.build), world,
+                           pack_bytes_of(c.build)) /
                   (n * elem_bytes(dtype))
             : 0;
   Config config{};
@@ -3483,13 +3525,15 @@ all_reduce_add_rms_norm_config(
   // the scales region.
   const bool scale_slot = algorithm == Algorithm::two_shot_pull &&
                           r.quantization == Quantization::exact;
-  const int64_t slot = scale_slot ? kScaleSlotPacks * kBuild.memory.pack_bytes / elem_bytes(dtype) : 0;
-  const int64_t partials_stride_m = payload_row(fn, algorithm, r.quantization, n) + slot;
+  // The scale slot's row whole slots (scale_slot_row), so every row's scale is aligned at any pack.
+  const int64_t slot = scale_slot ? kScaleSlotBytes / elem_bytes(dtype) : 0;
+  const int64_t row = payload_row(fn, algorithm, r.quantization, n);
+  const int64_t partials_stride_m =
+      scale_slot ? scale_slot_row(row * elem_bytes(dtype)) / elem_bytes(dtype) + slot : row;
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, algorithm, m,
-                           n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
-                           world) /
-                  ((n + slot) * elem_bytes(dtype))
+                           n * elem_bytes(dtype) / r.pack_bytes, world, r.pack_bytes) /
+                  (partials_stride_m * elem_bytes(dtype))
             : 0;
   Config config{};
   config.shared_memory_bytes = 0;
@@ -3580,8 +3624,8 @@ all_reduce_add_attn_res_rms_norm_config(
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, algorithm, m,
-                           n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
-                           world) /
+                           n * elem_bytes(dtype) / pack_bytes_of(c.build), world,
+                           pack_bytes_of(c.build)) /
                   (n * elem_bytes(dtype))
             : 0;
   Config config{};
@@ -3653,6 +3697,7 @@ inline Config rows_config(const Handle& h, const Chosen& k, int64_t n, DType dty
   config.grid = k.config.launch.grid;
   config.waves_per_eu = waves_of(b);
   config.quantization = quantization_of(b);
+  config.pack_bytes = pack_bytes_of(b);
   config.dtype = dtype;
   config.weight_dtype = weight_dtype;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
@@ -3753,16 +3798,17 @@ struct ExchangeSizes {
 };
 constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
                                        int world) {
+  // THE WIDEST PACK, a row's packs rounded up: a narrower build's need is at most its.
   const int64_t pack = kBuild.memory.pack_bytes;
   const auto whole = [pack](int64_t bytes) {
     return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
   };
   int64_t partials = 0, staging = int4_payload_bytes(max_rows, max_cols);
   for (const DType d : kBuild.supports.dtypes) {
-    const int64_t packs = packs_of(max_cols, d);
+    const int64_t packs = packs_of(max_cols, d, pack);
     for (const TemplateInfo& t : kTemplates)
       for (const int a : t.algorithms) {
-        const int64_t need = partials_need(t.fn, a, max_rows, packs, world);
+        const int64_t need = partials_need(t.fn, a, max_rows, packs, world, pack);
         if (need > partials) partials = need;
         const int64_t int4 = int4_payload_bytes(1, need / elem_bytes(d));
         if (need > 0 && int4 > partials) partials = int4;
@@ -3794,7 +3840,8 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
   for (const TemplateInfo& t : kTemplates)
     if (t.op == o)
       for (const int a : t.algorithms) {
-        const int64_t need = partials_need(t.fn, a, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
+        const int64_t need = partials_need(t.fn, a, 1, 1, kMaxRanks, kBuild.memory.pack_bytes) /
+                             kBuild.memory.pack_bytes;
         if (need > per_byte) per_byte = need;
       }
   if (per_byte == 0) return staging_bytes;
@@ -3834,7 +3881,7 @@ inline std::variant<Config, Error> all_reduce(
     void* output, int64_t output_stride_m, int64_t output_stride_n,
     int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e =
-          layout_refused(dtype, {{output_stride_m, output_stride_n},
+          layout_refused(dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
   std::variant<Config, Error> checked = all_reduce_config(
@@ -3895,11 +3942,11 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     int64_t output_size_m, int64_t output_size_n, DType dtype,
     DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e =
-          layout_refused(dtype, {{output_stride_m, output_stride_n},
+          layout_refused(dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, pack_bytes_of(k.config.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked = all_reduce_rms_norm_config(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
@@ -3956,13 +4003,13 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
     DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
-          dtype, {{output_stride_m, output_stride_n},
+          dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
                   {input_stride_m, input_stride_n},
                   {residual_stride_m, residual_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, pack_bytes_of(k.config.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
       all_reduce_add_rms_norm_config(
@@ -4047,7 +4094,7 @@ all_reduce_add_attn_res_rms_norm(
     int64_t block_output_size_n, DType dtype, int num_blocks, float eps,
     float output_eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
-          dtype, {{input_stride_m, input_stride_n},
+          dtype, pack_bytes_of(k.config.build), {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
                   {blocks_stride_r, blocks_stride_n},
                   {0, norm_weight_stride_n},
@@ -4060,15 +4107,15 @@ all_reduce_add_attn_res_rms_norm(
   // was refused as `inner_stride_not_one`, 2026-10-13).
   if (prefix != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, {{prefix_stride_m, prefix_stride_n}}))
+            layout_refused(dtype, pack_bytes_of(k.config.build), {{prefix_stride_m, prefix_stride_n}}))
       return *e;
   if (output_norm_weight != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, {{0, output_norm_weight_stride_n}}))
+            layout_refused(dtype, pack_bytes_of(k.config.build), {{0, output_norm_weight_stride_n}}))
       return *e;
   if (block_output != nullptr)
     if (const std::optional<Error> e = layout_refused(
-            dtype, {{block_output_stride_m, block_output_stride_n}}))
+            dtype, pack_bytes_of(k.config.build), {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<Config, Error> checked =
       all_reduce_add_attn_res_rms_norm_config(
@@ -4149,11 +4196,11 @@ inline std::variant<Config, Error> rms_norm(
     int64_t output_size_m, int64_t output_size_n, DType dtype, DType weight_dtype, float eps,
     const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e =
-          layout_refused(dtype, {{output_stride_m, output_stride_n},
+          layout_refused(dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, pack_bytes_of(k.config.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
       rms_norm_config(h, input_size_m, input_size_n, dtype, weight_dtype, k);
@@ -4188,13 +4235,13 @@ inline std::variant<Config, Error> add_rms_norm(
     int64_t residual_output_size_n, DType dtype, DType weight_dtype, float eps,
     const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
-          dtype, {{output_stride_m, output_stride_n},
+          dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
                   {input_stride_m, input_stride_n},
                   {residual_stride_m, residual_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, pack_bytes_of(k.config.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
       add_rms_norm_config(h, input_size_m, input_size_n, dtype, weight_dtype, k);
@@ -4239,7 +4286,7 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
     DType dtype, int num_blocks, float eps, float output_eps, const Chosen& k,
     hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
-          dtype, {{input_stride_m, input_stride_n},
+          dtype, pack_bytes_of(k.config.build), {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
                   {blocks_stride_r, blocks_stride_n},
                   {0, norm_weight_stride_n},
@@ -4250,15 +4297,15 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
   // THE OPTIONAL BUFFERS, checked only when given (all_reduce_add_attn_res_rms_norm's).
   if (prefix != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, {{prefix_stride_m, prefix_stride_n}}))
+            layout_refused(dtype, pack_bytes_of(k.config.build), {{prefix_stride_m, prefix_stride_n}}))
       return *e;
   if (output_norm_weight != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, {{0, output_norm_weight_stride_n}}))
+            layout_refused(dtype, pack_bytes_of(k.config.build), {{0, output_norm_weight_stride_n}}))
       return *e;
   if (block_output != nullptr)
     if (const std::optional<Error> e = layout_refused(
-            dtype, {{block_output_stride_m, block_output_stride_n}}))
+            dtype, pack_bytes_of(k.config.build), {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<Config, Error> checked =
       add_attn_res_rms_norm_config(h, input_size_m, input_size_n, dtype, num_blocks, k);

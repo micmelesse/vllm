@@ -827,7 +827,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       const int slice_m = (input_size_m + WORLD - 1) / WORLD;
-      constexpr int kScaleSlot = kPackElems;
+      constexpr int kScaleSlot = kScaleSlotBytes / static_cast<int>(sizeof(DTYPE));  // common.cuh's
       [[maybe_unused]] const int64_t scale_stride_m =
           partials_stride_m * static_cast<int64_t>(sizeof(DTYPE)) / static_cast<int64_t>(sizeof(float));
       const int row_n = input_size_n + kScaleSlot;  // a partials row's elements

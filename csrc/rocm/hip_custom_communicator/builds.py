@@ -5,8 +5,8 @@
 of every config the tables of the archs built list (`hip_custom_communicator.json`, a
 table an arch, each gd's `TunedTable`: its `configs`, each its op, its `kernel` the op's
 one kernel, its `algorithm` which of the kernel's bodies: `one_shot_pull`,
-`one_shot_push`, `two_shot_pull`, `two_shot_push` or `rows`, its block, waves, tile and
-quantization; the grid is the launch's, never compiled), each kernel's builds in the
+`one_shot_push`, `two_shot_pull`, `two_shot_push` or `rows`, its block, waves, tile,
+quantization and pack; the grid is the launch's, never compiled), each kernel's builds in the
 order the tables first name them. THE BUILD MAKES WHAT IT IS TOLD (Michael, October 25):
 nothing is left out and nothing added; every kernel takes any config it is built at
 (its tails its own), and what an algorithm cannot do at a call (INT4 on a one-shot, a
@@ -23,7 +23,7 @@ at configure the same way (CMakeLists.txt).
 
 A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input picks, which a tune adds on
 its own copy of the table; gd's tune prunes them when it writes. A file NAMES ITS BUILD
-(`hip_custom_communicator_<kernel>_<algorithm>__<block>_w<waves>_t<tile>_<q>.hip`;
+(`hip_custom_communicator_<kernel>_<algorithm>__<block>_w<waves>_t<tile>_<q>_p<pack>.hip`;
 the manifest
 `hip_custom_communicator_instances.json` says each file's builds: every build whose
 instances it holds), so a rebuild with other candidates recompiles only the new ones,
@@ -46,6 +46,7 @@ FIELDS = (
     "tile_n",
     "tile_k",
     "quantization",
+    "pack_bytes",
 )
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
 # THE ALGORITHMS, as common.cuh names them and numbers them (its template ints).
@@ -89,20 +90,20 @@ def named(tables: list[dict]) -> dict[str, list[tuple]]:
 
 
 def literal(kernel: str, b: tuple) -> str:
-    algorithm, bx, by, bz, waves, tm, tn, tk, q = b
+    algorithm, bx, by, bz, waves, tm, tn, tk, q, pack = b
     fields = [f"Algorithm::{algorithm}"]
     fields += [f"{{{bx}, {by}, {bz}}}", str(waves), str(tm), str(tn)]
     if family(kernel) == "AllReduceAddAttnResRmsNormBuildConfig":
         fields.append(str(tk))
     elif tk != 1:
         raise SystemExit(f"{kernel}: tile_k {tk}, but the kernel has no K")
-    fields.append(QUANTIZATIONS[q])
+    fields += [QUANTIZATIONS[q], str(pack)]
     return f"    {family(kernel)}{{{', '.join(fields)}}},"
 
 
-# THE MACHINE'S FACTS AND WHAT IS COMPILED, as the host holds them (kTarget, kBuild);
-# the generated header asserts them equal, so a change there fails the compile naming
-# this file.
+# THE MACHINE'S FACTS AND WHAT IS COMPILED, as the host holds them (kTarget, kBuild:
+# PACK_BYTES the widest pack, a build's own its config's); the generated header asserts
+# them equal, so a change there fails the compile naming this file.
 WAVE_SIZE, PACK_BYTES = 64, 16
 DTYPES = (("f16", "c10::Half"), ("bf16", "c10::BFloat16"))
 WORLDS = (2, 4, 8)
@@ -144,7 +145,11 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
     each dtype and world, the weight's dtype where a norm takes one, contiguous or not
     (the plain two-shots), chunked or not (every kernel but the plain all-reduce's),
     with a tail or not (an INT4 two-shot)."""
-    algorithm, block, _, _, waves, tile_m, tile_n, tile_k, q = b
+    algorithm, block, _, _, waves, tile_m, tile_n, tile_k, q, pack = b
+    # AN INT4 BUILD AT A NARROWER PACK compiles its exact body (the host's
+    # compiled_quantization: INT4's word is a pack of 8 values; the call is refused).
+    if pack != PACK_BYTES:
+        q = "exact"
     two_shot = algorithm in ("two_shot_pull", "two_shot_push")
     plain = kernel == "all_reduce"
     out: list[str] = []
@@ -175,7 +180,7 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                                 "C.tile_k": str(tile_k),
                                 "C.block.x": str(block),
                                 "C.wave_size": str(WAVE_SIZE),
-                                "C.pack_bytes": str(PACK_BYTES),
+                                "C.pack_bytes": str(pack),
                                 "C.waves_per_eu": str(waves),
                                 "C.quantization": "1" if q == "int4" else "0",
                                 "C.algorithm": str(ALGORITHM_VALUES[algorithm]),
@@ -281,10 +286,10 @@ def main() -> None:
 
 def file_of(kernel: str, b: tuple) -> str:
     """The file a build's instances are compiled in, named by the build."""
-    algorithm, bx, by, bz, waves, tm, tn, tk, q = b
+    algorithm, bx, by, bz, waves, tm, tn, tk, q, pack = b
     return (
         f"hip_custom_communicator_{kernel}_{algorithm}__{bx}x{by}x{bz}_w{waves}"
-        f"_t{tm}x{tn}x{tk}_{q}.hip"
+        f"_t{tm}x{tn}x{tk}_{q}_p{pack}.hip"
     )
 
 

@@ -288,10 +288,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // tile's last pack: the same bytes its owner sends; its sum is stored nowhere).
     constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
     constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
-    // A THREAD'S PACK IS ONE LINE'S PAYLOAD, 8 bytes (aiter's packet): a block's stores spread over
+    // A THREAD'S PACK IS ONE LINE'S PAYLOAD, 8 bytes (aiter's packet), or the build's narrower pack
+    // alone in its line (PACK_BYTES 2 or 4: a row not whole 8 bytes): a block's stores spread over
     // twice the waves of a 16-byte pack, half the stores a wave (16 stores a wave at 128 threads
     // were ~9k cycles of issue stalls, ATT 2026-10-19T04-50-53Z).
-    constexpr int kPackElems = kLinePayloadBytes / static_cast<int>(sizeof(DTYPE));
+    constexpr int kPackElems =
+        (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) / static_cast<int>(sizeof(DTYPE));
     constexpr int kRows = TILE_M / kThreadsM;
     // THE TILE IN WHOLE PACKS (TILE_N rounded up): a tile edge inside a pack would split one aligned
     // access between two blocks; any TILE_N walks, the row's columns past the input masked.
@@ -309,7 +311,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    epochs are this rank's alone, so a pointer of their own (`&unfenced_epochs_ptr, 1`): through
     //    a device array each launch began with a cold scalar load before the epoch's (ATT
     //    2026-10-19T04-50-53Z: ~5k cycles of lgkmcnt waits before the first send).
-    int32_t last[kRows][1][traits<int32_t, PACK_BYTES>::N];
+    int32_t last[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))];  // a 16-byte line a row, any pack
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
         &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
         1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, first_row, 0,
@@ -377,7 +379,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     // 5. Each row's epoch, for its next write in the next launch: its row of threads' first lane's
     //    store (the store's lanes past the line's one pack store nothing).
-    int32_t next[kRows][1][traits<int32_t, PACK_BYTES>::N] = {};
+    int32_t next[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
   #pragma unroll
     for (int i = 0; i < kRows; ++i)
       next[i][0][0] = ran ? static_cast<int32_t>(epochs[i]) : last[i][0][0];

@@ -139,6 +139,7 @@ class Error(IntEnum):
     lds_too_large = 35
     scratch_too_large = 36
     unfenced_too_small = 37
+    pack_out_of_range = 38
 
 
 class Where(IntEnum):
@@ -841,6 +842,8 @@ TunedTables = dict[str, TunedTable]
 # names it (the mode the communicator was opened in).
 _QUALIFIED = "hip_custom_communicator."
 _MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
+# A TUNED INPUT'S DTYPE's element bytes, as the table names it.
+_DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
 # A CONFIG POINT'S FIELDS, in their order (C++'s arguments'): the kernel, its algorithm,
 # its grid, its block and the block's waves a EU (__launch_bounds__), its
 # tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
@@ -859,6 +862,7 @@ _CONFIG_KEYS = (
     "tile_n",
     "tile_k",
     "quantization",
+    "pack_bytes",
 )
 
 
@@ -866,7 +870,7 @@ _CONFIG_KEYS = (
 class Config:
     """ONE KERNEL'S CONFIG, a field each (`_CONFIG_KEYS`, C++'s arguments, in their
     order): the kernel, its algorithm, its grid, its block and the block's waves a EU,
-    its tile, what it moves. Every op's C++ call is handed each field by name, a line
+    its tile, what it moves, its pack. Every op's C++ call is handed each field by name, a line
     each, never a tuple or a dict unpacked: a field one side lacks is an error naming it
     (STANDARDS 3)."""
 
@@ -883,6 +887,7 @@ class Config:
     tile_n: int
     tile_k: int
     quantization: Quantization
+    pack_bytes: int
 
 
 def _config(c: Mapping[str, Any]) -> Config:
@@ -902,6 +907,7 @@ def _config(c: Mapping[str, Any]) -> Config:
         tile_n=c["tile_n"],
         tile_k=c["tile_k"],
         quantization=c["quantization"],
+        pack_bytes=c["pack_bytes"],
     )
 
 
@@ -1000,6 +1006,7 @@ def get_given_config(
     tile_n: int | None,
     tile_k: int | None,
     quantization: Quantization | None,
+    pack_bytes: int | None,
 ) -> Config | None:
     """AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS: every field given (the config), or none
     (None: a plain call, the table's pick). Some but not all is no config, refused,
@@ -1018,6 +1025,7 @@ def get_given_config(
         and tile_n is not None
         and tile_k is not None
         and quantization is not None
+        and pack_bytes is not None
     ):
         return Config(
             kernel=kernel,
@@ -1033,6 +1041,7 @@ def get_given_config(
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
     if (
         kernel is None
@@ -1048,11 +1057,12 @@ def get_given_config(
         and tile_n is None
         and tile_k is None
         and quantization is None
+        and pack_bytes is None
     ):
         return None
     raise RuntimeError(
         "forced_incomplete: a forced call gives kernel, algorithm, grid x y z, block x "
-        "y z, waves_per_eu, tile m n k and quantization"
+        "y z, waves_per_eu, tile m n k, quantization and pack_bytes"
     )
 
 
@@ -1067,8 +1077,10 @@ def get_nearest_pick(
     """THE PICK A PLAIN CALL OF `op` ON `rows` x `cols` RUNS, from the arch's `table`:
     its record (`input`, the table input it was tuned at; `configs`, what it launches),
     the nearest input of `op` tuned in the communicator's mode (`quantization`) at
-    `world`. The nearest width, then the nearest size (rows x width), the fewer tokens
-    on a tie."""
+    `world`. Among the picks whose every config's pack fits the row (whole packs of
+    `pack_bytes`, at the tuned input's dtype; a config the row is not whole packs of is
+    refused, row_not_packs), where any does; then the nearest width, then the nearest
+    size (rows x width), the fewer tokens on a tie."""
     inputs = table["inputs"]
     picks = [
         k
@@ -1077,6 +1089,17 @@ def get_nearest_pick(
         and inputs[k["input"]]["mode"] == _MODES[quantization]
         and inputs[k["input"]]["world"] == world
     ]
+    fitting = [
+        k
+        for k in picks
+        if all(
+            cols * _DTYPE_BYTES[inputs[k["input"]]["dtype"]]
+            % table["configs"][j]["pack_bytes"]
+            == 0
+            for j in k["configs"]
+        )
+    ]
+    picks = fitting or picks
     width = min(
         (inputs[k["input"]]["hidden"] for k in picks), key=lambda h: abs(h - cols)
     )
@@ -1567,6 +1590,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> torch.Tensor:
         """The sum of every rank's `input`, at the config given (the tuner's, the
         tests'), else at the table's pick for its rows and width. Each config argument
@@ -1600,6 +1624,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1654,6 +1679,7 @@ class HipCustomCommunicator:
                     tile_n=config.tile_n,
                     tile_k=config.tile_k,
                     quantization=config.quantization,
+                    pack_bytes=config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -1692,6 +1718,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)`, at the config given
         (the tuner's, the tests'), else at the table's pick for its rows and width: one
@@ -1726,6 +1753,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1783,6 +1811,7 @@ class HipCustomCommunicator:
                     tile_n=fused_config.tile_n,
                     tile_k=fused_config.tile_k,
                     quantization=fused_config.quantization,
+                    pack_bytes=fused_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -1809,6 +1838,7 @@ class HipCustomCommunicator:
                     tile_n=reduce_config.tile_n,
                     tile_k=reduce_config.tile_k,
                     quantization=reduce_config.quantization,
+                    pack_bytes=reduce_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -1833,6 +1863,7 @@ class HipCustomCommunicator:
                     tile_n=norm_config.tile_n,
                     tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
+                    pack_bytes=norm_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -1874,6 +1905,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)`,
         at the config given (the tuner's, the tests'), else at the table's pick for its
@@ -1909,6 +1941,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1969,6 +2002,7 @@ class HipCustomCommunicator:
                         tile_n=fused_config.tile_n,
                         tile_k=fused_config.tile_k,
                         quantization=fused_config.quantization,
+                        pack_bytes=fused_config.pack_bytes,
                     )
                 )
                 if error != -1:
@@ -1996,6 +2030,7 @@ class HipCustomCommunicator:
                     tile_n=reduce_config.tile_n,
                     tile_k=reduce_config.tile_k,
                     quantization=reduce_config.quantization,
+                    pack_bytes=reduce_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -2022,6 +2057,7 @@ class HipCustomCommunicator:
                     tile_n=norm_config.tile_n,
                     tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
+                    pack_bytes=norm_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -2067,6 +2103,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(input), blocks, ...)`, at the config given (the
         tuner's, the tests'), else at the table's pick for its rows and width: one
@@ -2104,6 +2141,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2184,6 +2222,7 @@ class HipCustomCommunicator:
                     tile_n=fused_config.tile_n,
                     tile_k=fused_config.tile_k,
                     quantization=fused_config.quantization,
+                    pack_bytes=fused_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -2210,6 +2249,7 @@ class HipCustomCommunicator:
                     tile_n=reduce_config.tile_n,
                     tile_k=reduce_config.tile_k,
                     quantization=reduce_config.quantization,
+                    pack_bytes=reduce_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -2242,6 +2282,7 @@ class HipCustomCommunicator:
                     tile_n=norm_config.tile_n,
                     tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
+                    pack_bytes=norm_config.pack_bytes,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -2278,6 +2319,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(input, weight, eps)` on this rank's rows, `input` a
         sum, at the config given. Returns the normed rows."""
@@ -2310,6 +2352,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2352,6 +2395,7 @@ class HipCustomCommunicator:
             tile_n=config.tile_n,
             tile_k=config.tile_k,
             quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -2378,6 +2422,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(input, residual, weight, eps)` on this rank's
         rows, `input` a sum, at the config given. Returns the normed result and the sum
@@ -2411,6 +2456,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2455,6 +2501,7 @@ class HipCustomCommunicator:
             tile_n=config.tile_n,
             tile_k=config.tile_k,
             quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -2487,6 +2534,7 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         quantization: Quantization | None = None,
+        pack_bytes: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, input, blocks, ...)` on this rank's rows, `input` a sum,
         its arguments `all_reduce_add_attn_res_rms_norm`'s, at the config given.
@@ -2520,6 +2568,7 @@ class HipCustomCommunicator:
             tile_n=tile_n,
             tile_k=tile_k,
             quantization=quantization,
+            pack_bytes=pack_bytes,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2583,6 +2632,7 @@ class HipCustomCommunicator:
             tile_n=config.tile_n,
             tile_k=config.tile_k,
             quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")

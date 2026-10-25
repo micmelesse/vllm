@@ -284,7 +284,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
   // block a field a dimension. The launch is not a build's: a forced call gives
   // its own grid.
   const Names fields = {"algorithm", "tile_m",  "tile_n",       "tile_k",
-                        "block_x",   "block_y", "block_z",      "waves_per_eu", "quantization"};
+                        "block_x",   "block_y", "block_z",      "waves_per_eu", "quantization",
+                        "pack_bytes"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
@@ -297,7 +298,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
             configs.insert(configs.end(),
                            {f.algorithm, f.tile_m, f.tile_n, k, f.block.x,
-                            f.block.y, f.block.z, f.waves_per_eu, f.quantization});
+                            f.block.y, f.block.z, f.waves_per_eu, f.quantization,
+                            f.pack_bytes});
           },
           b);
     counts.push_back(static_cast<int64_t>(t.builds.size()));
@@ -492,7 +494,8 @@ using Picked = std::variant<hip_custom_communicator::Chosen, hip_custom_communic
 Picked forced_config(hip_custom_communicator::OpType o, const std::string& kernel,
     const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   const std::optional<Template> fn = template_named(kernel);
   if (!fn) return Error::no_such_template;
@@ -500,7 +503,7 @@ Picked forced_config(hip_custom_communicator::OpType o, const std::string& kerne
                 Dim3{narrowed(grid_x), narrowed(grid_y), narrowed(grid_z)},
                 Dim3{narrowed(block_x), narrowed(block_y), narrowed(block_z)},
                 narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
-                quantization_from(quantization));
+                quantization_from(quantization), narrowed(pack_bytes));
 }
 }  // namespace
 
@@ -535,10 +538,11 @@ Answer hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& inpu
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return all_reduce_with(handle_ptr, input, output,
       forced_config(hip_custom_communicator::OpType::all_reduce, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -601,10 +605,11 @@ Answer hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Ten
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return all_reduce_rms_norm_with(handle_ptr, input, weight, output, eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -637,10 +642,11 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(fptr_t handle_ptr, torch:
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return all_reduce_add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -771,10 +777,11 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(fptr_t handle_pt
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return all_reduce_add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -802,10 +809,11 @@ Answer hip_custom_communicator_rms_norm(fptr_t handle_ptr, torch::Tensor& input,
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return rms_norm_with(handle_ptr, input, weight, output, eps,
       forced_config(hip_custom_communicator::OpType::rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -839,10 +847,11 @@ Answer hip_custom_communicator_add_rms_norm(fptr_t handle_ptr, torch::Tensor& in
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
       forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }
 
 namespace {
@@ -895,8 +904,9 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(fptr_t handle_ptr, torch::T
     const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes) {
   return add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
       forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes));
 }

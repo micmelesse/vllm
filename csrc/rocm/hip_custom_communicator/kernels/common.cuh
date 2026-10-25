@@ -41,6 +41,36 @@ struct traits {
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
+// A PACK OF ANY WIDTH THROUGH ONE GLOBAL ACCESS (PACK_BYTES 2, 4, 8 or 16: global_load_ushort,
+// _dword, _dwordx2, _dwordx4), the pack's bytes as they are: the flat walk's and the exact group
+// walk's load and store, at a build's pack.
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+template <int BYTES>
+struct pack_word;
+template <>
+struct pack_word<2> { using t = uint16_t; };
+template <>
+struct pack_word<4> { using t = uint32_t; };
+template <>
+struct pack_word<8> { using t = u32x2; };
+template <>
+struct pack_word<16> { using t = u32x4; };
+template <typename V>
+DINLINE V load_pack(const void* p) {
+  using W = typename pack_word<sizeof(V)>::t;
+  const W raw = *(const __attribute__((address_space(1))) W*)(p);
+  V v;
+  __builtin_memcpy(&v, &raw, sizeof(V));
+  return v;
+}
+template <typename V>
+DINLINE void store_pack(void* p, const V& v) {
+  using W = typename pack_word<sizeof(V)>::t;
+  W raw;
+  __builtin_memcpy(&raw, &v, sizeof(V));
+  *(__attribute__((address_space(1))) W*)(p) = raw;
+}
+
 
 // AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
 // (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size)) __builtin_trap();` at each
@@ -110,6 +140,15 @@ constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's valu
 constexpr int kInt4WordBytes = 4;        // a pack's values
 constexpr int kInt4ScaleBytes = 2;       // a group's scale
 constexpr uint32_t kInt4ZeroWord = 0x88888888u;  // a word of zeros (each value stored q + 8)
+
+// THE ADD-RMSNORM PULL TWO-SHOT'S SCALE SLOT: each partials row's fp32 scale in a slot before the
+// row, kScaleSlotBytes whatever the build's pack, and the row whole slots (scale_slot_row), so
+// every row's scale is aligned at any pack (kernels/all_reduce_add_rms_norm.cuh; the host's
+// partials_need and partials stride).
+constexpr int kScaleSlotBytes = 16;
+__host__ __device__ constexpr int64_t scale_slot_row(int64_t row_bytes) {
+  return (row_bytes + kScaleSlotBytes - 1) / kScaleSlotBytes * kScaleSlotBytes;
+}
 
 // A ROW OF n ELEMENTS' INT4 GROUPS, the last short where n is not whole groups.
 __host__ __device__ constexpr int64_t int4_groups(int64_t n) {
@@ -437,8 +476,11 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     static_assert(QUANTIZATION == Quantization::exact && kSlots && kCopies == WORLD,
                   "a line read is every writer's exact copy");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
-    constexpr int kLines = sizeof(V) / kLinePayloadBytes;
-    static_assert(sizeof(V) % kLinePayloadBytes == 0 && kLines >= 1 && kLines <= 2 &&
+    // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
+    // first bytes.
+    constexpr int kLines = sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
+    static_assert((sizeof(V) <= kLinePayloadBytes || sizeof(V) % kLinePayloadBytes == 0) &&
+                      kLines >= 1 && kLines <= 2 &&
                       sizeof(u32x4) == kLineBytes,
                   "a pack is one or two lines");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
@@ -544,7 +586,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
             words[2 * h] = got[c][i][k][h][0];
             words[2 * h + 1] = got[c][i][k][h][2];
           }
-          __builtin_memcpy(output[c][i][k], words, sizeof(words));
+          __builtin_memcpy(output[c][i][k], words, sizeof(V));
         }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
@@ -553,7 +595,6 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     const U* const from = reinterpret_cast<const U*>(input) + int64_t{offs_m} * input_stride_m;
     const int64_t first = int64_t{input_slot} * input_stride_slot;
     if constexpr (kRun) {
@@ -567,8 +608,8 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         const int col = n < clip_n / kPackElems ? n : last;
         uint32_t offset = static_cast<uint32_t>(col) * uint32_t{sizeof(V)};
         asm volatile("" : "+v"(offset));
-        const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(run) + offset);
-        __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+        const V v = load_pack<V>(reinterpret_cast<const char*>(run) + offset);
+        __builtin_memcpy(output[0][k], &v, sizeof(v));
       }
     } else {
 #pragma unroll
@@ -577,9 +618,9 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         // branch).
         const int n = offs_n / kPackElems + tid % kLanes + k * kLanes;
         const int col = n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
-        const u32x4 raw = *(const global_u32x4*)(element_at(
+        const V v = load_pack<V>(element_at(
             from, input_stride_m, input_stride_n, first + int64_t{col} * kPackElems, input_size_n));
-        __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+        __builtin_memcpy(output[0][k], &v, sizeof(v));
       }
     }
     // ISSUED HERE: no memory operation nor instruction crosses this point, so every load above is
@@ -939,8 +980,11 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // row of threads has none, its loop unbranched as before.
     static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
-    constexpr int kLines = sizeof(V) / kLinePayloadBytes;
-    static_assert(sizeof(V) % kLinePayloadBytes == 0 && kLines >= 1 && kLines <= 2 &&
+    // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
+    // first bytes.
+    constexpr int kLines = sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
+    static_assert((sizeof(V) <= kLinePayloadBytes || sizeof(V) % kLinePayloadBytes == 0) &&
+                      kLines >= 1 && kLines <= 2 &&
                       sizeof(u32x4) == kLineBytes,
                   "a pack is one or two lines");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
@@ -957,8 +1001,8 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         const int col = min(col_at(k), clip_n / kPackElems - 1);
-        uint32_t words[2 * kLines];
-        __builtin_memcpy(words, input[i][k], sizeof(words));
+        uint32_t words[2 * kLines] = {};
+        __builtin_memcpy(words, input[i][k], sizeof(V));
         // A row's packs' first lines, then their second (the line read's layout).
         const uint32_t half = static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
         uint32_t at = static_cast<uint32_t>(row) * half * kLineScale +
@@ -977,7 +1021,6 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
     const int64_t first = int64_t{output_slot} * output_stride_slot;
     U* const run = to + first * output_stride_n;
@@ -996,9 +1039,9 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         p = reinterpret_cast<V*>(element_at(to, output_stride_m, output_stride_n,
                                             first + int64_t{c} * kPackElems, output_size_n));
       }
-      u32x4 raw;
-      __builtin_memcpy(&raw, input[0][k], sizeof(raw));
-      *(global_u32x4*)(p) = raw;
+      V v;
+      __builtin_memcpy(&v, input[0][k], sizeof(v));
+      store_pack(p, v);
     }
   } else if constexpr (kGroup) {
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks,
