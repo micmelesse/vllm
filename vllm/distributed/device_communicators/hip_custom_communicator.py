@@ -894,8 +894,9 @@ def _config(c: Mapping[str, Any]) -> Config:
 def check_table(raw: TunedTable) -> None:
     """THE TUNED TABLE `raw` (the arch's file, or one handed in at open), checked: one
     that is not sound raises, naming the entry. Its keys `_TABLE_KEYS`; every config its
-    op's (qualified) and every field `_CONFIG_KEYS` names in that order, a kernel the
-    build has at a build it lists (its grid is C++'s to refuse at the call); every input
+    op's (qualified) and every field `_CONFIG_KEYS` names in that order, a picked one a
+    kernel the build has at a build it lists (its grid is C++'s to refuse at the call; a
+    candidate, a config no pick names, need not be built); every input
     one of `TUNED_OPS`, in a mode, at a built world, with a width and tokens; every pick
     one input's, its configs one kernel of the input's op, or our all-reduce then the
     op's norm on rows, an exact input's moving nothing quantized; every tuned op an
@@ -906,6 +907,9 @@ def check_table(raw: TunedTable) -> None:
             f"the tuned table's keys are {list(raw)}, not {list(_TABLE_KEYS)}"
         )
     configs, inputs = raw["configs"], raw["inputs"]
+    # A CANDIDATE (a config no pick names: a tune's) need not be built: builds.py leaves
+    # out what no kernel takes, and a forced call of it is refused (tile_not_built).
+    picked = {j for k in raw["picks"] for j in k.get("configs", [])}
     ops_of_configs = []
     for i, c in enumerate(configs):
         where = f"the tuned table: configs[{i}]"
@@ -913,13 +917,13 @@ def check_table(raw: TunedTable) -> None:
             raise ValueError(f"{where} has keys {list(c)}, not {['op', *_CONFIG_KEYS]}")
         template = built.templates.get(c["kernel"])
         build = {k: c[k] for k in _CONFIG_KEYS if k != "kernel" and k[:5] != "grid_"}
-        if template is None or build not in template.builds:
+        if i in picked and (template is None or build not in template.builds):
             raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
-        if c["op"] != _QUALIFIED + template.op:
+        if template is not None and c["op"] != _QUALIFIED + template.op:
             raise ValueError(
                 f"{where}: {c['kernel']} is {template.op}'s, not {c['op']}'s"
             )
-        ops_of_configs.append(template.op)
+        ops_of_configs.append(template.op if template is not None else None)
     for i, e in enumerate(inputs):
         where = f"the tuned table: inputs[{i}]"
         name = str(e.get("op", ""))
