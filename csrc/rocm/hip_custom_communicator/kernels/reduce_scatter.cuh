@@ -352,7 +352,15 @@ DINLINE void reduce_scatter(
           }
     } else {
       constexpr int kSliceWaves = (TILE_N / WORLD / kPackElems + WAVE_SIZE - 1) / WAVE_SIZE * WAVE_SIZE;
-      constexpr int kThreadsN = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
+      // A ROW OF THREADS: the narrowest whole waves at least the slice's that divide the block, so
+      // the block is whole rows of threads at any block (448 threads, 7 waves, take one row of 448
+      // where a slice of 128 would leave 64 threads no row; the block itself always divides).
+      constexpr int kThreadsN = [] {
+        for (int t = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
+             t < THREADS_PER_BLOCK; t += WAVE_SIZE)
+          if (THREADS_PER_BLOCK % t == 0) return t;
+        return THREADS_PER_BLOCK;
+      }();
       constexpr int kThreadsM = THREADS_PER_BLOCK / kThreadsN;  // rows of threads at once
       using Summed = std::conditional_t<kInt4, float, DTYPE>;
       const int offs_n = col0 * kPackElems;
