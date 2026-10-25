@@ -41,36 +41,6 @@ struct traits {
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
-// A PACK OF ANY WIDTH THROUGH ONE GLOBAL ACCESS (PACK_BYTES 2, 4, 8 or 16: global_load_ushort,
-// _dword, _dwordx2, _dwordx4), the pack's bytes as they are: the flat walk's and the exact group
-// walk's load and store, at a build's pack.
-typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
-template <int BYTES>
-struct pack_word;
-template <>
-struct pack_word<2> { using t = uint16_t; };
-template <>
-struct pack_word<4> { using t = uint32_t; };
-template <>
-struct pack_word<8> { using t = u32x2; };
-template <>
-struct pack_word<16> { using t = u32x4; };
-template <typename V>
-DINLINE V load_pack(const void* p) {
-  using W = typename pack_word<sizeof(V)>::t;
-  const W raw = *(const __attribute__((address_space(1))) W*)(p);
-  V v;
-  __builtin_memcpy(&v, &raw, sizeof(V));
-  return v;
-}
-template <typename V>
-DINLINE void store_pack(void* p, const V& v) {
-  using W = typename pack_word<sizeof(V)>::t;
-  W raw;
-  __builtin_memcpy(&raw, &v, sizeof(V));
-  *(__attribute__((address_space(1))) W*)(p) = raw;
-}
-
 
 // AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
 // (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size)) __builtin_trap();` at each
@@ -297,6 +267,22 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
                       float& scale);
 
 namespace internal {
+
+// A PACK OF ANY WIDTH THROUGH ONE GLOBAL ACCESS (PACK_BYTES 2, 4, 8 or 16: global_load_ushort,
+// _dword, _dwordx2, _dwordx4): the word the flat walk's load and store move a pack as, at a
+// build's pack.
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+template <int BYTES>
+struct pack_word;
+template <>
+struct pack_word<2> { using t = uint16_t; };
+template <>
+struct pack_word<4> { using t = uint32_t; };
+template <>
+struct pack_word<8> { using t = u32x2; };
+template <>
+struct pack_word<16> { using t = u32x4; };
+
 
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
 // addresses, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
@@ -608,7 +594,12 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         const int col = n < clip_n / kPackElems ? n : last;
         uint32_t offset = static_cast<uint32_t>(col) * uint32_t{sizeof(V)};
         asm volatile("" : "+v"(offset));
-        const V v = load_pack<V>(reinterpret_cast<const char*>(run) + offset);
+        V v;
+        {
+          using W = typename pack_word<sizeof(V)>::t;
+          const W raw = *(const __attribute__((address_space(1))) W*)(reinterpret_cast<const char*>(run) + offset);
+          __builtin_memcpy(&v, &raw, sizeof(V));
+        }
         __builtin_memcpy(output[0][k], &v, sizeof(v));
       }
     } else {
@@ -618,8 +609,13 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         // branch).
         const int n = offs_n / kPackElems + tid % kLanes + k * kLanes;
         const int col = n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
-        const V v = load_pack<V>(element_at(
+        V v;
+        {
+          using W = typename pack_word<sizeof(V)>::t;
+          const W raw = *(const __attribute__((address_space(1))) W*)(element_at(
             from, input_stride_m, input_stride_n, first + int64_t{col} * kPackElems, input_size_n));
+          __builtin_memcpy(&v, &raw, sizeof(V));
+        }
         __builtin_memcpy(output[0][k], &v, sizeof(v));
       }
     }
@@ -1041,7 +1037,12 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       }
       V v;
       __builtin_memcpy(&v, input[0][k], sizeof(v));
-      store_pack(p, v);
+      {
+        using W = typename pack_word<sizeof(V)>::t;
+        W raw;
+        __builtin_memcpy(&raw, &v, sizeof(V));
+        *(__attribute__((address_space(1))) W*)(p) = raw;
+      }
     }
   } else if constexpr (kGroup) {
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks,
