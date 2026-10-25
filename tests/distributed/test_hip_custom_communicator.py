@@ -211,7 +211,7 @@ def _rank_main(
     kernel_timeout_s: float,
     log_mode: LogMode,
     tables: TunedTables | None,
-    debug_file: str | None,
+    debug: bool,
 ) -> None:
     global _COMM
     # SIGUSR1 AND SIGTERM TO THE DUMPER ONLY: blocked here before any thread starts
@@ -247,7 +247,7 @@ def _rank_main(
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
                 quantization="exact",
                 tables=tables,
-                debug_file=debug_file,
+                debug=debug,
             )
         _COMM = comm
         try:
@@ -269,13 +269,13 @@ def _on_every_rank(
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
     tables: TunedTables | None = None,
-    debug_file: str | None = None,
+    debug: bool = False,
 ) -> None:
     """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
     by name first, `partial`), each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
-    tuned tables `tables` (None: the file's), its calls written to `debug_file` (None:
-    the environment's, off unless set). A
+    tuned tables `tables` (None: the file's), in debug mode where `debug` (its calls
+    under vLLM's cache root). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
     TERM_GRACE_S, then killed."""
@@ -293,7 +293,7 @@ def _on_every_rank(
                 kernel_timeout_s=kernel_timeout_s,
                 log_mode=log_mode,
                 tables=tables,
-                debug_file=debug_file,
+                debug=debug,
             )
         )
         for r in range(WORLD_SIZE)
@@ -1633,19 +1633,23 @@ def _debugged_calls_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
 
 
 @on_eight_gpus
-def test_the_debug_file_holds_every_call_as_launched(tmp_path: Path) -> None:
-    """With a debug file, every call is a line of it, every rank's, before it launches:
-    its rank and world, its op, its tensors' shapes, the configs it launches and the
-    table input their pick was tuned at (the lookup's own, `get_nearest_pick`), null
-    for a forced call."""
+def test_debug_mode_writes_every_call_as_launched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In debug mode every call is a line of its process's file under vLLM's cache root
+    (`debug_path`), every rank's, before it launches: its rank and world, its op, its
+    tensors' shapes, the configs it launches and the table input their pick was tuned
+    at (the lookup's own, `get_nearest_pick`), null for a forced call."""
     # example-based: a plain and a forced decode all-reduce on every rank
     import vllm._rocm_C  # noqa: F401
 
     found = supported(torch.device("cuda:0"), WORLD_SIZE)
     assert not isinstance(found, Error), found
-    path = tmp_path / "calls.jsonl"
-    _on_every_rank(target=_debugged_calls_on_rank, debug_file=str(path))
-    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    _on_every_rank(target=_debugged_calls_on_rank, debug=True)
+    files = sorted((tmp_path / "hip_custom_communicator").glob("calls-*.jsonl"))
+    assert len(files) == WORLD_SIZE, "a file a process"
+    lines = [json.loads(x) for f in files for x in f.read_text().splitlines()]
     assert sorted(x["rank"] for x in lines) == sorted([*range(WORLD_SIZE)] * 2)
     shapes = {
         (x["op"], x["world"], tuple(x["tensors"]["input"]["shape"])) for x in lines

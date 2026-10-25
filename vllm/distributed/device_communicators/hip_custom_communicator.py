@@ -587,14 +587,26 @@ def _install_exit_hooks() -> None:
         signal.signal(sig, functools.partial(_on_exit_signal, signal.getsignal(sig)))
 
 
-def configured_log_mode() -> LogMode:
-    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG` asks (errors by default)."""
+def configured_debug() -> bool:
+    """Whether `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG` asks for debug mode (off by
+    default)."""
+    import vllm.envs as envs
+
+    return bool(envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG)
+
+
+def debug_path() -> Path:
+    """WHERE A PROCESS'S CALLS GO IN DEBUG MODE: vLLM's cache root (VLLM_CACHE_ROOT,
+    where it keeps its other per-machine files), `hip_custom_communicator/`, a file a
+    process (`calls-<host>-<pid>.jsonl`), so ranks and runs never share one."""
+    import socket
+
     import vllm.envs as envs
 
     return (
-        "everything"
-        if envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG == "everything"
-        else "errors"
+        Path(envs.VLLM_CACHE_ROOT)
+        / "hip_custom_communicator"
+        / f"calls-{socket.gethostname()}-{os.getpid()}.jsonl"
     )
 
 
@@ -1182,14 +1194,6 @@ def open_handle(
     return Error(err) if err is not None else handle
 
 
-def configured_debug_file() -> str | None:
-    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE` asks: the file every call's
-    resolved configs are appended to, or None (off, the default)."""
-    import vllm.envs as envs
-
-    return envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE or None
-
-
 def configured_quantization() -> Quantization:
     """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks (exact by default:
     INT4 is lossy, so opt-in)."""
@@ -1351,7 +1355,7 @@ class HipCustomCommunicator:
         quantization: Quantization | None = None,
         log_mode: LogMode | None = None,
         tables: TunedTables | None = None,
-        debug_file: str | Path | None = None,
+        debug: bool | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
@@ -1361,14 +1365,15 @@ class HipCustomCommunicator:
         sized for; None is the server's (`problem_size`). `quantization`: what the
         plain calls move across the links, from each op's crossover up (their table:
         the quantized one where INT4); None is what the environment asks
-        (`configured_quantization`). `log_mode`: what the
-        state log records (`log()`); None is what the environment asks
-        (`configured_log_mode`). `tables`: the tuned tables its plain calls run from
-        (the arch's), of the file's shape (the tuner's candidate); None is the file's
-        (`hip_custom_communicator.json`), read once. `debug_file`: where every call's
-        resolved configs are appended before it launches, a JSON line each (`_debug`;
-        every rank's to the one file, its rank in each line); None is what the
-        environment asks (`configured_debug_file`), off unless it names one."""
+        (`configured_quantization`). `log_mode`: what the state log records (`log()`);
+        None is everything in debug mode, else errors. `tables`: the tuned tables its
+        plain calls run from (the arch's), of the file's shape (the tuner's candidate);
+        None is the file's (`hip_custom_communicator.json`), read once. `debug`: debug
+        mode, every call printed and appended before it launches, a JSON line each
+        (`_debug`), to this process's file under vLLM's cache root (`debug_path`), its
+        path printed at open, and the state log everything (unless `log_mode` says
+        otherwise); None is what the environment asks (`configured_debug`), off by
+        default."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -1399,15 +1404,19 @@ class HipCustomCommunicator:
         self.quantization: Quantization = (
             configured_quantization() if quantization is None else quantization
         )
-        self.log_mode: LogMode = configured_log_mode() if log_mode is None else log_mode
+        debugging = configured_debug() if debug is None else debug
+        self.log_mode: LogMode = (
+            ("everything" if debugging else "errors") if log_mode is None else log_mode
+        )
         self._given_tables = tables
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
-        debug_path = configured_debug_file() if debug_file is None else debug_file
-        if debug_path is not None:
-            # LINE-BUFFERED, APPENDED: each call's line one write, so the ranks'
-            # lines in the one file never interleave.
-            self._debug_out = open(debug_path, "a", buffering=1)  # noqa: SIM115
+        if debugging:
+            calls = debug_path()
+            calls.parent.mkdir(parents=True, exist_ok=True)
+            # LINE-BUFFERED, APPENDED: each call's line one write.
+            self._debug_out = open(calls, "a", buffering=1)  # noqa: SIM115
+            logger.info("%s debug: every call to %s", type(self).__name__, calls)
         why = self._open()
         if why is None:
             self.state = Open()
@@ -1457,9 +1466,10 @@ class HipCustomCommunicator:
         configs: Sequence[Config],
         pick: Mapping[str, Any] | None,
     ) -> None:
-        """THE CALL'S LINE IN THE DEBUG FILE, where one is open (`debug_file`), written
-        before it launches: when, the rank and the world, the op, the communicator's
-        quantization, whether a graph is being captured, every tensor's shape, dtype and
+        """THE CALL'S LINE IN DEBUG MODE (`debug`), printed and appended to the
+        process's file (`debug_path`) before it launches: when, the rank and the world,
+        the op, the communicator's quantization, whether a graph is being captured,
+        every tensor's shape, dtype and
         strides (null where one is not given), the call's values, the configs it
         launches in order (each field by name), and the table input their pick was
         tuned at (null for a forced call). Off, nothing: no work on the call's path."""
@@ -1488,6 +1498,16 @@ class HipCustomCommunicator:
                 None if pick is None else self.table["inputs"][pick["input"]]
             ),
         }
+        logger.info(
+            "%s rank %d: %s %s %s launches %s (its pick tuned at %s)",
+            type(self).__name__,
+            line["rank"],
+            op,
+            self.quantization,
+            line["tensors"],
+            line["configs"],
+            line["table_input"],
+        )
         self._debug_out.write(json.dumps(line) + "\n")
 
     @final

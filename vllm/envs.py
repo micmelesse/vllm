@@ -157,8 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR: bool = False
     VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION: Literal["NONE", "INT4"] = "NONE"
-    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG: Literal["errors", "everything"] = "errors"
-    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE: str | None = None
+    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1403,15 +1402,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION": env_with_choices(
         "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", "NONE", ["NONE", "INT4"]
     ),
-    # What HipCustomCommunicator's state log records: errors (the default: failures
-    # and open's warnings) or everything (every open phase and check, every launch).
-    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG": env_with_choices(
-        "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG", "errors", ["errors", "everything"]
-    ),
-    # The hip custom communicator's debug file: where every call's resolved configs are
-    # appended, a JSON line each, before it launches (off when unset).
-    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE": lambda: os.getenv(
-        "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE", None
+    # HipCustomCommunicator's debug mode (off by default): its state log records
+    # everything (every open phase and check, every launch; else errors alone), and
+    # every call is printed and appended, a JSON line before it launches, to
+    # VLLM_CACHE_ROOT/hip_custom_communicator/calls-<host>-<pid>.jsonl.
+    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG": lambda: (
+        os.getenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
