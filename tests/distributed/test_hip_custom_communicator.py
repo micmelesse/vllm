@@ -1025,9 +1025,19 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
         if config.quantization == "int4":
             if not isinstance(forcing, Composed) and "two_shot" in config.algorithm:
                 for shape in INT4_SHAPES:
-                    _int4_case(
-                        comm, rank, op, Variant(kernel, config.algorithm), shape, config
-                    )
+                    # AN INT4 BUILD THE OP DOES NOT RUN INT4 (the plain all-reduce's pulled
+                    # two-shot; a pack narrower than the widest) is refused by name.
+                    try:
+                        _int4_case(
+                            comm, rank, op, Variant(kernel, config.algorithm), shape, config
+                        )
+                    except RuntimeError as no:
+                        if not str(no).startswith("quantization_not_supported"):
+                            raise
+                        _assert_clean(comm, f"{op} {shape}: {config}")
+                        if rank == 0:
+                            print(f"{op} {shape}: {config} refused by name")
+                        break
             continue
         for hidden in (*WIDTHS[op], *ODD_WIDTHS):
             for rows in (1, 33):
