@@ -3065,9 +3065,12 @@ struct Config {
   int64_t scales_stride_m{};
   int64_t scales_size_m{};
   // THE MACHINE'S WAVE, the host's fact and no call's (HARDWARE), handed to every kernel as its
-  // WAVE_SIZE; the BUILD'S PACK, its bytes, as its PACK_BYTES (kernel_pointer and each launch).
+  // WAVE_SIZE; the BUILD'S PACK, its bytes, as its PACK_BYTES (kernel_pointer and each launch),
+  // each op's config setting it from its build. NO DEFAULT PACK: left at 16, an op that did not set
+  // it ran the 16-byte build of its other fields, wrong on a row not whole 16-byte packs
+  // (2026-10-25T18-32-31Z); left at 0, it finds no build.
   int wave_size{kTarget.wave_size};
-  int pack_bytes{kBuild.memory.pack_bytes};
+  int pack_bytes{};
 };
 
 template <typename WRAPPED>
@@ -3373,6 +3376,7 @@ inline std::variant<Config, Error> all_reduce_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
+  config.pack_bytes = a.pack_bytes;  // the build's: the instance dispatch finds
   // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share).
   const bool int4_flat = !in_passes && is_two_shot(algorithm);
   const int64_t share = int4_flat_share(m, n, world);
@@ -3462,6 +3466,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = r.waves_per_eu;
   config.quantization = r.quantization;
+  config.pack_bytes = r.pack_bytes;  // the build's: the instance dispatch finds
   const int64_t row_n = payload_row(fn, algorithm, r.quantization, n);
   config.partials_stride_m = row_n;
   config.partials_stride_n = 1;
@@ -3547,6 +3552,7 @@ all_reduce_add_rms_norm_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = r.waves_per_eu;
   config.quantization = r.quantization;
+  config.pack_bytes = r.pack_bytes;  // the build's: the instance dispatch finds
   config.partials_stride_m = partials_stride_m;
   config.partials_stride_n = 1;
   config.partials_size_m = partials_rows;
@@ -3644,6 +3650,7 @@ all_reduce_add_attn_res_rms_norm_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
+  config.pack_bytes = a.pack_bytes;  // the build's: the instance dispatch finds
   const int64_t row_n = payload_row(fn, algorithm, a.quantization, n);
   config.partials_stride_m = row_n;
   config.partials_stride_n = 1;
