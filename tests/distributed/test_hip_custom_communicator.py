@@ -818,6 +818,15 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         _eager(comm, rank, "all_reduce", 2048, HIDDEN, bf16, None, None, 3)
     with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay"):
         _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, None, None)
+    # A PULLED BUILD READS ITS PEERS' CAPTURED INPUTS WHERE THEY ARE, so they register (the
+    # tuned pick at a decode row may be the pushed one-shot, which registers none).
+    pulled = next(
+        c
+        for c in _built_configs("all_reduce")
+        if c.algorithm == "one_shot_pull" and c.quantization == "exact"
+    )
+    with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay, {pulled}"):
+        _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, pulled, None)
     with _step(rank, "the capture's inputs registered, the eager inputs copied"):
         log = comm.log()
         assert log is not None
@@ -1025,6 +1034,37 @@ def test_every_build_matches_the_reference(op: Op) -> None:
     2026-10-25; the per-op test forces only each variant's first build)."""
     # example-based: every build the install compiled, a tune's candidates too
     _on_every_rank(target=partial(_every_build_on_rank, op=op))
+
+
+def _pushed_one_shots() -> dict[int, Config]:
+    """A built exact pushed one-shot of the plain all-reduce at each TILE_M."""
+    found: dict[int, Config] = {}
+    for c in _built_configs("all_reduce"):
+        if c.algorithm == "one_shot_push" and c.quantization == "exact":
+            found.setdefault(c.tile_m, c)
+    return found
+
+
+def _rows_change_hands_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
+    pushed = _pushed_one_shots()
+    for seed in range(6):
+        for tile_m in sorted(pushed, reverse=seed % 2 == 1):
+            assert _eager(
+                comm, rank, "all_reduce", 1, HIDDEN, torch.bfloat16, pushed[tile_m], None,
+                seed,
+            )
+
+
+@on_eight_gpus
+def test_pushed_one_shot_rows_change_hands() -> None:
+    """The pushed one-shot's inbox rows are a block's TILE_M's: at another TILE_M a row
+    is another block's, so its epoch is the row's, never a block's (counted a block,
+    block 2b + 1 back at TILE_M 1 counted to the epoch block b's stale line carried at
+    TILE_M 2, and took it for data). Builds at two TILE_Ms in turn, one row (blocks
+    past the tiles never run, so their counts lag)."""
+    if len(_pushed_one_shots()) < 2:
+        pytest.skip("no pushed one-shot built at two TILE_Ms")
+    _on_every_rank(target=_rows_change_hands_on_rank)
 
 
 @on_eight_gpus
