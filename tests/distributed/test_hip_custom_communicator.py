@@ -363,8 +363,18 @@ def _assert_close(
 ) -> None:
     assert len(got) == len(want), where
     for i, (a, b, (atol, rtol)) in enumerate(zip(got, want, tolerances)):
+        # The call named, then torch's own account (mismatched elements, the greatest
+        # differences and where), and the first columns that differ.
+        bad = ((a.float() - b.float()).abs() > atol + rtol * b.float().abs()).nonzero()
         torch.testing.assert_close(
-            a.float(), b.float(), atol=atol, rtol=rtol, msg=f"{where}, output {i}"
+            a.float(),
+            b.float(),
+            atol=atol,
+            rtol=rtol,
+            msg=lambda said, i=i, bad=bad: (
+                f"{where}, output {i}: {said}; first mismatched indices "
+                f"{bad[:8].tolist()} of {a.shape}"
+            ),
         )
 
 
@@ -1019,6 +1029,7 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
     if op in ROWS:
         (rows_kernel,) = [n for n, t in build_info().templates.items() if t.op == ROWS[op]]
         forcings += [Composed(norm_config=c) for c in _built_configs(rows_kernel)]
+    wrongs: list[str] = []
     for forcing in forcings:
         config = forcing.norm_config if isinstance(forcing, Composed) else forcing
         assert config is not None
@@ -1041,11 +1052,18 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
             continue
         for hidden in (*WIDTHS[op], *ODD_WIDTHS):
             for rows in (1, 33):
-                ran = _eager(
-                    comm, rank, op, rows, hidden, torch.bfloat16, forcing, layer, rows
-                )
+                # EVERY BUILD'S ANSWER, a wrong one kept and the next build run (a round
+                # on the node is half an hour: it says every build that is wrong).
+                try:
+                    ran = _eager(
+                        comm, rank, op, rows, hidden, torch.bfloat16, forcing, layer, rows
+                    )
+                except AssertionError as wrong:
+                    wrongs.append(str(wrong))
+                    continue
                 if not ran and rank == 0:
                     print(f"{op} {rows}x{hidden}: {forcing} refused by name")
+    assert not wrongs, f"{len(wrongs)} builds wrong:\n" + "\n".join(wrongs)
 
 
 @on_eight_gpus
