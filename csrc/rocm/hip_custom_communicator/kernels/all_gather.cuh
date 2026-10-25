@@ -81,14 +81,16 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     } else {
       constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
-      static_assert(TILE_N % kPackElems == 0, "a chunk is whole packs");
-      constexpr int kPacks = (TILE_N + kPackElems * kLanes - 1) / (kPackElems * kLanes);
+      // THE CHUNK IN WHOLE PACKS (TILE_N rounded up): any TILE_N walks, the slice's packs past it
+      // masked at its end.
+      constexpr int kChunkN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
+      constexpr int kPacks = (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
       // reduce_scatter's walk: whole waves a rank, else a lane's own rank; whole steps a chunk,
       // else the last masked at the chunk's end.
       constexpr bool kWaves = kLanes % WAVE_SIZE == 0;
-      constexpr bool kWhole = kPacks * kPackElems * kLanes == TILE_N;
-      const int chunks = (slice + TILE_N - 1) / TILE_N;
+      constexpr bool kWhole = kPacks * kPackElems * kLanes == kChunkN;
+      const int chunks = (slice + kChunkN - 1) / kChunkN;
       // A ROW OF THREADS' RANK, whole waves, so read from the first lane: recv then takes its
       // scalar path alone (from a lane's value it kept the per-lane select too, WORLD - 1 rank
       // compares whose masks spilled to a VGPR in the plain two-shot: ISA 2026-10-19T03-16-52Z).
@@ -99,12 +101,12 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, a row of threads a rank, in one round trip.
         recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
-                       kWhole ? slice : min(slice, chunk * TILE_N + TILE_N), got, 0, chunk * TILE_N, 0);
+                       kWhole ? slice : min(slice, chunk * kChunkN + kChunkN), got, 0, chunk * kChunkN, 0);
         // 2. Stored where rank r's share goes, its first `len` elements (the chunk's, masked).
         store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, kOutput, TAIL>(
             got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
             output_size_m, output_size_n, 1,
-            kWhole ? share_len(r) : min(share_len(r), chunk * TILE_N + TILE_N), 0, chunk * TILE_N, 1);
+            kWhole ? share_len(r) : min(share_len(r), chunk * kChunkN + kChunkN), 0, chunk * kChunkN, 1);
       }
     }
   } else {

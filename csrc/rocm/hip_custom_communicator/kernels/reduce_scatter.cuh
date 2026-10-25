@@ -205,14 +205,16 @@ DINLINE void reduce_scatter(
       static_assert(ACCUMULATE == Accumulate::lds, "the exact flat walk sums through LDS");
       constexpr Layout kInput = CONTIGUOUS ? Layout::run : Layout::flat;
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
-      static_assert(TILE_N % kPackElems == 0, "a chunk is whole packs");
-      constexpr int kPacks = (TILE_N + kPackElems * kLanes - 1) / (kPackElems * kLanes);
+      // THE CHUNK IN WHOLE PACKS (TILE_N rounded up): any TILE_N walks, the slice's packs past it
+      // masked at its end.
+      constexpr int kChunkN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
+      constexpr int kPacks = (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
       // WHOLE WAVES A RANK: its rank and entry scalar (the head of this file); else a lane's own.
       constexpr bool kWaves = kLanes % WAVE_SIZE == 0;
       // A RANK'S LANES WALK THE CHUNK IN WHOLE STEPS, else the last step is masked at the chunk.
-      constexpr bool kWhole = kPacks * kPackElems * kLanes == TILE_N;
-      const int chunks = (slice + TILE_N - 1) / TILE_N;
+      constexpr bool kWhole = kPacks * kPackElems * kLanes == kChunkN;
+      const int chunks = (slice + kChunkN - 1) / kChunkN;
       if constexpr (DIRECTION == Direction::push) {
         // 1. THE PUSH: this rank's input, every rank's share of it, read here (no peer reads the
         // caller's input) and sent to THAT rank's inbox at this rank's slot, each block the
@@ -222,15 +224,15 @@ DINLINE void reduce_scatter(
           const int len = share_len(r);
           if (len == 0) continue;
           // The share's end, or the chunk's where its last step is masked.
-          const int end = kWhole ? len : min(len, chunk * TILE_N + TILE_N);
+          const int end = kWhole ? len : min(len, chunk * kChunkN + kChunkN);
           DTYPE part[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
-              input_size_n, input_size_m, end, part, offs_m, chunk * TILE_N, 1);
+              input_size_n, input_size_m, end, part, offs_m, chunk * kChunkN, 1);
           send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::run>(
               part, staging_ptr_array, staging_ptr_array_size, r, rank, staging_stride_m,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, end, 0,
-              chunk * TILE_N, 1);
+              chunk * kChunkN, 1);
         }
       }
       // THIS ROW OF THREADS' RANK w, (pull) rank w's input entry and this rank's partials entry,
@@ -245,7 +247,7 @@ DINLINE void reduce_scatter(
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
-      // 2. THE SUM: this rank's share, a TILE_N chunk a step, every rank's copy a row of threads
+      // 2. THE SUM: this rank's share, a kChunkN chunk a step, every rank's copy a row of threads
       // (pull: rank w's input, received, at this rank's share; push: writer w's slot of this
       // rank's inbox, loaded) in one round trip, summed over the ranks in rotated order through
       // LDS, rounded once to DTYPE, stored in this rank's partials.
@@ -253,27 +255,27 @@ DINLINE void reduce_scatter(
       if (len != 0) {  // a late rank's share is empty at few packs (every block alike)
         for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
           // The share's end, or the chunk's where its last step is masked.
-          const int end = kWhole ? len : min(len, chunk * TILE_N + TILE_N);
+          const int end = kWhole ? len : min(len, chunk * kChunkN + kChunkN);
           DTYPE got[1][kPacks][kPackElems];
           if constexpr (DIRECTION == Direction::push)
             load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::run>(
                 staging_ptr_array, staging_ptr_array_size, rank, w, staging_stride_m,
                 staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, end,
-                got, 0, chunk * TILE_N, 1);
+                got, 0, chunk * kChunkN, 1);
           else if constexpr (kWaves)
             recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, kInput, TAIL>(
                 &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, end, got,
-                offs_m, chunk * TILE_N, 1);
+                offs_m, chunk * kChunkN, 1);
           else
             recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, kInput, TAIL>(
                 input_ptr_array, input_ptr_array_size, w, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, end, got,
-                offs_m, chunk * TILE_N, 1);
+                offs_m, chunk * kChunkN, 1);
           DTYPE rounded[1][kPacks][kPackElems];
           reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
           store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0,
-                                   0, 1, 1, 1, len, 1, end, 0, chunk * TILE_N, 1);
+                                   0, 1, 1, 1, len, 1, end, 0, chunk * kChunkN, 1);
         }
       }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,

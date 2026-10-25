@@ -141,8 +141,8 @@ namespace hip_custom_communicator {
 // rank's summed share out to the output). The kernel states the problem;
 // common.cuh's flat walk cuts it as [R, 1, M*N], each rank's share one
 // contiguous range of the elements, for long runs (its comment says why and
-// what it serves badly), a TILE_N chunk a step (TILE_M is the build's, 1:
-// select's two_shot_lays_out; any block and tile of whole packs walk it, the
+// what it serves badly), a TILE_N chunk a step (the flat walk has no rows: TILE_M is
+// the one-shots'; any block and any tile walk it, rounded up to whole packs, the
 // collectives' flat walk says how). CONTIGUOUS: the input's and the output's rows
 // are back to back, the instance the host picks from their strides.
 // QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION); with int4
@@ -193,16 +193,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot, above).
-    static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
     constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
     constexpr int kRows = TILE_M / kThreadsM;
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    static_assert(TILE_N % kPackElems == 0, "a tile is whole packs");
-    constexpr int kPacks = (TILE_N + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
+    // THE TILE IN WHOLE PACKS (TILE_N rounded up): a tile edge inside a pack would split one aligned
+    // access between two blocks; any TILE_N walks, the row's columns past the input masked.
+    constexpr int kTileN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
+    constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
     // A ROW OF THREADS AS WIDE AS THE TILE IN WHOLE STEPS, else the last step masked at the tile.
-    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == TILE_N;
-    const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
+    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
+    const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
     // 0. Every rank's input entry, read before the barrier (load's entry form: the table is fixed
     // for the launch), so its round trip runs under the barrier's.
@@ -219,11 +222,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Every rank's input, in rank order, through the table, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       // The columns this tile clips at: the input's, or the tile's end where a step is masked.
-      const int clip_n = kWhole ? input_size_n : min(input_size_n, t % tiles_n * TILE_N + TILE_N);
+      const int clip_n = kWhole ? input_size_n : min(input_size_n, t % tiles_n * kTileN + kTileN);
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
   #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * kTileN, 1);
       // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
       // same order, so every rank's sums agree bitwise.
       DTYPE rounded[kRows][kPacks][kPackElems];
@@ -238,7 +241,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
             rounded[i][k][j] = static_cast<DTYPE>(acc);
           }
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, t / tiles_n * TILE_M, t % tiles_n * kTileN, 1);
     }
     // 3. Every peer is done reading this rank's input: the launch may end and
     // the input be overwritten.
@@ -249,7 +252,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks, Until::read, 1);
   } else if constexpr (ALGORITHM == Algorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot, above).
-    static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
       const int band =
           min(partials_size_m, input_size_m - r0);  // this pass's rows
@@ -274,7 +278,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else if constexpr (ALGORITHM == Algorithm::one_shot_push) {
     // PUSH ONE-SHOT (all_reduce_push_one_shot, above).
-    static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     // THE TILE'S WALK, the pulled one-shot's (its section): rows of threads where they divide the
     // block, the last step's packs past the tile masked (a lane past it loads, and so sends, the
     // tile's last pack: the same bytes its owner sends; its sum is stored nowhere).
@@ -285,10 +290,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // were ~9k cycles of issue stalls, ATT 2026-10-19T04-50-53Z).
     constexpr int kPackElems = kLinePayloadBytes / static_cast<int>(sizeof(DTYPE));
     constexpr int kRows = TILE_M / kThreadsM;
-    static_assert(TILE_N % kPackElems == 0, "a tile is whole packs");
-    constexpr int kPacks = (TILE_N + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
-    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == TILE_N;
-    const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
+    // THE TILE IN WHOLE PACKS (TILE_N rounded up): a tile edge inside a pack would split one aligned
+    // access between two blocks; any TILE_N walks, the row's columns past the input masked.
+    constexpr int kTileN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
+    constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
+    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
+    const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
     const int blocks = unfenced_size_m / (2 * TILE_M);  // the inbox's: [bank, block] tiles of rows
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) > blocks) __builtin_trap();
@@ -306,10 +313,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     uint32_t epoch = 0;
     bool ran = false;
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-      const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * TILE_N;
+      const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
       // The tile's rows and columns inside the input: the lines past them are nobody's.
       const int clip_m = min(TILE_M, input_size_m - offs_m);
-      const int clip_n = min(TILE_N, input_size_n - offs_n);
+      const int clip_n = min(kTileN, input_size_n - offs_n);
       // 1. This rank's tile, read here, into slot [rank] of every peer's inbox, its lines carrying
       //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, read back as a peer's in 2), A RANK THE COMPILER
       //    KNOWS: no branch between the sends, whose joins waited for every store before

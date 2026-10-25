@@ -138,6 +138,7 @@ class Error(IntEnum):
     block_too_large = 34
     lds_too_large = 35
     scratch_too_large = 36
+    unfenced_too_small = 37
 
 
 class Where(IntEnum):

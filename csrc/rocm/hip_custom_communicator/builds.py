@@ -7,14 +7,11 @@ table an arch, each gd's `TunedTable`: its `configs`, each its op, its `kernel` 
 one kernel, its `algorithm` which of the kernel's bodies: `one_shot_pull`,
 `one_shot_push`, `two_shot_pull`, `two_shot_push` or `rows`, its block, waves, tile and
 quantization; the grid is the launch's, never compiled), each kernel's builds in the
-order the tables first name them. EVERY ALGORITHM OF A SHAPE (Michael,
-October 23): for every build shape the table holds of a kernel (its block, waves, tile
-and quantization: all a build is but its algorithm), the kernel is built at every
-algorithm it has (the host's `kAlgorithms_<kernel>`) that takes that shape (`takes`: a
-refusal the kernel's math or the hardware forces, which the communicator refuses by
-name at a call), the table's own builds first and in its order. So a tune's prune,
-which drops every config no input names, can drop a shape but never an algorithm of
-one: every path a call can be forced to take stays compiled. CMake runs this at
+order the tables first name them. THE BUILD MAKES WHAT IT IS TOLD (Michael, October 25):
+nothing is left out and nothing added; every kernel takes any config it is built at
+(its tails its own), and what an algorithm cannot do at a call (INT4 on a one-shot, a
+pushed one-shot's tile past its slot) is refused by name at the call
+(`hip_custom_communicator.cuh`'s checks), never by the build. CMake runs this at
 configure (the table and this file
 are configure dependencies), and the host file includes what it writes: one
 `constexpr BuildConfig` array a template, `kBuilds_<kernel>`. A config of the table is
@@ -74,30 +71,9 @@ def family(kernel: str) -> str:
 
 
 def tables(path: Path, archs: list[str]) -> list[dict]:
-    """The tuned table of each arch built that has one, in the archs' order, each its
-    candidates its kernel cannot take left out (`buildable`)."""
+    """The tuned table of each arch built that has one, in the archs' order, as it is."""
     file = json.loads(path.read_text())
-    return [buildable(file[arch], arch) for arch in archs if arch in file]
-
-
-def buildable(table: dict, arch: str) -> dict:
-    """THE TABLE AS THE BUILD TAKES IT: a candidate (a config no pick names: a tune's, `gd
-    tune --dry-run`'s) whose kernel cannot take its build (`takes`) is left out and counted, so
-    a space may name any combination; a picked config the kernel cannot take is no build, and
-    stops the configure, naming it."""
-    picked = {j for k in table["picks"] for j in k["configs"]}
-    kept, left = [], 0
-    for at, c in enumerate(table["configs"]):
-        b = tuple(c[f] for f in FIELDS)
-        if takes(c["kernel"], b):
-            kept.append(c)
-        elif at in picked:
-            raise SystemExit(f"{arch} configs[{at}]: {c['kernel']} cannot take {b}")
-        else:
-            left += 1
-    if left:
-        print(f"builds.py: {arch}: {left} candidate(s) no kernel takes, left out")
-    return {**table, "configs": kept}
+    return [file[arch] for arch in archs if arch in file]
 
 
 def named(tables: list[dict]) -> dict[str, list[tuple]]:
@@ -109,46 +85,6 @@ def named(tables: list[dict]) -> dict[str, list[tuple]]:
             b = tuple(c[f] for f in FIELDS)
             if b not in out.setdefault(c["kernel"], []):
                 out[c["kernel"]].append(b)
-    return out
-
-
-def takes(kernel: str, b: tuple) -> bool:
-    """WHETHER `kernel` AT ITS ALGORITHM TAKES THE SHAPE: no where the kernel refuses it by
-    construction, as the communicator refuses a call of it by name. INT4 is a two-shot's
-    and not the plain pull's (`quantization_not_supported`: a one-shot reads its peers'
-    inputs as they are); the pushed one-shot's tile is a row that fits its unfenced
-    slot (`push_one_shot_tiles_fit`); a pulled fused two-shot's INT4 tile is whole groups
-    a thread, a row high (its kernel's static_asserts: holes (a) and (b) of the task
-    list); a plain build lays out at some built world (`lays_out`)."""
-    algorithm, block, _, _, _, tile_m, tile_n, _, q = b
-    if q == "int4" and not (
-        algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
-    ):
-        return False
-    if kernel == "all_reduce" and algorithm == "one_shot_push":
-        if tile_m != 1 or tile_n * 2 > UNFENCED_SLOT_BYTES:
-            return False
-    if (
-        q == "int4"
-        and kernel in FUSED
-        and algorithm == "two_shot_pull"
-        and (tile_n % (INT4_GROUP * block) != 0 or tile_m != 1)
-    ):
-        return False
-    return any(lays_out(kernel, b, world) for world in WORLDS)
-
-
-def builds(tables: list[dict], has: dict[str, list[str]]) -> dict[str, list[tuple]]:
-    """Each kernel's builds: the tables', in their order, then every algorithm `has` lists
-    of every shape the tables hold of the kernel, where the algorithm takes it (`takes`)."""
-    out = named(tables)
-    for kernel, bs in out.items():
-        shapes = list(dict.fromkeys(b[1:] for b in bs))
-        for shape in shapes:
-            for algorithm in has[kernel]:
-                b = (algorithm, *shape)
-                if b not in bs and takes(kernel, b):
-                    bs.append(b)
     return out
 
 
@@ -170,12 +106,6 @@ def literal(kernel: str, b: tuple) -> str:
 WAVE_SIZE, PACK_BYTES = 64, 16
 DTYPES = (("f16", "c10::Half"), ("bf16", "c10::BFloat16"))
 WORLDS = (2, 4, 8)
-LINE_PAYLOAD_BYTES = (
-    8  # the pushed one-shot's pack: a line's payload (common.cuh's kLinePayloadBytes)
-)
-UNFENCED_SLOT_BYTES = 2048  # a pushed one-shot block's tile, at most (kUnfencedSlotBytes)
-INT4_GROUP = 32  # an INT4 group's elements (common.cuh's kInt4Group)
-FUSED = ("all_reduce_rms_norm", "all_reduce_add_rms_norm", "all_reduce_add_attn_res_rms_norm")
 HEADERS = (
     "kernels/all_reduce.cuh",
     "kernels/all_reduce_add_attn_res_rms_norm.cuh",
@@ -209,40 +139,17 @@ def algorithms(host: str) -> dict[str, list[str]]:
     return out
 
 
-def lays_out(kernel: str, b: tuple, world: int) -> bool:
-    """Whether a plain all-reduce build lays out (the host's one_shot_lays_out and
-    two_shot_lays_out, at a 16-bit dtype, whose comment says why each rule is forced):
-    any block walks any tile of whole packs (a step's packs past the tile masked, a
-    rank's lanes part of a wave where the block is narrow); a two-shot's tile has no
-    rows (the flat walk) and its block is WORLD rows of threads. Every other kernel's
-    builds do, but for an INT4 pulled norm or AttnRes whose tile is not whole groups a
-    thread (TILE_N a multiple of 32 * THREADS), which its kernel's static_assert refuses
-    by name (a thread quantizes whole groups alone)."""
-    algorithm, block, _, _, _, tile_m, tile_n, _, _ = b
-    if kernel != "all_reduce":
-        return True
-    if algorithm == "one_shot_push":
-        nl = LINE_PAYLOAD_BYTES // 2
-    else:
-        nl = PACK_BYTES // 2
-    if algorithm in ("one_shot_pull", "one_shot_push"):
-        return tile_n % nl == 0
-    return tile_m == 1 and block % world == 0 and tile_n % nl == 0
-
-
 def instances(kernel: str, args: str, b: tuple) -> list[str]:
     """EVERY INSTANCE OF A BUILD the dispatch reaches (the host's `with_config_build`):
     each dtype and world, the weight's dtype where a norm takes one, contiguous or not
     (the plain two-shots), chunked or not (every kernel but the plain all-reduce's),
-    with a tail or not (an INT4 two-shot); one that does not lay out has none."""
+    with a tail or not (an INT4 two-shot)."""
     algorithm, block, _, _, waves, tile_m, tile_n, tile_k, q = b
     two_shot = algorithm in ("two_shot_pull", "two_shot_push")
     plain = kernel == "all_reduce"
     out: list[str] = []
     for _, t in DTYPES:
         for world in WORLDS:
-            if not lays_out(kernel, b, world):
-                continue
             weighted = kernel in (
                 "all_reduce_rms_norm",
                 "rms_norm_rows",
@@ -288,14 +195,13 @@ def main() -> None:
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
     found = tables(table_path, archs)
     # EVERY BUILD THE TABLE NAMES AT ONE OF ITS KERNEL'S ALGORITHMS (the host's
-    # kAlgorithms_<kernel>; its own static_assert says the same at compile time, this says
-    # it naming the config).
+    # kAlgorithms_<kernel>: a body the kernel has, or the config names nothing to compile).
     has = algorithms(host)
     for kernel, bs in named(found).items():
         for b in bs:
             if kernel not in has or b[0] not in has[kernel]:
                 raise SystemExit(f"{kernel} has no {b[0]} algorithm: {b}")
-    every = builds(found, has)
+    every = named(found)
     text = [
         "// GENERATED by csrc/rocm/hip_custom_communicator/builds.py from the tuned",
         f"// tables (hip_custom_communicator.json) on {', '.join(archs)}: every",
@@ -329,8 +235,6 @@ def main() -> None:
         "static_assert("
         + " && ".join(f"Algorithm::{a} == {v}" for a, v in ALGORITHM_VALUES.items())
         + ", \"builds.py's algorithms are not common.cuh's\");",
-        f"static_assert(kUnfencedSlotBytes == {UNFENCED_SLOT_BYTES} && kInt4Group == "
-        f"{INT4_GROUP}, \"builds.py's unfenced slot and INT4 group are not the host's\");",
         "",
     ]
     files = []

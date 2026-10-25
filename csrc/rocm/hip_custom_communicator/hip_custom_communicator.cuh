@@ -713,8 +713,9 @@ enum class Error : int {
   block_too_large = 34,
   lds_too_large = 35,
   scratch_too_large = 36,
+  unfenced_too_small = 37,
 };
-constexpr int kNumErrors = 37;
+constexpr int kNumErrors = 38;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -817,6 +818,10 @@ constexpr const char* to_string(Error e) {
       return "scratch_too_large: the compiled kernel's scratch a lane is more than "
              "the device's scratch (hipExtLimitScratchMax) over its every lane, by "
              "kScratchShares (gfx950: 4 KiB a lane)";
+    case Error::unfenced_too_small:
+      return "unfenced_too_small: a pushed one-shot's tile does not fit the unfenced "
+             "region: a row of it past a slot's kUnfencedSlotBytes of payload, or its "
+             "grid's rows past a bank's kUnfencedBlocks";
   }
   return "unknown";
 }
@@ -2464,8 +2469,6 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 // kernels carry.
 
 // THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
-// builds lay out at that many elements a thread.
-constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / elem_bytes; }
 
 // THE BUILDS, GENERATED FROM THE TUNED TABLE (builds.py, at configure): each kernel's,
 // `kBuilds_<kernel>`, the build half of every config the table lists. A two-shot's INT4
@@ -2699,48 +2702,10 @@ static_assert(one_template_an_op(), "an op has two templates");
 // EACH OP'S KERNELS.
 // =================================================================================================
 
-// THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT at `world` ranks and `nl` elements
-// a pack, which its dispatch instantiates and nothing else (builds.py's
-// lays_out, the same rules): ANY BLOCK WALKS ANY TILE OF WHOLE PACKS (the dense
-// map, STANDARDS 3.2: a refusal the math or the hardware forces, never the
-// walk's convenience). The one-shot's tile in rows of threads (one row looping
-// over the rows where TILE_M does not divide the block), a row of threads' packs
-// in steps, the last masked at the tile (kernels/all_reduce.cuh); the two-shot's
-// [R, 1, TILE_N] chunk, a rank's THREADS / world threads (part of a wave: a
-// lane's own rank) in steps, the last masked at the chunk (the flat walk,
-// reduce_scatter.cuh). WHAT IS LEFT, EACH FORCED:
-//  - TILE_N WHOLE PACKS: a pack is one aligned 16-byte access (the pushed
-//    one-shot's an 8-byte line payload); a tile edge inside a pack splits it
-//    between two blocks' tiles (a row is whole packs: row_not_packs).
-//  - THE TWO-SHOT'S TILE_M 1: the flat walk numbers the band's elements
-//    row-major, so a chunk is TILE_N elements and has no rows; a TILE_M names a
-//    walk the kernel does not have.
-//  - THE TWO-SHOT'S BLOCK WORLD ROWS OF THREADS (a rank's copy a row, summed over
-//    the rows through LDS): every block is whole 64-lane waves
-//    (launch_out_of_range) and every built world divides 64, so it refuses no
-//    launchable block at a built world.
-// Every tuned entry must lay out, or select would refuse it at run time
-// (tile_not_built): checked here, at compile time.
-constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
-  return c.tile_n % nl == 0;
-}
-constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
-                                 int nl) {
-  return world > 0 && c.tile_m == 1 && c.block.x % world == 0 &&
-         c.tile_n % nl == 0;
-}
-// EVERY PUSHED ONE-SHOT BUILD'S TILE FITS AN UNFENCED SLOT (THE UNFENCED REGION) at
-// every built dtype.
-constexpr bool push_one_shot_tiles_fit() {
-  for (const BuildConfig& b : kBuilds_all_reduce)
-    for (const DType d : kBuild.supports.dtypes)
-      if (algorithm_of(b) == Algorithm::one_shot_push &&
-          (tile_m_of(b) != 1 || tile_n_of(b) * elem_bytes(d) > kUnfencedSlotBytes))
-        return false;
-  return true;
-}
-static_assert(push_one_shot_tiles_fit(),
-              "a pushed one-shot tile wider than its unfenced slot");
+// EVERY BUILD THE TABLE NAMES IS COMPILED AND TAKES ANY CALL ITS KERNEL CAN RUN (Michael, October
+// 25: the build makes what it is told): each kernel walks any tile at any block, its tails its own;
+// what a call cannot do is refused by name at the call (`refused`), its capacity (the regions, the
+// unfenced slot), the hardware's (`check_kernel`), or an algorithm's (INT4 on a one-shot).
 
 // A ROW OF THE STAGING AND PARTIALS AS A KERNEL VIEWS IT: n, or a groups-a-thread INT4 norm's
 // payload row, whole groups (its kernels' n_pad: every row's groups start on a group).
@@ -2957,6 +2922,13 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (!built_at(fn, algorithm, block, waves_of(c.build)))
     return Error::waves_not_built;
   if (!built(fn, c.build)) return Error::tile_not_built;
+  // A PUSHED ONE-SHOT IN THE UNFENCED REGION, its capacity (not a build's rule: any tile and
+  // grid is built): a row of a block's tile in a slot of kUnfencedSlotBytes of payload, a
+  // block's TILE_M rows of a bank's kUnfencedBlocks.
+  if (algorithm == Algorithm::one_shot_push &&
+      (tile_n_of(c.build) * elem_bytes(dtype) > kUnfencedSlotBytes ||
+       int64_t{c.launch.grid.x} * tile_m_of(c.build) > kUnfencedBlocks))
+    return Error::unfenced_too_small;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
   // An INT4 payload lies in the region that holds it exact (common.cuh's
@@ -3178,15 +3150,7 @@ void with_config_build(const Config& config, F& f) {
         }(), [&](auto b) {
           constexpr auto B = decltype(b)::value;
           constexpr int WORLD = decltype(world)::value;
-          constexpr bool valid = [=] {
-            if constexpr (FN != Template::all_reduce) return true;
-            else if constexpr (B.algorithm == Algorithm::one_shot_push)
-              return one_shot_lays_out(B, push_one_shot_pack(sizeof(T)));
-            else if constexpr (is_one_shot(B.algorithm))
-              return one_shot_lays_out(B, traits<T, kBuild.memory.pack_bytes>::N);
-            else return two_shot_lays_out(B, WORLD, traits<T, kBuild.memory.pack_bytes>::N);
-          }();
-          if constexpr (valid) {
+          {
             const auto layout = [&]<bool CONTIGUOUS, bool CHUNKED, bool TAIL>() {
               constexpr Config C = [=] {
                 Config c{};

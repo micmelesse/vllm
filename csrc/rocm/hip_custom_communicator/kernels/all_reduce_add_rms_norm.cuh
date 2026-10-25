@@ -103,7 +103,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_rms_norm, above).
-    static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
     // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
@@ -366,14 +367,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // A THREAD LOOPS OVER ITS GROUPS (common.cuh's group_run: group j of thread t is the row's
       // t + j * THREADS_PER_BLOCK), kGroups of them, so the tile and the block are two fields: one
       // group a thread is the loop of one, the code it was.
-      constexpr int kGroups = TILE_N / (kInt4Group * THREADS_PER_BLOCK);
+      constexpr int kGroups =
+          (TILE_N + kInt4Group * THREADS_PER_BLOCK - 1) / (kInt4Group * THREADS_PER_BLOCK);
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE GROUPS A THREAD (kGroupSpan columns): any tile at
+      // any block, the row's groups past it masked (the loads' clip, the TAIL instance's last group).
+      constexpr int kGroupSpan = kGroups * kInt4Group * THREADS_PER_BLOCK;
       constexpr int kThreadPacks = kGroups * kInt4GroupPacks;
       // REAL: a thread quantizes its groups alone (a group's scale is its own 32 values' largest),
       // so it holds whole groups, the same number in every thread (its registers are compiled); a
       // tile narrower than a group a thread would leave threads none (a group split over lanes is
       // another layout, not this body's).
-      static_assert(kGroups >= 1 && kGroups * kInt4Group * THREADS_PER_BLOCK == TILE_N,
-                    "the INT4 tile is whole groups a thread: TILE_N a multiple of 32 * THREADS");
       const int n = input_size_n;
       // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
       // groups start on a group of its slot.
@@ -386,7 +389,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
       // 1. THE PUSH, owners rotated (rank + w), a row of each a step, TWO OWNERS' ROWS IN FLIGHT (as
       // the flat walk's push: every owner's loads hoisted together are 8 groups of input a thread).
-      // Owner r's row l, its groups from column c (a TILE_N chunk: one, unless the row is wider).
+      // Owner r's row l, its groups from column c (a kGroupSpan chunk: one, unless the row is wider).
       const auto push = [&](int l, int r, int c) {
         DTYPE x[1][kThreadPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::group_run, TAIL>(
@@ -428,7 +431,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int w = 0; w < WORLD; ++w) {
             const int r = (rank + w) % WORLD;
             if (l >= rows_of(r)) continue;
-            for (int c = 0; c < n; c += TILE_N) push(l, r, c);
+            for (int c = 0; c < n; c += kGroupSpan) push(l, r, c);
           }
       }
       barrier<WORLD>(
@@ -463,7 +466,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
           {
             const auto chunk = [&](int c, float (&s)[1][kThreadPacks][kPackElems]) { values(l, c, s); };
-            for (int c = 0; c < n; c += TILE_N) {
+            for (int c = 0; c < n; c += kGroupSpan) {
               float s[1][kThreadPacks][kPackElems];
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kThreadPacks][kPackElems];
@@ -472,7 +475,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           NormPart::wide, true, Layout::group_run);
             }
           }
-          for (int c = 0; c < n; c += TILE_N) {
+          for (int c = 0; c < n; c += kGroupSpan) {
             float s[1][kThreadPacks][kPackElems];
             values(l, c, s);
             WEIGHT_DTYPE wc[1][kThreadPacks][kPackElems];
@@ -550,7 +553,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int l = blockIdx.x; l < slice_m; l += grid) gather(l, 0);
       else
         for (int l = blockIdx.x; l < slice_m; l += grid)
-          for (int c = 0; c < n; c += TILE_N) gather(l, c);
+          for (int c = 0; c < n; c += kGroupSpan) gather(l, c);
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_rms_norm, above).
@@ -687,7 +690,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_rms_norm, above).
-    static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
     // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
@@ -1023,14 +1027,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // A THREAD LOOPS OVER ITS GROUPS (common.cuh's group_run: group j of thread t is the row's
       // t + j * THREADS_PER_BLOCK), kGroups of them, so the tile and the block are two fields: one
       // group a thread is the loop of one, the code it was.
-      constexpr int kGroups = TILE_N / (kInt4Group * THREADS_PER_BLOCK);
+      constexpr int kGroups =
+          (TILE_N + kInt4Group * THREADS_PER_BLOCK - 1) / (kInt4Group * THREADS_PER_BLOCK);
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE GROUPS A THREAD (kGroupSpan columns): any tile at
+      // any block, the row's groups past it masked (the loads' clip, the TAIL instance's last group).
+      constexpr int kGroupSpan = kGroups * kInt4Group * THREADS_PER_BLOCK;
       constexpr int kThreadPacks = kGroups * kInt4GroupPacks;
       // REAL: a thread quantizes its groups alone (a group's scale is its own 32 values' largest),
       // so it holds whole groups, the same number in every thread (its registers are compiled); a
       // tile narrower than a group a thread would leave threads none (a group split over lanes is
       // another layout, not this body's).
-      static_assert(kGroups >= 1 && kGroups * kInt4Group * THREADS_PER_BLOCK == TILE_N,
-                    "the INT4 tile is whole groups a thread: TILE_N a multiple of 32 * THREADS");
       const int n = input_size_n;
       // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
       // groups start on a group of its slot.
@@ -1043,7 +1049,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
       // 1. THE PUSH, owners rotated (rank + w), a row of each a step, TWO OWNERS' ROWS IN FLIGHT (as
       // the flat walk's push: every owner's loads hoisted together are 8 groups of input a thread).
-      // Owner r's row l, its groups from column c (a TILE_N chunk: one, unless the row is wider).
+      // Owner r's row l, its groups from column c (a kGroupSpan chunk: one, unless the row is wider).
       const auto push = [&](int l, int r, int c) {
         DTYPE x[1][kThreadPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::group_run, TAIL>(
@@ -1085,7 +1091,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int w = 0; w < WORLD; ++w) {
             const int r = (rank + w) % WORLD;
             if (l >= rows_of(r)) continue;
-            for (int c = 0; c < n; c += TILE_N) push(l, r, c);
+            for (int c = 0; c < n; c += kGroupSpan) push(l, r, c);
           }
       }
       barrier<WORLD>(
@@ -1133,7 +1139,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                         DTYPE added[1][kThreadPacks][kPackElems];
                         values(l, c, s, added);
                       };
-            for (int c = 0; c < n; c += TILE_N) {
+            for (int c = 0; c < n; c += kGroupSpan) {
               float s[1][kThreadPacks][kPackElems];
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kThreadPacks][kPackElems];
@@ -1142,7 +1148,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           NormPart::wide, true, Layout::group_run);
             }
           }
-          for (int c = 0; c < n; c += TILE_N) {
+          for (int c = 0; c < n; c += kGroupSpan) {
             float s[1][kThreadPacks][kPackElems];
             DTYPE added[1][kThreadPacks][kPackElems];
             values(l, c, s, added);
@@ -1250,7 +1256,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int l = blockIdx.x; l < slice_m; l += grid) gather(l, 0, w);
       else
         for (int l = blockIdx.x; l < slice_m; l += grid)
-          for (int c = 0; c < n; c += TILE_N) {
+          for (int c = 0; c < n; c += kGroupSpan) {
             WEIGHT_DTYPE wc[1][kThreadPacks][kPackElems];
             load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::group_run, TAIL>(
                 &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);

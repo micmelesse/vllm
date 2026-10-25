@@ -963,48 +963,68 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
                         print(f"{op} {hidden} {dtype} {forcing}: refused at every size")
 
 
-def _every_norm_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
-    """Every build of `op`'s norm on rows (`ROWS[op]`), composed after our all-reduce
-    at a grid of 16 (rows past it looped), eager, at each width, at one row and at more
-    rows than the grid, against the reference: any tile at any block, the row a tile's
-    whole packs a thread or not (a pass rounded up to whole packs, the row's columns
-    past it masked), the row wider than the tile or not."""
+def _built_configs(kernel: str) -> list[Config]:
+    """Every build of `kernel` as a config, at a grid of 16 (rows past it looped)."""
+    return [
+        Config(
+            kernel=kernel,
+            algorithm=cast(Algorithm, b["algorithm"]),
+            grid_x=16,
+            grid_y=1,
+            grid_z=1,
+            block_x=int(b["block_x"]),
+            block_y=int(b["block_y"]),
+            block_z=int(b["block_z"]),
+            waves_per_eu=int(b["waves_per_eu"]),
+            tile_m=int(b["tile_m"]),
+            tile_n=int(b["tile_n"]),
+            tile_k=int(b["tile_k"]),
+            quantization=cast(Quantization, b["quantization"]),
+        )
+        for b in build_info().templates[kernel].builds
+    ]
+
+
+def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
+    """Every build of `op`'s kernel forced, and every build of its norm on rows composed
+    after our all-reduce, against the reference: an exact build at every width at one
+    row and at more rows than its grid, an INT4 two-shot against the INT4 format
+    (`_int4_case`) at its shapes; any tile at any block (its tails its own). A build the
+    host refuses by name at a size (its capacity) is said, never run."""
     layer = ATTN_RES_LAYERS[0] if op == "all_reduce_add_attn_res_rms_norm" else None
-    kernel = next(n for n, t in build_info().templates.items() if t.op == ROWS[op])
-    for hidden in WIDTHS[op]:
-        for b in build_info().templates[kernel].builds:
-            config = Config(
-                kernel=kernel,
-                algorithm=cast(Algorithm, b["algorithm"]),
-                grid_x=16,
-                grid_y=1,
-                grid_z=1,
-                block_x=int(b["block_x"]),
-                block_y=int(b["block_y"]),
-                block_z=int(b["block_z"]),
-                waves_per_eu=int(b["waves_per_eu"]),
-                tile_m=int(b["tile_m"]),
-                tile_n=int(b["tile_n"]),
-                tile_k=int(b["tile_k"]),
-                quantization=cast(Quantization, b["quantization"]),
-            )
+    (kernel,) = [n for n, t in build_info().templates.items() if t.op == op]
+    forcings: list[Forcing] = [*_built_configs(kernel)]
+    if op in ROWS:
+        (rows_kernel,) = [n for n, t in build_info().templates.items() if t.op == ROWS[op]]
+        forcings += [Composed(norm_config=c) for c in _built_configs(rows_kernel)]
+    for forcing in forcings:
+        config = forcing.norm_config if isinstance(forcing, Composed) else forcing
+        assert config is not None
+        if config.quantization == "int4":
+            if not isinstance(forcing, Composed) and "two_shot" in config.algorithm:
+                for shape in INT4_SHAPES:
+                    _int4_case(
+                        comm, rank, op, Variant(kernel, config.algorithm), shape, config
+                    )
+            continue
+        for hidden in WIDTHS[op]:
             for rows in (1, 33):
                 ran = _eager(
-                    comm, rank, op, rows, hidden, torch.bfloat16, Composed(config),
-                    layer, rows,
+                    comm, rank, op, rows, hidden, torch.bfloat16, forcing, layer, rows
                 )
-                assert ran, f"{op} {rows}x{hidden}: {config} refused"
+                if not ran and rank == 0:
+                    print(f"{op} {rows}x{hidden}: {forcing} refused by name")
 
 
 @on_eight_gpus
-@pytest.mark.parametrize("op", sorted(ROWS))
-def test_every_norm_build_matches_the_reference(op: Op) -> None:
-    """Every build of each fused op's norm on rows matches the reference at every
-    width: what a tune may pick is right whatever its block and tile (a pass covering
-    a tile not whole packs a thread skipped its remainder, unchecked, until
-    2026-10-25)."""
+@pytest.mark.parametrize("op", TUNED_OPS)
+def test_every_build_matches_the_reference(op: Op) -> None:
+    """Every build of each op's kernel, and of each fused op's norm on rows, matches the
+    reference: what a tune may pick is right whatever its block and tile (a pass
+    covering a tile not whole packs a thread skipped its remainder, unchecked, until
+    2026-10-25; the per-op test forces only each variant's first build)."""
     # example-based: every build the install compiled, a tune's candidates too
-    _on_every_rank(target=partial(_every_norm_build_on_rank, op=op))
+    _on_every_rank(target=partial(_every_build_on_rank, op=op))
 
 
 @on_eight_gpus
@@ -1104,6 +1124,7 @@ def _int4_case(
     op: Op,
     variant: Variant,
     shape: tuple[int, int],
+    config: Config | None = None,
 ) -> None:
     import vllm.ir.ops
     from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
@@ -1120,7 +1141,11 @@ def _int4_case(
         and "rms_norm" in op
         and "attn_res" not in op
     )
-    forced_config = _forced_whole(variant, _tile_cols(op, hidden), "int4")
+    forced_config = (
+        config
+        if config is not None
+        else _forced_whole(variant, _tile_cols(op, hidden), "int4")
+    )
     mine = inputs[rank].to(device)
     normed = _tolerance(dtype, normed=True)
     checks: list[tuple[str, torch.Tensor, torch.Tensor, Tolerance]]
@@ -1494,79 +1519,24 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
                 name,
                 b,
             )
-        for b in t.builds:
-            if b["quantization"] != "int4":
-                continue
-            assert b["algorithm"] in ("two_shot_pull", "two_shot_push"), (name, b)
-            if b["algorithm"] == "two_shot_pull":
-                assert name != "all_reduce", (name, b)
-                assert b["tile_n"] % (b["block_x"] * INT4_GROUP) == 0, (name, b)
-                assert b["tile_m"] == 1, (name, b)
 
 
-# EACH KERNEL'S ALGORITHMS, the bodies its op file has, in its order (the host's
-# kAlgorithms_<kernel>).
-_FUSED_ALGORITHMS = ("one_shot_pull", "two_shot_pull", "two_shot_push")
-ALGORITHMS: dict[str, tuple[str, ...]] = {
-    "all_reduce": ("one_shot_pull", "two_shot_pull", "one_shot_push", "two_shot_push"),
-    "all_reduce_rms_norm": _FUSED_ALGORITHMS,
-    "all_reduce_add_rms_norm": _FUSED_ALGORITHMS,
-    "all_reduce_add_attn_res_rms_norm": _FUSED_ALGORITHMS,
-    "rms_norm_rows": ("rows",),
-    "add_rms_norm_rows": ("rows",),
-    "add_attn_res_rms_norm_rows": ("rows",),
-}
-
-
-def _takes(kernel: str, b: dict[str, int | str]) -> bool:
-    """Whether `kernel` at build `b`'s algorithm is one it builds: INT4 a two-shot's and
-    not the plain pull's (a one-shot reads its peers' inputs as they are); the pushed
-    one-shot a row no wider than its unfenced slot (2048 bytes of 16-bit elements); a
-    fused pull's INT4 whole groups a thread, a row high; a plain two-shot a row high (the
-    flat walk)."""
-    algorithm = b["algorithm"]
-    if b["quantization"] == "int4" and not (
-        algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
-    ):
-        return False
-    if kernel == "all_reduce" and algorithm == "one_shot_push":
-        return b["tile_m"] == 1 and int(b["tile_n"]) * 2 <= 2048
-    if kernel == "all_reduce" and algorithm in ("two_shot_pull", "two_shot_push"):
-        return b["tile_m"] == 1
-    if b["quantization"] == "int4" and algorithm == "two_shot_pull":
-        return int(b["tile_n"]) % (int(b["block_x"]) * INT4_GROUP) == 0 and b["tile_m"] == 1
-    return True
-
-
-def test_the_builds_are_every_algorithm_of_the_tables_shapes() -> None:
+def test_the_builds_are_the_tables_configs() -> None:
     """What the build compiled is the build half of every config the tuned table lists
-    on gfx950, each kernel's in the order the table first names them, then the kernel
-    at every algorithm it has at every shape the table holds of it (its block, waves,
-    tile and quantization) that the algorithm takes (builds.py, at configure): no build
-    without a shape of the table, no config without its build, no algorithm of a shape
-    left out, so a pruned table never drops a path a call can be forced to take."""
+    on gfx950, each kernel's in the order the table first names them, nothing left out
+    and nothing added (builds.py at configure makes what it is told, Michael, October
+    25: a config a kernel cannot run at a call is refused by name there, never by the
+    build)."""
     import vllm._rocm_C  # noqa: F401
 
     table = json.loads(_TABLE.read_text())["gfx950"]
-    variant = ("algorithm",)
-    shape = ("block_x", "block_y", "block_z", "waves_per_eu")
-    shape += ("tile_m", "tile_n", "tile_k", "quantization")
+    fields = ("algorithm", "block_x", "block_y", "block_z", "waves_per_eu")
+    fields += ("tile_m", "tile_n", "tile_k", "quantization")
     want: dict[str, list[dict[str, int | str]]] = {}
     for c in table["configs"]:
-        b = {f: c[f] for f in variant + shape}
+        b = {f: c[f] for f in fields}
         if b not in want.setdefault(c["kernel"], []):
             want[c["kernel"]].append(b)
-    for kernel, bs in want.items():
-        shapes: list[dict[str, int | str]] = []
-        for b in bs:
-            s = {f: b[f] for f in shape}
-            if s not in shapes:
-                shapes.append(s)
-        for s in shapes:
-            for a in ALGORITHMS[kernel]:
-                b = {"algorithm": a} | s
-                if b not in bs and _takes(kernel, b):
-                    bs.append(b)
     got = {name: list(t.builds) for name, t in build_info().templates.items()}
     assert got == want
 

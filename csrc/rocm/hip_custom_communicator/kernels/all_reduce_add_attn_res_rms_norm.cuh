@@ -144,7 +144,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float eps, float output_eps) {
   if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_attn_res_rms_norm, above).
-    static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
+    // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
+    // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
     // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
@@ -238,14 +239,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // A THREAD LOOPS OVER ITS GROUPS (common.cuh's group_run: group j of thread t is the row's
       // t + j * THREADS_PER_BLOCK), kGroups of them, so the tile and the block are two fields: one
       // group a thread is the loop of one, the code it was.
-      constexpr int kGroups = TILE_N / (kInt4Group * THREADS_PER_BLOCK);
+      constexpr int kGroups =
+          (TILE_N + kInt4Group * THREADS_PER_BLOCK - 1) / (kInt4Group * THREADS_PER_BLOCK);
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE GROUPS A THREAD (kGroupSpan columns): any tile at
+      // any block, the row's groups past it masked (the loads' clip, the TAIL instance's last group).
+      constexpr int kGroupSpan = kGroups * kInt4Group * THREADS_PER_BLOCK;
       constexpr int kThreadPacks = kGroups * kInt4GroupPacks;
       // REAL: a thread quantizes its groups alone (a group's scale is its own 32 values' largest),
       // so it holds whole groups, the same number in every thread (its registers are compiled); a
       // tile narrower than a group a thread would leave threads none (a group split over lanes is
       // another layout, not this body's).
-      static_assert(kGroups >= 1 && kGroups * kInt4Group * THREADS_PER_BLOCK == TILE_N,
-                    "the INT4 tile is whole groups a thread: TILE_N a multiple of 32 * THREADS");
       const int n = input_size_n;
       // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
       // groups start on a group of its slot.
@@ -268,7 +271,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       const int step = classes == 1 ? grid : slice_m;
 
       // 1. THE PUSH, owners rotated (rank + w), a row of each a step, two owners' rows in flight.
-      // Owner r's row l, its groups from column col (a TILE_N chunk: one, unless the row is wider).
+      // Owner r's row l, its groups from column col (a kGroupSpan chunk: one, unless the row is wider).
       const auto push = [&](int l, int r, int col) {
         DTYPE x[1][kThreadPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::group_run, TAIL>(
@@ -311,7 +314,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int w = 0; w < WORLD; ++w) {
             const int r = (rank + w) % WORLD;
             if ((r & mask) != c || l >= rows_of(r)) continue;
-            for (int col = 0; col < n; col += TILE_N) push(l, r, col);
+            for (int col = 0; col < n; col += kGroupSpan) push(l, r, col);
           }
       }
       barrier<WORLD>(
@@ -339,7 +342,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               l * n_pad + col, 1);
         };
         if constexpr (CHUNKED)
-          for (int col = 0; col < n; col += TILE_N) sum(col);
+          for (int col = 0; col < n; col += kGroupSpan) sum(col);
         else
           sum(0);
       }
@@ -379,7 +382,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                 prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
                 block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m, n,
                 owner * slice_m + l, 0, num_blocks, eps, output_eps, inv_hidden, sum_chunk,
-                TILE_N);
+                kGroupSpan);
             continue;
           }
           uint32_t raw[1][kThreadPacks][2];
