@@ -103,6 +103,11 @@ GRAPH_LAYERS = 2
 GRAPH_REPLAYS = 3
 KERNEL_TIMEOUT_S = 30.0
 PROCESS_TIMEOUT_S = 900
+# EVERY BUILD, A SWEEP: each build at four widths and two row counts, the tails space's three
+# packs of each (AttnRes's ran past 900 s, 2026-10-25T21-17-23Z, its last step a refusal and no
+# kernel's watchdog fired: a long sweep, not a hang). A hang inside a kernel is still the kernel
+# timeout's.
+EVERY_BUILD_TIMEOUT_S = 3600
 # The basic-correctness (smoke) test's world: a broken basic fails in minutes,
 # not a PROCESS_TIMEOUT_S.
 # 30 s, as every other test: on 2026-10-16 one rank's first 2048-row launch ran
@@ -1060,6 +1065,9 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
                     )
                 except AssertionError as wrong:
                     wrongs.append(str(wrong))
+                    # SAID AS FOUND, so a sweep cut short still names what it found wrong.
+                    if rank == 0:
+                        print(f"WRONG {wrong}", flush=True)
                     continue
                 if not ran and rank == 0:
                     print(f"{op} {rows}x{hidden}: {forcing} refused by name")
@@ -1074,7 +1082,10 @@ def test_every_build_matches_the_reference(op: Op) -> None:
     covering a tile not whole packs a thread skipped its remainder, unchecked, until
     2026-10-25; the per-op test forces only each variant's first build)."""
     # example-based: every build the install compiled, a tune's candidates too
-    _on_every_rank(target=partial(_every_build_on_rank, op=op))
+    _on_every_rank(
+        target=partial(_every_build_on_rank, op=op),
+        process_timeout_s=EVERY_BUILD_TIMEOUT_S,
+    )
 
 
 def _pushed_one_shots() -> dict[int, Config]:
