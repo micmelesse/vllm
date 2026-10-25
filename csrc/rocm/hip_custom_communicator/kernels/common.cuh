@@ -1456,8 +1456,11 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
                             __MEMORY_SCOPE_SYSTEM);
     // 5. WAIT, AT SYSTEM SCOPE, for the flag a peer's system-scope release stored. Spins
     // relaxed and acquires once, after: an acquire per poll would invalidate the caches on
-    // every iteration of every spinning block. A sleep a poll (64 cycles) keeps a spinning
-    // block from hammering the link. EVERY 256 POLLS, the slow path: the clock, and the
+    // every iteration of every spinning block. NO SLEEP A POLL: the flag polled is this rank's
+    // own (its peers store into it), so a poll crosses no link, and a 64-cycle sleep was up to
+    // 64 cycles late seeing each barrier's last peer (aiter's waits poll bare; the two-shot pull
+    // lost 1-3% to its 2-stage at the same grid, 2026-10-25T03-37-04Z). EVERY 256 POLLS, the
+    // slow path: the clock, and the
     // status's `abort` (host-mapped, so only here, never in the fast path). Past the timeout
     // the wait records the fault; timed out or aborted, the WAVE ENDS (s_endpgm): an ended wave
     // no longer counts at the block's s_barrier, so the block's other waves run on to their own
@@ -1475,7 +1478,6 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     for (uint32_t n = 1;
          __scoped_atomic_load_n(mine_ptr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) < want;
          ++n) {
-      __builtin_amdgcn_s_sleep(1);
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
       const bool aborted = __scoped_atomic_load_n(word(StatusField::abort), __ATOMIC_RELAXED,
