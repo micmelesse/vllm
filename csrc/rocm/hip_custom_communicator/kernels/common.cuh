@@ -1413,7 +1413,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // unsigned, as blockIdx.x; a rank as passed): an int where the caller had an unsigned costs
   // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
   // this rank's, written by this lane's peer.
-  // THE OWNER'S SIGNALS are its entry of the table: theirs a lane's peer (lane_ptr_array_at),
+  // THE OWNER'S SIGNALS are its entry of the table: theirs a lane's peer (one load a lane, below),
   // mine this rank's, the same across the wave, so one scalar read (ptr_array_at; through the
   // lane form it was WORLD - 1 rank compares and a select chain, their masks spilled to a VGPR in
   // the plain two-shot: ISA 2026-10-19T03-07-38Z), kept a global pointer as the lane form's is.
@@ -1431,12 +1431,19 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // THEIR ADDRESSES FIRST, before the block barrier: the signals table is fixed at open, so its
   // read (a cold scalar load, ~1500 cycles at decode: ATT 2026-10-18T15-45-22Z) overlaps the
   // kernel's argument loads and the other waves' arrival instead of following them.
+  // THEIRS BY ONE LOAD A LANE (aiter's `sg.signals[threadIdx.x]`): lane l reads entry l of the
+  // table itself. Through lane_ptr_array_at it was all WORLD entries read scalar and a select a
+  // lane, in each barrier: 16 SGPRs and 14 v_cndmask a barrier, the two-shot pull at 106 SGPRs, 35
+  // spilled (ISA 2026-10-25, b2b039a6ac).
   uint32_t* theirs_ptr = nullptr;
   uint32_t* mine_ptr = nullptr;
   if (threadIdx.x < WORLD) {
-    theirs_ptr = flag(internal::lane_ptr_array_at<uint32_t, WORLD>(
-                          signals_ptr_array, signals_ptr_array_size, static_cast<int>(threadIdx.x)),
-                      threadIdx.x, blockIdx.x, rank);
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && WORLD > signals_ptr_array_size) __builtin_trap();
+    // A global pointer, so its accesses stay global_* (from an integer they were flat_*).
+    const uint64_t entry =
+        ((const __attribute__((address_space(1))) uint64_t*)signals_ptr_array)[threadIdx.x];
+    theirs_ptr = flag((uint32_t*)(__attribute__((address_space(1))) uint32_t*)entry, threadIdx.x,
+                      blockIdx.x, rank);
     mine_ptr = flag((uint32_t*)(__attribute__((address_space(1))) uint32_t*)internal::ptr_array_at(
                         signals_ptr_array, signals_ptr_array_size, rank),
                     rank, blockIdx.x, threadIdx.x);
