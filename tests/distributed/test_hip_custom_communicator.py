@@ -963,6 +963,50 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
                         print(f"{op} {hidden} {dtype} {forcing}: refused at every size")
 
 
+def _every_norm_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
+    """Every build of `op`'s norm on rows (`ROWS[op]`), composed after our all-reduce
+    at a grid of 16 (rows past it looped), eager, at each width, at one row and at more
+    rows than the grid, against the reference: any tile at any block, the row a tile's
+    whole packs a thread or not (a pass rounded up to whole packs, the row's columns
+    past it masked), the row wider than the tile or not."""
+    layer = ATTN_RES_LAYERS[0] if op == "all_reduce_add_attn_res_rms_norm" else None
+    kernel = next(n for n, t in build_info().templates.items() if t.op == ROWS[op])
+    for hidden in WIDTHS[op]:
+        for b in build_info().templates[kernel].builds:
+            config = Config(
+                kernel=kernel,
+                algorithm=cast(Algorithm, b["algorithm"]),
+                grid_x=16,
+                grid_y=1,
+                grid_z=1,
+                block_x=int(b["block_x"]),
+                block_y=int(b["block_y"]),
+                block_z=int(b["block_z"]),
+                waves_per_eu=int(b["waves_per_eu"]),
+                tile_m=int(b["tile_m"]),
+                tile_n=int(b["tile_n"]),
+                tile_k=int(b["tile_k"]),
+                quantization=cast(Quantization, b["quantization"]),
+            )
+            for rows in (1, 33):
+                ran = _eager(
+                    comm, rank, op, rows, hidden, torch.bfloat16, Composed(config),
+                    layer, rows,
+                )
+                assert ran, f"{op} {rows}x{hidden}: {config} refused"
+
+
+@on_eight_gpus
+@pytest.mark.parametrize("op", sorted(ROWS))
+def test_every_norm_build_matches_the_reference(op: Op) -> None:
+    """Every build of each fused op's norm on rows matches the reference at every
+    width: what a tune may pick is right whatever its block and tile (a pass covering
+    a tile not whole packs a thread skipped its remainder, unchecked, until
+    2026-10-25)."""
+    # example-based: every build the install compiled, a tune's candidates too
+    _on_every_rank(target=partial(_every_norm_build_on_rank, op=op))
+
+
 @on_eight_gpus
 @pytest.mark.parametrize("op", TUNED_OPS)
 def test_op_matches_the_ops_it_replaces(op: Op) -> None:
@@ -1479,11 +1523,8 @@ def _takes(kernel: str, b: dict[str, int | str]) -> bool:
     not the plain pull's (a one-shot reads its peers' inputs as they are); the pushed
     one-shot a row no wider than its unfenced slot (2048 bytes of 16-bit elements); a
     fused pull's INT4 whole groups a thread, a row high; a plain two-shot a row high (the
-    flat walk); every other kernel's tile whole 16-byte packs a thread (8 elements of a
-    2-byte dtype: a remainder would be skipped, its static_asserts)."""
+    flat walk)."""
     algorithm = b["algorithm"]
-    if kernel != "all_reduce" and int(b["tile_n"]) % (8 * int(b["block_x"])) != 0:
-        return False
     if b["quantization"] == "int4" and not (
         algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
     ):

@@ -105,11 +105,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // PULL ONE-SHOT (all_reduce_pull_one_shot_rms_norm, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
     // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = values;
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -154,7 +154,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
-        for (int c = 0; c < input_size_n; c += TILE_N) {
+        for (int c = 0; c < input_size_n; c += kSpan) {
           float s[1][kPacks][kPackElems];
           values(c, s);
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
@@ -208,11 +208,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "unsupported quantization");
     if constexpr (QUANTIZATION == Quantization::exact) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-      // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-      // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-      static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                    "a tile is whole packs a thread");
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      constexpr int kPacks =
+          (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+      constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       const int slice_m = (input_size_m + WORLD - 1) / WORLD;
       constexpr int kScaleSlot = 0;
@@ -299,7 +299,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
           {
             const auto chunk = values;
-            for (int c = 0; c < input_size_n; c += TILE_N) {
+            for (int c = 0; c < input_size_n; c += kSpan) {
               float s[1][kPacks][kPackElems];
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -308,7 +308,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           NormPart::wide, true, Layout::tile);
             }
           }
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             values(c, s);
             WEIGHT_DTYPE wc[1][kPacks][kPackElems];
@@ -559,11 +559,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     // 1-3. none: nothing staged, every rank's input read in place where the input table says.
     // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
@@ -600,7 +600,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = values;
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -609,7 +609,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
-        for (int c = 0; c < input_size_n; c += TILE_N) {
+        for (int c = 0; c < input_size_n; c += kSpan) {
           float s[1][kPacks][kPackElems];
           values(c, s);
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
@@ -689,11 +689,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_rms_norm, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
     // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -744,7 +744,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = scale_values;
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -753,7 +753,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
-        for (int c = 0; c < input_size_n; c += TILE_N) {
+        for (int c = 0; c < input_size_n; c += kSpan) {
           float s[1][kPacks][kPackElems];
           DTYPE added[1][kPacks][kPackElems];
           values(c, s, added);
@@ -816,11 +816,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "unsupported quantization");
     if constexpr (QUANTIZATION == Quantization::exact) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-      // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-      // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-      static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                    "a tile is whole packs a thread");
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      constexpr int kPacks =
+          (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+      constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       const int slice_m = (input_size_m + WORLD - 1) / WORLD;
       constexpr int kScaleSlot = kPackElems;
@@ -940,7 +940,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
           {
             const auto chunk = scale_values;
-            for (int c = 0; c < input_size_n; c += TILE_N) {
+            for (int c = 0; c < input_size_n; c += kSpan) {
               float s[1][kPacks][kPackElems];
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -949,7 +949,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           NormPart::wide, true, Layout::tile);
             }
           }
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             DTYPE added[1][kPacks][kPackElems];
             values(c, s, added);
@@ -1264,11 +1264,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     // 1-3. none: nothing staged, every rank's input read in place where the input table says.
     // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
@@ -1314,7 +1314,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                     DTYPE added[1][kPacks][kPackElems];
                     values(c, s, added);
                   };
-          for (int c = 0; c < input_size_n; c += TILE_N) {
+          for (int c = 0; c < input_size_n; c += kSpan) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -1323,7 +1323,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
-        for (int c = 0; c < input_size_n; c += TILE_N) {
+        for (int c = 0; c < input_size_n; c += kSpan) {
           float s[1][kPacks][kPackElems];
           DTYPE added[1][kPacks][kPackElems];
           values(c, s, added);
@@ -1397,11 +1397,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   int weight_size_n, DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
                   int64_t output_stride_n, int output_size_m, int output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-  // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-  // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-  static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                "a tile is whole packs a thread");
+  // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  constexpr int kPacks =
+      (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
@@ -1427,7 +1427,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int m = 0; m < TILE_M; ++m) scale[m] = 0.0f;
       {
         const auto chunk = values;
-        for (int c = 0; c < n; c += TILE_N) {
+        for (int c = 0; c < n; c += kSpan) {
           float s[TILE_M][kPacks][kPackElems];
           chunk(c, s);
           WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -1436,7 +1436,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
-      for (int c = 0; c < n; c += TILE_N) {
+      for (int c = 0; c < n; c += kSpan) {
         float s[TILE_M][kPacks][kPackElems];
         values(c, s);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
@@ -1487,11 +1487,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       int64_t residual_output_stride_m, int64_t residual_output_stride_n,
                       int residual_output_size_m, int residual_output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-  // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-  // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-  static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                "a tile is whole packs a thread");
+  // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  constexpr int kPacks =
+      (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
@@ -1529,7 +1529,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   DTYPE added[TILE_M][kPacks][kPackElems];
                   values(c, s, added);
                 };
-        for (int c = 0; c < n; c += TILE_N) {
+        for (int c = 0; c < n; c += kSpan) {
           float s[TILE_M][kPacks][kPackElems];
           chunk(c, s);
           WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
@@ -1538,7 +1538,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
-      for (int c = 0; c < n; c += TILE_N) {
+      for (int c = 0; c < n; c += kSpan) {
         float s[TILE_M][kPacks][kPackElems];
         DTYPE added[TILE_M][kPacks][kPackElems];
         values(c, s, added);

@@ -146,11 +146,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_attn_res_rms_norm, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
     // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -193,7 +193,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
             block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
             input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden, sum_chunk,
-            TILE_N);
+            kSpan);
         continue;
       }
       DTYPE peers[WORLD][1][kPacks][kPackElems];
@@ -403,11 +403,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     } else {
       // THE EXACT BUILD.
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-      // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-      // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-      static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                    "a tile is whole packs a thread");
+      // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      constexpr int kPacks =
+          (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+      constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       // EVERY RANK AN EQUAL SLICE OF THE ROW, in elements: rounded up to whole
       // waves (so a wave's packs had one owner), rank 7 owned nothing at 3584 and
@@ -463,7 +463,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
               block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
               input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden, sum_chunk,
-              TILE_N);
+              kSpan);
           continue;
         }
         DTYPE sum[TILE_M][kPacks][kPackElems];
@@ -492,11 +492,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // INT4 payload layout): found from each region's own sizes where read or
     // written.
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                  "a tile is whole packs a thread");
+    // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    constexpr int kPacks =
+        (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+    constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
     //    to every rank (itself too), at their place in the tensor: A SLICE OF LANES A ROW, as wide
@@ -541,7 +541,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
             block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
             input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden, sum_chunk,
-            TILE_N);
+            kSpan);
         continue;
       }
       DTYPE sum[1][kPacks][kPackElems];
@@ -605,11 +605,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int block_output_size_m, int block_output_size_n, int num_blocks,
         float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-  // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
-  // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
-  static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
-                "a tile is whole packs a thread");
+  // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
+  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  constexpr int kPacks =
+      (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
+  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
   // A TILE'S REGISTERS ARE THE LOOP BODY'S SCOPE (the fused pull's reason).
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
@@ -632,7 +632,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
           block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
           input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden, sum_chunk,
-          TILE_N);
+          kSpan);
       continue;
     }
     DTYPE sum[TILE_M][kPacks][kPackElems];
