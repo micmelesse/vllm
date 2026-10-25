@@ -41,7 +41,8 @@ import warnings
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
@@ -1042,18 +1043,19 @@ def get_given_config(
     )
 
 
-def get_nearest_configs(
+def get_nearest_pick(
     table: TunedTable,
     op: Op,
     rows: int,
     cols: int,
     quantization: Quantization,
     world: int,
-) -> list[Config]:
-    """WHAT A PLAIN CALL OF `op` LAUNCHES on `rows` x `cols`, from the arch's `table`:
-    the pick of the nearest input of `op` tuned in the communicator's mode
-    (`quantization`) at `world`, its configs in the order they launch. The nearest
-    width, then the nearest size (rows x width), the fewer tokens on a tie."""
+) -> dict[str, Any]:
+    """THE PICK A PLAIN CALL OF `op` ON `rows` x `cols` RUNS, from the arch's `table`:
+    its record (`input`, the table input it was tuned at; `configs`, what it launches),
+    the nearest input of `op` tuned in the communicator's mode (`quantization`) at
+    `world`. The nearest width, then the nearest size (rows x width), the fewer tokens
+    on a tie."""
     inputs = table["inputs"]
     picks = [
         k
@@ -1065,14 +1067,33 @@ def get_nearest_configs(
     width = min(
         (inputs[k["input"]]["hidden"] for k in picks), key=lambda h: abs(h - cols)
     )
-    nearest = min(
+    return min(
         (k for k in picks if inputs[k["input"]]["hidden"] == width),
         key=lambda k: (
             abs(inputs[k["input"]]["tokens"] * width - rows * cols),
             inputs[k["input"]]["tokens"],
         ),
     )
-    return [_config(table["configs"][j]) for j in nearest["configs"]]
+
+
+def get_nearest_configs(
+    table: TunedTable,
+    op: Op,
+    rows: int,
+    cols: int,
+    quantization: Quantization,
+    world: int,
+) -> list[Config]:
+    """WHAT A PLAIN CALL OF `op` LAUNCHES on `rows` x `cols`, from the arch's `table`:
+    its pick's configs (`get_nearest_pick`), in the order they launch."""
+    return picked_configs(
+        table, get_nearest_pick(table, op, rows, cols, quantization, world)
+    )
+
+
+def picked_configs(table: TunedTable, pick: Mapping[str, Any]) -> list[Config]:
+    """A pick's configs (its record in the arch's `table`), in the order they launch."""
+    return [_config(table["configs"][j]) for j in pick["configs"]]
 
 
 def get_kernel_config(
@@ -1159,6 +1180,14 @@ def open_handle(
     except RuntimeError as e:
         raise RuntimeError(f"{e}\n{last_log() or 'no log was made'}") from e
     return Error(err) if err is not None else handle
+
+
+def configured_debug_file() -> str | None:
+    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE` asks: the file every call's
+    resolved configs are appended to, or None (off, the default)."""
+    import vllm.envs as envs
+
+    return envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE or None
 
 
 def configured_quantization() -> Quantization:
@@ -1322,6 +1351,7 @@ class HipCustomCommunicator:
         quantization: Quantization | None = None,
         log_mode: LogMode | None = None,
         tables: TunedTables | None = None,
+        debug_file: str | Path | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
@@ -1335,7 +1365,10 @@ class HipCustomCommunicator:
         state log records (`log()`); None is what the environment asks
         (`configured_log_mode`). `tables`: the tuned tables its plain calls run from
         (the arch's), of the file's shape (the tuner's candidate); None is the file's
-        (`hip_custom_communicator.json`), read once."""
+        (`hip_custom_communicator.json`), read once. `debug_file`: where every call's
+        resolved configs are appended before it launches, a JSON line each (`_debug`;
+        every rank's to the one file, its rank in each line); None is what the
+        environment asks (`configured_debug_file`), off unless it names one."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -1370,6 +1403,11 @@ class HipCustomCommunicator:
         self._given_tables = tables
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
+        debug_path = configured_debug_file() if debug_file is None else debug_file
+        if debug_path is not None:
+            # LINE-BUFFERED, APPENDED: each call's line one write, so the ranks'
+            # lines in the one file never interleave.
+            self._debug_out = open(debug_path, "a", buffering=1)  # noqa: SIM115
         why = self._open()
         if why is None:
             self.state = Open()
@@ -1393,6 +1431,7 @@ class HipCustomCommunicator:
         self._lock = threading.Lock()
         self._stop_watching = threading.Event()
         self._watchdog = None
+        self._debug_out = None
         if state is not None:
             self.state = state
 
@@ -1408,6 +1447,48 @@ class HipCustomCommunicator:
     # table: a call of one gives its config. A forced call asks no `should_`: C++
     # answers it. An op raises a RuntimeError naming the Error it is refused for; a
     # call its `should_` admitted is never refused.
+
+    @final
+    def _debug(
+        self,
+        op: str,
+        tensors: Mapping[str, torch.Tensor | None],
+        values: Mapping[str, int | float],
+        configs: Sequence[Config],
+        pick: Mapping[str, Any] | None,
+    ) -> None:
+        """THE CALL'S LINE IN THE DEBUG FILE, where one is open (`debug_file`), written
+        before it launches: when, the rank and the world, the op, the communicator's
+        quantization, whether a graph is being captured, every tensor's shape, dtype and
+        strides (null where one is not given), the call's values, the configs it
+        launches in order (each field by name), and the table input their pick was
+        tuned at (null for a forced call). Off, nothing: no work on the call's path."""
+        if self._debug_out is None:
+            return
+        line = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "rank": self.device_group.rank(),
+            "world": self.device_group.size(),
+            "op": op,
+            "quantization": self.quantization,
+            "captured": torch.cuda.is_current_stream_capturing(),
+            "tensors": {
+                name: None
+                if t is None
+                else {
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype).removeprefix("torch."),
+                    "stride": list(t.stride()),
+                }
+                for name, t in tensors.items()
+            },
+            "values": dict(values),
+            "configs": [asdict(c) for c in configs],
+            "table_input": (
+                None if pick is None else self.table["inputs"][pick["input"]]
+            ),
+        }
+        self._debug_out.write(json.dumps(line) + "\n")
 
     @final
     def tuned(self, op: Op, rows: int, cols: int) -> list[Config]:
@@ -1510,11 +1591,12 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
+        pick = None
         if given_config is not None:
             configs = [given_config]
         else:
             rows, cols = input.shape
-            configs = get_nearest_configs(
+            pick = get_nearest_pick(
                 self.table,
                 "all_reduce",
                 rows,
@@ -1522,7 +1604,15 @@ class HipCustomCommunicator:
                 self.quantization,
                 self.device_group.size(),
             )
+            configs = picked_configs(self.table, pick)
         logger.debug("all_reduce launches %s", configs)
+        self._debug(
+            "all_reduce",
+            {"input": input},
+            {},
+            configs,
+            pick,
+        )
 
         match configs:
             case [config]:
@@ -1627,11 +1717,12 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
+        pick = None
         if given_config is not None:
             configs = [given_config]
         else:
             rows, cols = input.shape
-            configs = get_nearest_configs(
+            pick = get_nearest_pick(
                 self.table,
                 "all_reduce_rms_norm",
                 rows,
@@ -1639,7 +1730,15 @@ class HipCustomCommunicator:
                 self.quantization,
                 self.device_group.size(),
             )
+            configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_rms_norm launches %s", configs)
+        self._debug(
+            "all_reduce_rms_norm",
+            {"input": input, "weight": weight},
+            {"eps": eps},
+            configs,
+            pick,
+        )
 
         match configs:
             case [fused_config]:
@@ -1801,11 +1900,12 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
+        pick = None
         if given_config is not None:
             configs = [given_config]
         else:
             rows, cols = input.shape
-            configs = get_nearest_configs(
+            pick = get_nearest_pick(
                 self.table,
                 "all_reduce_add_rms_norm",
                 rows,
@@ -1813,7 +1913,15 @@ class HipCustomCommunicator:
                 self.quantization,
                 self.device_group.size(),
             )
+            configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_add_rms_norm launches %s", configs)
+        self._debug(
+            "all_reduce_add_rms_norm",
+            {"input": input, "residual": residual, "weight": weight},
+            {"eps": eps},
+            configs,
+            pick,
+        )
 
         match configs:
             case [fused_config]:
@@ -1987,11 +2095,12 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
+        pick = None
         if given_config is not None:
             configs = [given_config]
         else:
             rows, cols = input.shape
-            configs = get_nearest_configs(
+            pick = get_nearest_pick(
                 self.table,
                 "all_reduce_add_attn_res_rms_norm",
                 rows,
@@ -1999,7 +2108,27 @@ class HipCustomCommunicator:
                 self.quantization,
                 self.device_group.size(),
             )
+            configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_add_attn_res_rms_norm launches %s", configs)
+        self._debug(
+            "all_reduce_add_attn_res_rms_norm",
+            {
+                "input": input,
+                "prefix": prefix,
+                "blocks": blocks,
+                "norm_weight": norm_weight,
+                "qk_weight": qk_weight,
+                "output_norm_weight": output_norm_weight,
+            },
+            {
+                "num_blocks": num_blocks,
+                "write_index": write_index,
+                "eps": eps,
+                "output_eps": output_eps,
+            },
+            configs,
+            pick,
+        )
 
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
@@ -2175,6 +2304,13 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("rms_norm launches %s", config)
+        self._debug(
+            "rms_norm",
+            {"input": input, "weight": weight},
+            {"eps": eps},
+            [config],
+            None,
+        )
 
         error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
             handle_ptr=self._handle,
@@ -2269,6 +2405,13 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("add_rms_norm launches %s", config)
+        self._debug(
+            "add_rms_norm",
+            {"input": input, "residual": residual, "weight": weight},
+            {"eps": eps},
+            [config],
+            None,
+        )
 
         error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
             handle_ptr=self._handle,
@@ -2371,6 +2514,25 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("add_attn_res_rms_norm launches %s", config)
+        self._debug(
+            "add_attn_res_rms_norm",
+            {
+                "input": input,
+                "prefix": prefix,
+                "blocks": blocks,
+                "norm_weight": norm_weight,
+                "qk_weight": qk_weight,
+                "output_norm_weight": output_norm_weight,
+            },
+            {
+                "num_blocks": num_blocks,
+                "write_index": write_index,
+                "eps": eps,
+                "output_eps": output_eps,
+            },
+            [config],
+            None,
+        )
 
         block_output = blocks[:, write_index] if write_index >= 0 else None
         error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
@@ -2441,6 +2603,9 @@ class HipCustomCommunicator:
         with self._lock:
             self.state = Closed()
         self._on_close()
+        if self._debug_out is not None:
+            self._debug_out.close()
+            self._debug_out = None
 
     @final
     def __enter__(self) -> "HipCustomCommunicator":

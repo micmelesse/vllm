@@ -158,6 +158,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR: bool = False
     VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION: Literal["NONE", "INT4"] = "NONE"
     VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG: Literal["errors", "everything"] = "errors"
+    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE: str | None = None
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1406,6 +1407,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and open's warnings) or everything (every open phase and check, every launch).
     "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG": env_with_choices(
         "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG", "errors", ["errors", "everything"]
+    ),
+    # The hip custom communicator's debug file: where every call's resolved configs are
+    # appended, a JSON line each, before it launches (off when unset).
+    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE": lambda: os.getenv(
+        "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEBUG_FILE", None
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

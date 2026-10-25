@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from multiprocessing.queues import Queue
+from pathlib import Path
 from typing import Any, TypeAlias, TypeVar, cast, get_args
 
 import pytest
@@ -51,8 +52,10 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     abandon_open,
     build_info,
     check_table,
+    get_nearest_pick,
     last_log,
     open_handle,
+    picked_configs,
     supported,
 )
 from vllm.distributed.parallel_state import get_tp_group
@@ -208,6 +211,7 @@ def _rank_main(
     kernel_timeout_s: float,
     log_mode: LogMode,
     tables: TunedTables | None,
+    debug_file: str | None,
 ) -> None:
     global _COMM
     # SIGUSR1 AND SIGTERM TO THE DUMPER ONLY: blocked here before any thread starts
@@ -243,6 +247,7 @@ def _rank_main(
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
                 quantization="exact",
                 tables=tables,
+                debug_file=debug_file,
             )
         _COMM = comm
         try:
@@ -264,11 +269,13 @@ def _on_every_rank(
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
     tables: TunedTables | None = None,
+    debug_file: str | None = None,
 ) -> None:
     """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
     by name first, `partial`), each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
-    tuned tables `tables` (None: the file's). A
+    tuned tables `tables` (None: the file's), its calls written to `debug_file` (None:
+    the environment's, off unless set). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
     TERM_GRACE_S, then killed."""
@@ -286,6 +293,7 @@ def _on_every_rank(
                 kernel_timeout_s=kernel_timeout_s,
                 log_mode=log_mode,
                 tables=tables,
+                debug_file=debug_file,
             )
         )
         for r in range(WORLD_SIZE)
@@ -1612,6 +1620,45 @@ def test_tables_handed_in_are_the_ones_it_runs() -> None:
         target=partial(_handed_table_on_rank, config=json.dumps(config)),
         tables=tables,
     )
+
+
+def _debugged_calls_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
+    """A plain all-reduce at a decode row count, then the same call forced at the
+    config its pick runs."""
+    rows, bf16 = 2, torch.bfloat16
+    comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
+    (config,) = comm.tuned("all_reduce", rows, HIDDEN)
+    comm.all_reduce(_randn((rows, HIDDEN), bf16, rank), **asdict(config))
+    _assert_clean(comm, "the debug file's calls")
+
+
+@on_eight_gpus
+def test_the_debug_file_holds_every_call_as_launched(tmp_path: Path) -> None:
+    """With a debug file, every call is a line of it, every rank's, before it launches:
+    its rank and world, its op, its tensors' shapes, the configs it launches and the
+    table input their pick was tuned at (the lookup's own, `get_nearest_pick`), null
+    for a forced call."""
+    # example-based: a plain and a forced decode all-reduce on every rank
+    import vllm._rocm_C  # noqa: F401
+
+    found = supported(torch.device("cuda:0"), WORLD_SIZE)
+    assert not isinstance(found, Error), found
+    path = tmp_path / "calls.jsonl"
+    _on_every_rank(target=_debugged_calls_on_rank, debug_file=str(path))
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    assert sorted(x["rank"] for x in lines) == sorted([*range(WORLD_SIZE)] * 2)
+    shapes = {
+        (x["op"], x["world"], tuple(x["tensors"]["input"]["shape"])) for x in lines
+    }
+    assert shapes == {("all_reduce", WORLD_SIZE, (2, HIDDEN))}
+    table = json.loads(_TABLE.read_text())[found.arch]
+    pick = get_nearest_pick(table, "all_reduce", 2, HIDDEN, "exact", WORLD_SIZE)
+    want = [asdict(c) for c in picked_configs(table, pick)]
+    plain = [x for x in lines if x["table_input"] is not None]
+    forced = [x for x in lines if x["table_input"] is None]
+    assert len(plain) == len(forced) == WORLD_SIZE
+    assert all(x["table_input"] == table["inputs"][pick["input"]] for x in plain)
+    assert all(x["configs"] == want for x in lines), "the forced one is the pick's"
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
