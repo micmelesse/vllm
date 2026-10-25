@@ -236,8 +236,9 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
 //     writer c at slot input_slot + c) and POLLS until each line it waits for carries `flag`: the
 //     rows and packs inside the clip (those past it are nobody's: their registers are left
-//     unread), every writer but input_rank (this rank, which never writes its own inbox; its
-//     registers are left as read, garbage). Both nontemporal 16-byte accesses, aiter's
+//     unread), EVERY WRITER, THIS RANK TOO: its own line is its own thread's store before the
+//     read, so its registers are its own payload (a runtime rank tested a writer at a time was 8
+//     masks of SGPRs and a select an element: 106 SGPRs, 79 spilled, ISA 2026-10-25). Both nontemporal 16-byte accesses, aiter's
 //     ll_store_b128 / ll_load_b128 (`global_*_dwordx4 ... nt`): a line moves in one transaction.
 //     The poll leaves past timeout_ticks or once the status's `abort` is set, as barrier's wait
 //     does (give_up, Where::start: the line wait is its kernel's only one).
@@ -356,8 +357,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
 // undecoded, [0] the pack's word and [1] its group's scale as fp32 bits: a caller summing every
 // rank's words (v_dot2, never a decoded tile of every rank: 172 VGPRs, reduce_scatter.cuh) or
 // loading every rank's before decoding any.
-// THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the writer not waited for, and the
-// fault's), `flag` the value every line waited for carries, and the status buffer and limit its
+// THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the fault's), `flag` the value every line waited for carries, and the status buffer and limit its
 // poll gives up by; every other layout passes them as their defaults and reads none.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
           Layout LAYOUT, bool TAIL, typename OUTPUT>
@@ -487,7 +487,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
           for (int k = 0; k < kPacks; ++k)
 #pragma unroll
             for (int h = 0; h < kLines; ++h)
-              missing |= c != rank && waits[i][k] &&
+              missing |= waits[i][k] &&
                          (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag);
       if (!missing) break;
       if ((n & 255u) != 0) continue;
@@ -509,7 +509,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
             for (int k = 0; k < kPacks; ++k)
 #pragma unroll
               for (int h = 0; h < kLines; ++h)
-                if (c != rank && waits[i][k] &&
+                if (waits[i][k] &&
                     (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag)) {
                   peer = c;
                   seen = got[c][i][k][h][1];

@@ -311,7 +311,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       const int clip_m = min(TILE_M, input_size_m - offs_m);
       const int clip_n = min(TILE_N, input_size_n - offs_n);
       // 1. This rank's tile, read here, into slot [rank] of every peer's inbox, its lines carrying
-      //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, never read), A RANK THE COMPILER
+      //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, read back as a peer's in 2), A RANK THE COMPILER
       //    KNOWS: no branch between the sends, whose joins waited for every store before
       //    (s_waitcnt vmcnt(0)), so the remote stores ran one after another (ATT
       //    2026-10-19T04-09-17Z: 40k of 60k cycles a wave; 2.3-2.9x aiter at 1-8 tokens). The
@@ -335,8 +335,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + clip_m, clip_n, peers, row, 0, 1, epoch, status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      // 3. Summed in rank order in fp32 (this rank's own from its input), rounded to DTYPE once:
-      //    every rank sums the same copies in the same order, so every rank's sums agree bitwise.
+      // 3. Summed in rank order in fp32, every rank's from the inbox (this rank's own line too, the
+      //    same bits as its input: no select on a runtime rank), rounded to DTYPE once: every rank
+      //    sums the same copies in the same order, so every rank's sums agree bitwise.
       DTYPE rounded[kRows][kPacks][kPackElems];
   #pragma unroll
       for (int i = 0; i < kRows; ++i)
@@ -344,10 +345,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int k = 0; k < kPacks; ++k)
   #pragma unroll
           for (int j = 0; j < kPackElems; ++j) {
-            float acc = static_cast<float>(rank == 0 ? mine[i][k][j] : peers[0][i][k][j]);
+            float acc = static_cast<float>(peers[0][i][k][j]);
   #pragma unroll
-            for (int r = 1; r < WORLD; ++r)
-              acc += static_cast<float>(r == rank ? mine[i][k][j] : peers[r][i][k][j]);
+            for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
             rounded[i][k][j] = static_cast<DTYPE>(acc);
           }
       store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, offs_m, offs_n, 1);
