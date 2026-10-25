@@ -1137,12 +1137,12 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // THE UNFENCED REGION AND ITS EPOCHS: memory no barrier fences, each write carrying its own
 // flag (the pushed one-shot's: kernels/all_reduce.cuh, the flag in the line), one more
 // region after the partials:
-//   unfenced   the INBOX peers push lines into: [writer, bank * block] rows of a block's
-//              tile, kUnfencedSlotBytes of payload a row, each payload byte two in lines
+//   unfenced   the INBOX peers push lines into: [writer, bank * row] rows of the blocks'
+//              tiles, kUnfencedSlotBytes of payload a row, each payload byte two in lines
 //              (common.cuh's Layout::line), two banks: world * 2 * kUnfencedBlocks rows.
 //              Its own region, never a fenced kernel's: a stale word a fenced kernel left
 //              could carry an epoch's value, and the reader would take it for data.
-// THE EPOCHS are not a region: each block's last epoch, a 16-byte pack a block (its
+// THE EPOCHS are not a region: each row of a bank's last epoch, a 16-byte pack a row (its
 // word at column 0), kUnfencedBlocks of them, read only by their own rank, so CACHED
 // rank-local memory (hipMalloc, zeroed at open; aiter's block_flags): from the
 // uncached arena each launch began with an uncached load (~2k cycles before any
@@ -3352,9 +3352,9 @@ inline std::variant<Config, Error> all_reduce_config(
                        : int4_flat                       ? world * share
                        : !in_passes || !is_two_shot(algorithm) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype);
-  // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank, block) of
-  // kUnfencedSlotBytes of payload each whatever the build (so a block's row is the same bytes at
-  // every build), a writer's rows contiguous.
+  // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank, row) of
+  // kUnfencedSlotBytes of payload each whatever the build (so a row is the same bytes at every
+  // build, its epoch its own), a writer's rows contiguous.
   config.unfenced_stride_slot = unfenced ? 2 * kUnfencedBlocks * (kUnfencedSlotBytes / elem_bytes(dtype)) : 0;
   config.unfenced_stride_m = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
   config.unfenced_stride_n = unfenced ? 1 : 0;

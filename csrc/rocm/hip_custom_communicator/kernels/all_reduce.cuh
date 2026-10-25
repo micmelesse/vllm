@@ -91,34 +91,37 @@ namespace hip_custom_communicator {
 
 // THE BUFFER AS [m, n] AT ITS STRIDES, a work item a TILE_M x TILE_N tile, the
 // grid striding over the tiles row-major: A TILE A BLOCK A PASS. THE INBOX
-// (`lines`), [writer, row, n] in payload elements, TILE_M rows one block's tile
-// in one bank: from row (bank * blocks + block) * TILE_M, blocks = unfenced_size_m /
-// (2 * TILE_M) (the host's unfenced region; the grid is at most that, select's; the
-// builds are a row, so a block's row is the same bytes at every build), the
-// row's pitch fixed whatever the build. EACH BLOCK HAS ITS OWN ROWS, so a line is
-// only ever written with one block's epochs, whatever the grids of the calls
-// around it; ONE WRITER'S ROWS ARE CONTIGUOUS (aiter's dense packet index): as
-// [bank, block, writer] slots, a writer's lines a block apart sat 32 KiB apart.
-// THE EPOCH (`epochs`, [block, n], a block's word at column 0), PER BLOCK, ON
-// THE DEVICE: read at the start, +1 a pass (never 0: the inbox starts zeroed;
-// past 0xffffffff it is 2, keeping the banks alternating), written back at the
-// end by thread 0, so a CUDA-graph replay, which runs none of our host code,
-// counts on and the inbox is never cleared. Every rank runs the same calls at
-// the same grids, so block b's epoch is the same on every rank. (STANDARDS 3.2
-// says nothing persists between launches; this counter does, by Michael's
-// design, October 18: the flag in the line needs a per-call value no host
-// writes.) BANK = epoch & 1.
-// WHY TWO BANKS NEED NO CLOSING BARRIER (aiter's argument, per block): a rank's
-// block b writes epoch e into a peer's bank (e & 1) only after it saw that
-// peer's block b lines of e - 1, which the peer sends only once it is done with
-// e - 2, the bank's last use: in the same launch, its block passed the
-// __syncthreads after its pass e - 2; in an earlier launch, that launch ended
+// (`lines`), [writer, row, n] in payload elements, two banks of unfenced_size_m / 2
+// rows (the host's unfenced region), a block's TILE_M rows from blockIdx.x * TILE_M
+// of a bank (the grid's rows at most a bank's, select's), the row's pitch fixed
+// whatever the build; ONE WRITER'S ROWS ARE CONTIGUOUS (aiter's dense packet
+// index): as [bank, block, writer] slots, a writer's lines a block apart sat 32 KiB
+// apart.
+// THE EPOCH (`epochs`, [row, n], a row's word at column 0), PER ROW, ON THE
+// DEVICE: read at the start, +1 a pass that writes the row (never 0: the inbox
+// starts zeroed; past 0xffffffff it is 2, keeping the banks alternating), written
+// back at the end, so a CUDA-graph replay, which runs none of our host code,
+// counts on and the inbox is never cleared. A ROW'S, NOT A BLOCK'S: a block's rows
+// are its TILE_M's, so at another TILE_M a row is another block's, and a block's
+// count was not the row's (at TILE_M 2 block b writes rows 2b and 2b + 1; back at
+// TILE_M 1, block 2b + 1, behind block b, counted to the epoch b's stale line
+// carried and took it for data). A row's every write counts on its own epoch,
+// whichever block writes it. Every rank runs the same calls at the same builds and
+// grids, so row q's epoch is the same on every rank. (STANDARDS 3.2 says nothing
+// persists between launches; this counter does, by Michael's design, October 18:
+// the flag in the line needs a per-call value no host writes.) A ROW'S BANK =
+// its epoch & 1 (common.cuh's line layout).
+// WHY TWO BANKS NEED NO CLOSING BARRIER (aiter's argument, per row): a rank
+// writes row q's epoch e into a peer's bank (e & 1) only after it saw that
+// peer's row q lines of e - 1, which the peer sends only once it is done with
+// e - 2, the bank's last use: in the same launch, its row's one block passed
+// the __syncthreads after its pass e - 2; in an earlier launch, that launch ended
 // before the one sending e - 1 began (stream order). A rank starts call e + 2
 // only after every peer started e + 1, which they do only after finishing e.
-// The argument is a block's, not a thread's: a lane past the clip writes its
-// clamped place too (the same bytes as its owner; common.cuh's line write), and
-// the __syncthreads closing each pass covers every lane; the lines a block
-// writes are ever read only by that block.
+// The argument is a row's, not a thread's: a lane past the clip's columns writes
+// its clamped place too (the same bytes as its owner; common.cuh's line write), a
+// row past the clip is neither written nor counted, and the __syncthreads closing
+// each pass covers every lane.
 
 
 // =============================================================================
@@ -297,20 +300,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
     const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-    const int blocks = unfenced_size_m / (2 * TILE_M);  // the inbox's: [bank, block] tiles of rows
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) > blocks) __builtin_trap();
-    // 0. THIS BLOCK'S LAST EPOCH, every thread's (one 16-byte line, the same for all). The epochs
-    //    are this rank's alone, so a pointer of their own (`&unfenced_epochs_ptr, 1`): through a device
-    //    array each launch began with a cold scalar load before the epoch's (ATT
+    // THE BLOCK'S ROWS OF A BANK: TILE_M from blockIdx.x * TILE_M (the inbox's two banks of
+    // unfenced_size_m / 2 rows each; the grid's TILE_M rows at most that, select's).
+    const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
+      __builtin_trap();
+    // 0. THIS THREAD'S ROWS' LAST EPOCHS (a 16-byte line a row, the row's every thread's). The
+    //    epochs are this rank's alone, so a pointer of their own (`&unfenced_epochs_ptr, 1`): through
+    //    a device array each launch began with a cold scalar load before the epoch's (ATT
     //    2026-10-19T04-50-53Z: ~5k cycles of lgkmcnt waits before the first send).
-    int32_t last[1][1][traits<int32_t, PACK_BYTES>::N];
-    load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
+    int32_t last[kRows][1][traits<int32_t, PACK_BYTES>::N];
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
         &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
-        1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, blockIdx.x, 0,
+        1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, first_row, 0,
         1);
-    // The epoch is read (a wait for that load) only once the first tile's load is issued, so the two
-    // round trips overlap (ATT 2026-10-19T05-22-25Z: ~1.2k cycles a wave waited for the epoch alone).
-    uint32_t epoch = 0;
+    // The epochs are read (a wait for that load) only once the first tile's load is issued, so the
+    // two round trips overlap (ATT 2026-10-19T05-22-25Z: ~1.2k cycles a wave waited for the epoch
+    // alone). One row of threads' rows are the block's: read from the first lane, scalar.
+    uint32_t epochs[kRows] = {};
     bool ran = false;
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
@@ -330,18 +337,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       const int input_clip_n = kWhole ? input_size_n : offs_n + clip_n;
       DTYPE mine[kRows][kPacks][kPackElems];
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, mine, offs_m, offs_n, 1);
-      // This pass's epoch (the last + 1, never 0) and this block's row of the inbox in its bank.
-      const uint32_t before =
-          ran ? epoch : __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(last[0][0][0]));
-      epoch = before + 1u == 0u ? 2u : before + 1u;
+      // This pass's epoch a row (its last + 1, never 0), its lines in its bank (epoch & 1). A row
+      // past the tile's is not written, so not counted.
+  #pragma unroll
+      for (int i = 0; i < kRows; ++i) {
+        const uint32_t before =
+            ran ? epochs[i]
+                : kThreadsM == 1 ? __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(last[i][0][0]))
+                                 : static_cast<uint32_t>(last[i][0][0]);
+        const bool written = (kThreadsM == 1 ? i : static_cast<int>(threadIdx.x) / kThreadsN + i * kThreadsM) < clip_m;
+        epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
+      }
       ran = true;
-      const int row = (static_cast<int>(epoch & 1u) * blocks + static_cast<int>(blockIdx.x)) * TILE_M;
   #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + clip_m, clip_n, row, 0, 1, epoch);
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, first_row + clip_m, clip_n, first_row, 0, 1, epochs);
       // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + clip_m, clip_n, peers, row, 0, 1, epoch, status_ptr, status_stride_field, status_size_field, timeout_ticks);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, first_row + clip_m, clip_n, peers, first_row, 0, 1, epochs, status_ptr, status_stride_field, status_size_field, timeout_ticks);
       // 3. Summed in rank order in fp32, every rank's from the inbox (this rank's own line too, the
       //    same bits as its input: no select on a runtime rank), rounded to DTYPE once: every rank
       //    sums the same copies in the same order, so every rank's sums agree bitwise.
@@ -362,13 +375,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       //    (the bank argument above), and, the last pass, every wave has read the epoch (step 0).
       __syncthreads();
     }
-    // 5. The epoch, for this block's next pass in the next launch: thread 0's store.
-    int32_t next[1][1][traits<int32_t, PACK_BYTES>::N] = {
-        {{ran ? static_cast<int32_t>(epoch) : last[0][0][0]}}};
-    store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
+    // 5. Each row's epoch, for its next write in the next launch: its row of threads' first lane's
+    //    store (the store's lanes past the line's one pack store nothing).
+    int32_t next[kRows][1][traits<int32_t, PACK_BYTES>::N] = {};
+  #pragma unroll
+    for (int i = 0; i < kRows; ++i)
+      next[i][0][0] = ran ? static_cast<int32_t>(epochs[i]) : last[i][0][0];
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
         next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
         unfenced_epochs_stride_n, 1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n,
-        blockIdx.x, 0, 1);
+        first_row, 0, 1);
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot, above).
     static_assert(ALGORITHM == Algorithm::two_shot_push,

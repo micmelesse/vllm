@@ -232,9 +232,13 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
 //     sees both flags of a line holds its data, with no barrier. Strides and sizes count the
 //     payload's elements; a row's lines take twice its payload's bytes (kLineBytes /
-//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. send writes the registers' lines carrying `flag`;
+//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. A FLAG
+//     A ROW, ITS BANK ITS PARITY: the buffer's rows are two banks (size_m / 2 rows each), a tile
+//     row's lines in the bank of its flag's parity (row + (flag & 1) * size_m / 2), so a row's
+//     consecutive writes alternate banks whatever the rows around it were last written with. send
+//     writes each row's lines carrying its flag;
 //     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
-//     writer c at slot input_slot + c) and POLLS until each line it waits for carries `flag`: the
+//     writer c at slot input_slot + c) and POLLS until each line it waits for carries its row's flag: the
 //     rows and packs inside the clip (those past it are nobody's: their registers are left
 //     unread), EVERY WRITER, THIS RANK TOO: its own line is its own thread's store before the
 //     read, so its registers are its own payload (a runtime rank tested a writer at a time was 8
@@ -357,7 +361,8 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
 // undecoded, [0] the pack's word and [1] its group's scale as fp32 bits: a caller summing every
 // rank's words (v_dot2, never a decoded tile of every rank: 172 VGPRs, reduce_scatter.cuh) or
 // loading every rank's before decoding any.
-// THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the fault's), `flag` the value every line waited for carries, and the status buffer and limit its
+// THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the fault's), `flags` the value each
+// row's lines waited for carry (kRows, a thread's rows), and the status buffer and limit its
 // poll gives up by; every other layout passes them as their defaults and reads none.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
           Layout LAYOUT, bool TAIL, typename OUTPUT>
@@ -365,7 +370,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
                          int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
                          int input_size_m, int input_size_n, int clip_m, int clip_n,
                          OUTPUT& output, int offs_m, int offs_n, int row_step, int rank = 0,
-                         uint32_t flag = 0, uint32_t* status_ptr = nullptr,
+                         const uint32_t* flags = nullptr, uint32_t* status_ptr = nullptr,
                          int64_t status_stride_field = 0, int status_size_field = 0,
                          uint64_t timeout_ticks = 0) {
   // THE HANDED WAVE IS THE COMPILER'S: the flat walk's whole waves are the hardware's.
@@ -438,7 +443,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
                   "a pack is one or two lines");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (input_slot < 0 || input_slot + WORLD > input_size_slot || flag == 0))
+        (input_slot < 0 || input_slot + WORLD > input_size_slot || flags == nullptr))
       __builtin_trap();
     const char* slots[WORLD];
 #pragma unroll
@@ -448,15 +453,21 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // A PACK'S FIRST LINE, as a 32-bit byte offset into its slot, and whether its thread waits
     // for it (inside the clip). A ROW'S LINES ARE ITS PACKS' FIRST LINES, THEN THEIR SECOND (`half`
     // apart), so one load (or store) instruction's lanes cover one contiguous run, as aiter's
-    // packets: a pack's two lines side by side put a lane's 16 bytes 32 apart.
+    // packets: a pack's two lines side by side put a lane's 16 bytes 32 apart. A ROW IN ITS FLAG'S
+    // BANK, past the clip too (its own row, unclamped, read and never waited for: a clamped one in
+    // its own flag's bank could be past the buffer).
     const uint32_t half = static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+    const int bank_rows = input_size_m / 2;
     uint32_t line_at[kRows][kPacks];
     bool waits[kRows][kPacks];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
-        line_at[i][k] = static_cast<uint32_t>(row_of(i)) *
+        const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (row < 0 || row >= input_size_m || flags[i] == 0))
+          __builtin_trap();
+        line_at[i][k] = static_cast<uint32_t>(row) *
                             static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)}) *
                             kLineScale +
                         static_cast<uint32_t>(pack_of(k)) * uint32_t{kLineBytes};
@@ -488,7 +499,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 #pragma unroll
             for (int h = 0; h < kLines; ++h)
               missing |= waits[i][k] &&
-                         (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag);
+                         (got[c][i][k][h][1] != flags[i] || got[c][i][k][h][3] != flags[i]);
       if (!missing) break;
       if ((n & 255u) != 0) continue;
       // THE SLOW PATH every 256 polls, as barrier's wait: the clock and the status's `abort`.
@@ -500,7 +511,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
       if (!aborted && waited <= timeout_ticks) continue;
       if (!aborted) {
         // THE FAULT'S PEER AND WHAT IT SAW: the last writer whose line was not there.
-        uint32_t peer = 0, seen = flag;
+        uint32_t peer = 0, seen = flags[0], want = flags[0];
 #pragma unroll
         for (int c = 0; c < WORLD; ++c)
 #pragma unroll
@@ -510,12 +521,13 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 #pragma unroll
               for (int h = 0; h < kLines; ++h)
                 if (waits[i][k] &&
-                    (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag)) {
+                    (got[c][i][k][h][1] != flags[i] || got[c][i][k][h][3] != flags[i])) {
                   peer = c;
                   seen = got[c][i][k][h][1];
+                  want = flags[i];
                 }
         give_up(status_ptr, status_stride_field, status_size_field, Where::start, rank, peer,
-                seen, flag, waited);
+                seen, want, waited);
       }
       __builtin_amdgcn_endpgm();
     }
@@ -867,15 +879,15 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 // registers of a dtype are quantized here; uint32_t registers U[kRows][kPacks][2] are the payload
 // already quantized ([0] the word, [1] the group's scale as fp32 bits), so a caller sending to
 // every rank quantizes once, before its loop.
-// THE LINE WRITE'S OWN (Layout::line): `flag`, the value its lines carry; every other layout
-// passes it as its default.
+// THE LINE WRITE'S OWN (Layout::line): `flags`, the value each row's lines carry (kRows, a
+// thread's rows); every other layout passes it as its default.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
           Layout LAYOUT, bool TAIL, typename INPUT>
 DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                           int64_t output_stride_slot, int64_t output_stride_m,
                           int64_t output_stride_n, int output_size_slot, int output_size_m,
                           int output_size_n, int clip_m, int clip_n, int offs_m, int offs_n,
-                          int row_step, uint32_t flag = 0) {
+                          int row_step, const uint32_t* flags = nullptr) {
   // THE HANDED WAVE IS THE COMPILER'S: the flat walk's whole waves are the hardware's.
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
   static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE, "the compiler's wave is not the one handed");
@@ -915,12 +927,16 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   constexpr bool kGroup = LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat;
   constexpr bool kRun = LAYOUT == Layout::run || LAYOUT == Layout::group_run;
   if constexpr (LAYOUT == Layout::line) {
-    // THE LINE WRITE: each pack as its two lines, the flag in each. NO BRANCH: a lane past the
-    // clip writes its clamped place (the last row and pack inside it), whose registers it loaded
-    // clamped the same way, so the same bytes its owner writes. Under a branch, each store's data
-    // registers were rebuilt after the join, which waited for every store before (s_waitcnt
-    // vmcnt(0)): a send's remote stores ran one at a time, 40k of 60k cycles a wave (ATT
-    // 2026-10-19T04-09-17Z, 1 x 7168).
+    // THE LINE WRITE: each pack as its two lines, the flag in each. NO BRANCH ON A PACK: a lane
+    // past the clip's columns writes its clamped place (the last pack inside it), whose registers
+    // it loaded clamped the same way, so the same bytes its owner writes. Under a branch, each
+    // store's data registers were rebuilt after the join, which waited for every store before
+    // (s_waitcnt vmcnt(0)): a send's remote stores ran one at a time, 40k of 60k cycles a wave
+    // (ATT 2026-10-19T04-09-17Z, 1 x 7168). A ROW PAST THE CLIP IS SKIPPED, as the read skips it
+    // (read_buffer's `skips`: several rows a thread or rows of threads), so its registers were
+    // never loaded: written clamped, they overwrote the last row's lines with stale registers
+    // under the owner's flag (TILE_M 2 at one row, 2026-10-25T17-23-56Z). One row a thread of one
+    // row of threads has none, its loop unbranched as before.
     static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     constexpr int kLines = sizeof(V) / kLinePayloadBytes;
@@ -928,12 +944,16 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                       sizeof(u32x4) == kLineBytes,
                   "a pack is one or two lines");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flag == 0) __builtin_trap();
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
+    const int bank_rows = output_size_m / 2;
     char* const slot = reinterpret_cast<char*>(output) +
                        int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)} * kLineScale;
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
-      const int row = min(row_at(i), clip_m - 1);
+      if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
+      // The row's lines in its flag's bank (the line layout above).
+      const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (row >= output_size_m || flags[i] == 0)) __builtin_trap();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         const int col = min(col_at(k), clip_n / kPackElems - 1);
@@ -946,7 +966,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         asm volatile("" : "+v"(at));
 #pragma unroll
         for (int h = 0; h < kLines; ++h)
-          __builtin_nontemporal_store(u32x4{words[2 * h], flag, words[2 * h + 1], flag},
+          __builtin_nontemporal_store(u32x4{words[2 * h], flags[i], words[2 * h + 1], flags[i]},
                                       (global_u32x4*)(slot + at + h * half));
       }
     }
@@ -1769,14 +1789,14 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&payload)[1][K][2]) {
 // +86-143 VALU a plain two-shot (I8 ISA 2026-10-18T00-13-04Z).
 
 // LOAD: this rank's buffer (entry input_rank) into a thread's registers. Layout::line's poll
-// takes its flag, the status and the limit (read_buffer's line read); no other layout reads them.
+// takes its rows' flags, the status and the limit (read_buffer's line read); no other layout reads them.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
           Layout LAYOUT, bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n, int row_step,
-                  uint32_t flag = 0, uint32_t* status_ptr = nullptr,
+                  const uint32_t* flags = nullptr, uint32_t* status_ptr = nullptr,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
   // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
@@ -1800,7 +1820,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
           input_ptr_array, input_ptr_array_size, input_rank, input_slot, input_stride_slot,
           input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, group, offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
-          row_step, flag, status_ptr, status_stride_field,
+          row_step, flags, status_ptr, status_stride_field,
           status_size_field, timeout_ticks);
 #pragma unroll
       for (int c = 0; c < kCopies; ++c)
@@ -1821,7 +1841,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
-        flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
+        flags, status_ptr, status_stride_field, status_size_field, timeout_ticks);
   }
 }
 
@@ -1943,14 +1963,14 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 
 // SEND: a thread's registers into rank output_rank's buffer (a peer's, over the fabric; the rank
 // may differ by lane). Posted: the next ordered barrier's release completes and publishes it
-// (BARRIER); a Layout::line send carries `flag` in its lines and needs no barrier.
+// (BARRIER); a Layout::line send carries its rows' `flags` in its lines and needs no barrier.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
           Layout LAYOUT, bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                   int output_rank, int output_slot, int64_t output_stride_slot,
                   int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
                   int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
-                  int offs_n, int row_step, uint32_t flag = 0) {
+                  int offs_n, int row_step, const uint32_t* flags = nullptr) {
   // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
   // thread): a call a group, group j of thread t the row's group offs_n / kInt4Group + t %
   // kThreadsN + j * kThreadsN, its registers from pack j * kInt4GroupPacks. One group a thread is
@@ -1973,7 +1993,7 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
           group, output_ptr_array, output_ptr_array_size, output_rank, output_slot,
           output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
           output_size_n, clip_m, clip_n, offs_m,
-          offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group, row_step, flag);
+          offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group, row_step, flags);
     }
   } else {
     const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
@@ -1982,13 +2002,13 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
       internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
           input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
           output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
-          output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
+          output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flags);
     else
       internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
           input,
           internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
           output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
-          output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
+          output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flags);
   }
 }
 
