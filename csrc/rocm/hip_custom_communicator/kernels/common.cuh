@@ -40,6 +40,9 @@ struct traits {
 // gives `global_load_dwordx4` / `global_store_dwordx4`.
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
+// A PACK OF ANY WIDTH THROUGH ONE GLOBAL ACCESS (PACK_BYTES 2, 4, 8 or 16: global_load_ushort,
+// _dword, _dwordx2, _dwordx4): the flat walk moves a pack as the word of its width.
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 
 
 // AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
@@ -268,20 +271,6 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
 
 namespace internal {
 
-// A PACK OF ANY WIDTH THROUGH ONE GLOBAL ACCESS (PACK_BYTES 2, 4, 8 or 16: global_load_ushort,
-// _dword, _dwordx2, _dwordx4): the word the flat walk's load and store move a pack as, at a
-// build's pack.
-typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
-template <int BYTES>
-struct pack_word;
-template <>
-struct pack_word<2> { using t = uint16_t; };
-template <>
-struct pack_word<4> { using t = uint32_t; };
-template <>
-struct pack_word<8> { using t = u32x2; };
-template <>
-struct pack_word<16> { using t = u32x4; };
 
 
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
@@ -596,7 +585,10 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         asm volatile("" : "+v"(offset));
         V v;
         {
-          using W = typename pack_word<sizeof(V)>::t;
+          using W = std::conditional_t<
+              sizeof(V) == 16, u32x4,
+              std::conditional_t<sizeof(V) == 8, u32x2,
+                                 std::conditional_t<sizeof(V) == 4, uint32_t, uint16_t>>>;
           const W raw = *(const __attribute__((address_space(1))) W*)(reinterpret_cast<const char*>(run) + offset);
           __builtin_memcpy(&v, &raw, sizeof(V));
         }
@@ -611,7 +603,10 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         const int col = n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
         V v;
         {
-          using W = typename pack_word<sizeof(V)>::t;
+          using W = std::conditional_t<
+              sizeof(V) == 16, u32x4,
+              std::conditional_t<sizeof(V) == 8, u32x2,
+                                 std::conditional_t<sizeof(V) == 4, uint32_t, uint16_t>>>;
           const W raw = *(const __attribute__((address_space(1))) W*)(element_at(
             from, input_stride_m, input_stride_n, first + int64_t{col} * kPackElems, input_size_n));
           __builtin_memcpy(&v, &raw, sizeof(V));
@@ -1038,7 +1033,10 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       V v;
       __builtin_memcpy(&v, input[0][k], sizeof(v));
       {
-        using W = typename pack_word<sizeof(V)>::t;
+        using W = std::conditional_t<
+              sizeof(V) == 16, u32x4,
+              std::conditional_t<sizeof(V) == 8, u32x2,
+                                 std::conditional_t<sizeof(V) == 4, uint32_t, uint16_t>>>;
         W raw;
         __builtin_memcpy(&raw, &v, sizeof(V));
         *(__attribute__((address_space(1))) W*)(p) = raw;
