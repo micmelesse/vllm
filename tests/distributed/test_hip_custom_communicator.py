@@ -45,14 +45,12 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Open,
     Quantization,
     Supported,
-    TunedTables,
     Where,
+    _record,
     abandon_open,
     build_info,
-    check_table,
     config_of_record,
-    get_nearest_pick,
-    picked_configs,
+    parse_tuned_configs,
     supported,
 )
 from vllm.distributed.parallel_state import get_tp_group
@@ -211,7 +209,7 @@ def _rank_main(
     target: Callable[[HipCustomCommunicator, int], None],
     failures: "Queue[str]",
     kernel_timeout_s: float,
-    tables: TunedTables | None,
+    tuned_path: Path,
     debug: bool,
 ) -> None:
     global _COMM
@@ -246,7 +244,7 @@ def _rank_main(
                 # the crossover would then be checked, lossy, against the exact
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
                 quantization="exact",
-                tables=tables,
+                tuned_path=tuned_path,
                 debug=debug,
             )
         _COMM = comm
@@ -267,13 +265,13 @@ def _on_every_rank(
     target: Callable[[HipCustomCommunicator, int], None],
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
-    tables: TunedTables | None = None,
+    tuned_path: Path = _TABLE,
     debug: bool = False,
 ) -> None:
     """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
     by name first, `partial`), each holding a
     communicator sized for Kimi-K3's largest call, its
-    tuned tables `tables` (None: the file's), in debug mode where `debug` (its calls
+    tuned tables' file `tuned_path` (the shipped one by default), in debug mode where `debug` (its calls
     under vLLM's cache root). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
@@ -290,7 +288,7 @@ def _on_every_rank(
                 target=target,
                 failures=failures,
                 kernel_timeout_s=kernel_timeout_s,
-                tables=tables,
+                tuned_path=tuned_path,
                 debug=debug,
             )
         )
@@ -734,7 +732,7 @@ def _templates() -> dict[str, _Kernel]:
     return {r.kernel: _Kernel(op, r.builds) for op, r in build_info().ops.items()}
 
 
-def _record(
+def _built_config(
     kernel: str, build: dict[str, int | str], quantization: Quantization, grid_x: int
 ) -> Config:
     """KERNEL `kernel` AT `build` moving `quantization` on `grid_x` blocks: its op's
@@ -778,7 +776,7 @@ def _forced(
     )
     if build is None:
         return None
-    return _record(variant.kernel, build, quantization, 16)
+    return _built_config(variant.kernel, build, quantization, 16)
 
 
 def _forced_whole(
@@ -996,7 +994,7 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
 def _built_configs(kernel: str) -> list[Config]:
     """Every build of `kernel` as a config, at a grid of 16 (rows past it looped)."""
     return [
-        _record(kernel, b, cast(Quantization, b["quantization"]), 16)
+        _built_config(kernel, b, cast(Quantization, b["quantization"]), 16)
         for b in _templates()[kernel].builds
     ]
 
@@ -1669,36 +1667,45 @@ def test_the_builds_are_the_tables_configs() -> None:
     assert got == want
 
 
-def test_the_tuned_table_checks() -> None:
+def _written(tmp_path: Path, tables: dict[str, Any]) -> Path:
+    """`tables` as a tuned tables' file under `tmp_path`."""
+    path = tmp_path / "hip_custom_communicator.json"
+    path.write_text(json.dumps(tables))
+    return path
+
+
+def test_the_tuned_table_checks(tmp_path: Path) -> None:
     """gfx950's tuned table (`hip_custom_communicator.json`, a table an arch) checks:
     every pick one kernel of its input's op or our all-reduce then its norm on rows
     (a split among them), every config a build its kernel lists; an unsound table
     raises, naming the entry."""
     import vllm._rocm_C  # noqa: F401
 
-    table = json.loads(_TABLE.read_text())["gfx950"]
-    check_table(table)
-    for k in table["picks"]:
-        op = table["inputs"][k["input"]]["op"].removeprefix("hip_custom_communicator.")
-        kernels = [table["configs"][j]["kernel"] for j in k["configs"]]
-        ops = tuple(_templates()[kernel].op for kernel in kernels)
-        assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, k)
-    assert any(len(k["configs"]) == 2 for k in table["picks"])
+    tuned = parse_tuned_configs(_TABLE, "gfx950")
+    assert tuned is not None
+    for tuned_input, launches in tuned.picks.items():
+        ops = tuple(_templates()[c.kernel].op for c in launches)
+        assert ops in ((tuned_input.op,), ("all_reduce", ROWS.get(tuned_input.op))), (
+            tuned_input
+        )
+    assert any(len(launches) == 2 for launches in tuned.picks.values())
     # AN UNSOUND TABLE, named: a build its kernel does not list, an exact input moving
     # INT4.
-    bad = copy.deepcopy(table)
-    bad["configs"][0]["tile_n"] = 100
+    tables = json.loads(_TABLE.read_text())
+    bad = copy.deepcopy(tables)
+    bad["gfx950"]["configs"][0]["tile_n"] = 100
     with pytest.raises(ValueError, match=r"configs\[0\].*no build"):
-        check_table(bad)
-    bad = copy.deepcopy(table)
+        parse_tuned_configs(_written(tmp_path, bad), "gfx950")
+    bad = copy.deepcopy(tables)
+    table = bad["gfx950"]
     exact = next(
-        k for k in bad["picks"] if bad["inputs"][k["input"]]["mode"] == "exact"
+        k for k in table["picks"] if table["inputs"][k["input"]]["mode"] == "exact"
     )
     exact["configs"] = [
-        next(i for i, c in enumerate(bad["configs"]) if c["quantization"] == "int4")
+        next(i for i, c in enumerate(table["configs"]) if c["quantization"] == "int4")
     ]
     with pytest.raises(ValueError, match="an exact input moves INT4"):
-        check_table(bad)
+        parse_tuned_configs(_written(tmp_path, bad), "gfx950")
 
 
 # THE HANDED-IN TABLE'S ONE INPUT: the plain all-reduce at the hidden row, a decode
@@ -1706,7 +1713,7 @@ def test_the_tuned_table_checks() -> None:
 _HANDED_TOKENS = 8
 
 
-def _one_input_tables(arch: str) -> tuple[TunedTables, dict[str, str | int]]:
+def _one_input_tables(arch: str) -> tuple[dict[str, Any], dict[str, str | int]]:
     """THE FILE'S TABLES WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED on `arch`: the exact
     input at WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, picking a config the file
     does not run there (the file's 1-token pick at that width, a config it already runs
@@ -1738,7 +1745,7 @@ def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -
     want = json.loads(config)
     rows, bf16 = _HANDED_TOKENS, torch.bfloat16
     (tuned_config,) = comm.tuned("all_reduce", rows, HIDDEN)
-    assert asdict(tuned_config) == want, (
+    assert tuned_config == config_of_record(want), (
         f"rank {rank}: tuned {tuned_config}, the table names {want}"
     )
     comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
@@ -1746,7 +1753,7 @@ def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -
 
 
 @on_eight_gpus
-def test_tables_handed_in_are_the_ones_it_runs() -> None:
+def test_tables_handed_in_are_the_ones_it_runs(tmp_path: Path) -> None:
     """A communicator opened with `tables` of the file's shape runs from them, not the
     file: the file's tables with one plain all-reduce input re-pointed to a config the
     file does not run there, and its `tuned` answers that config, which a plain call
@@ -1759,7 +1766,7 @@ def test_tables_handed_in_are_the_ones_it_runs() -> None:
     tables, config = _one_input_tables(found.arch)
     _on_every_rank(
         target=partial(_handed_table_on_rank, config=json.dumps(config)),
-        tables=tables,
+        tuned_path=_written(tmp_path, tables),
     )
 
 
@@ -1796,13 +1803,15 @@ def test_debug_mode_writes_every_call_as_launched(
         (x["op"], x["world"], tuple(x["tensors"]["input"]["shape"])) for x in lines
     }
     assert shapes == {("all_reduce", WORLD_SIZE, (2, HIDDEN))}
-    table = json.loads(_TABLE.read_text())[found.arch]
-    pick = get_nearest_pick(table, "all_reduce", 2, HIDDEN, "exact", WORLD_SIZE)
-    want = [asdict(c) for c in picked_configs(table, pick)]
+    tuned = parse_tuned_configs(_TABLE, found.arch)
+    assert tuned is not None
+    tuned_input, launches = tuned.nearest("all_reduce", "exact", WORLD_SIZE, 2, HIDDEN)
+    want = [_record(c) for c in launches]
     plain = [x for x in lines if x["table_input"] is not None]
     forced = [x for x in lines if x["table_input"] is None]
     assert len(plain) == len(forced) == WORLD_SIZE
-    assert all(x["table_input"] == table["inputs"][pick["input"]] for x in plain)
+    at = asdict(tuned_input) | {"op": "hip_custom_communicator.all_reduce"}
+    assert all(x["table_input"] == at for x in plain)
     assert all(x["configs"] == want for x in lines), "the forced one is the pick's"
 
 
