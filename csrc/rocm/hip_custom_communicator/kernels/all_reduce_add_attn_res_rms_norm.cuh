@@ -427,14 +427,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
       // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
       //    same rows.
-      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, true, Walk::rows, Accumulate::lds, Direction::pull, Until::started, false>(
+      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, true, Walk::rows, Direction::pull, false>(
           input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
           input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
           staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
           staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
           partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
           signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
-          status_ptr, status_stride_field, status_size_field, 0, rank,
+          status_ptr, status_stride_field, status_size_field, rank,
           timeout_ticks);
 
       // 4. Each of this block's tiles: its packs from the ranks that own them (A
@@ -509,14 +509,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // every input read in place after it (written before the peers' launches), and the pushes into a
     // peer's partials after it land where that peer finished reading in its last launch, ended before
     // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
-    reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, true, Walk::rows, Accumulate::registers, Direction::push, !QUANTIZE_INT4 ? Until::started : Until::launched, TAIL>(
+    reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, true, Walk::rows, Direction::push, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
         staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
         partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, 0, rank,
+        status_ptr, status_stride_field, status_size_field, rank,
         timeout_ticks);
 
     // 4. This block's rows: the sum out of this rank's partials (at the input's

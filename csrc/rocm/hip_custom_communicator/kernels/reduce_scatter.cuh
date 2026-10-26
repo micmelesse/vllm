@@ -31,7 +31,7 @@ enum class Direction : int { pull = 0, push = 1 };
 enum class Walk : int { flat = 0, rows = 1 };
 enum class Accumulate : int { lds = 0, registers = 1 };
 
-// [PUSH OR STAGE] BARRIER(UNTIL, 0) SUM BARRIER(visible, 1). After the second barrier every
+// [PUSH OR STAGE] BARRIER(kFirst, 0) SUM BARRIER(visible, 1). After the second barrier every
 // rank's sums are in the partials and every peer is done reading.
 //   flat, pull:           every rank's input read in place through the input table.
 //   flat, push, exact:    this rank's input pushed into every rank's staging inbox
@@ -43,8 +43,8 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 //   rows, registers:      a row of threads as wide as a rank's slice of a row, every rank's pack
 //                         summed in registers; push stores the sum in every rank's partials.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, Walk WALK, Accumulate ACCUMULATE, Direction DIRECTION,
-          Until UNTIL, bool TAIL, typename DTYPE>
+          bool QUANTIZE_INT4, bool CONTIGUOUS, Walk WALK, Direction DIRECTION, bool TAIL,
+          typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
     int input_size_n, const DTYPE* const* input_ptr_array, int input_ptr_array_size,
@@ -56,10 +56,21 @@ DINLINE void reduce_scatter(
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer, int signals_size_parity,
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
-    int64_t status_stride_field, int status_size_field, int offs_m, int rank,
+    int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
+  // WHERE THE COPIES ARE SUMMED, from the walk, the direction and the encoding: the flat walk sums
+  // INT4 groups in registers and exact chunks through LDS; the rows walk sums pulled rows through
+  // LDS and pushed ones in registers.
+  constexpr Accumulate kAccumulate =
+      WALK == Walk::flat ? (kInt4 ? Accumulate::registers : Accumulate::lds)
+                         : (DIRECTION == Direction::pull ? Accumulate::lds : Accumulate::registers);
+  // WHAT THE FIRST BARRIER WAITS FOR: ordered (launched) where this launch writes before it (the
+  // flat walk's push, INT4's staging), else unordered (started): what is read was written before
+  // the launch.
+  constexpr Until kFirst =
+      (WALK == Walk::flat && DIRECTION == Direction::push) || kInt4 ? Until::launched : Until::started;
   if constexpr (WALK == Walk::flat) {
     // THE SHARES of the band's elements: rank r's is slot r of the band viewed flat.
     constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
@@ -72,7 +83,7 @@ DINLINE void reduce_scatter(
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
     };
     if constexpr (kInt4) {
-      static_assert(DIRECTION == Direction::push && ACCUMULATE == Accumulate::registers,
+      static_assert(DIRECTION == Direction::push && kAccumulate == Accumulate::registers,
                     "the int4 flat walk pushes and sums in registers");
       constexpr Layout kInput = CONTIGUOUS ? Layout::group_run : Layout::group_flat;
       const int groups_all = slice / kInt4Group;
@@ -92,7 +103,7 @@ DINLINE void reduce_scatter(
           DTYPE x[1][kInt4GroupPacks][kPackElems];
           load<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
-              input_size_n, input_size_m, len, x, offs_m, g0 * kInt4Group, 1);
+              input_size_n, input_size_m, len, x, 0, g0 * kInt4Group, 1);
           // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
           uint32_t words[kInt4GroupPacks];
           float scale;
@@ -112,7 +123,7 @@ DINLINE void reduce_scatter(
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
+                              status_stride_field, status_size_field, rank, timeout_ticks, kFirst, 0);
       // 2. THE SUM, LOCAL: every writer's group of this share from this rank's inbox, summed in
       //    fp32 from the words, quantized into this rank's partials.
       const int own = share_len(rank);
@@ -139,7 +150,7 @@ DINLINE void reduce_scatter(
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks, Until::visible, 1);
     } else {
-      static_assert(ACCUMULATE == Accumulate::lds, "the exact flat walk sums through LDS");
+      static_assert(kAccumulate == Accumulate::lds, "the exact flat walk sums through LDS");
       constexpr Layout kInput = CONTIGUOUS ? Layout::run : Layout::flat;
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
       // The chunk in whole packs (TILE_N rounded up); the share's packs past it are masked.
@@ -163,7 +174,7 @@ DINLINE void reduce_scatter(
           DTYPE part[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
-              input_size_n, input_size_m, end, part, offs_m, chunk * kChunkN, 1);
+              input_size_n, input_size_m, end, part, 0, chunk * kChunkN, 1);
           send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::run>(
               part, staging_ptr_array, staging_ptr_array_size, r, rank, staging_stride_m,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, end, 0,
@@ -181,7 +192,7 @@ DINLINE void reduce_scatter(
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
+                              status_stride_field, status_size_field, rank, timeout_ticks, kFirst, 0);
       // 2. THE SUM: this rank's share a chunk a step, every rank's copy a row of threads (pull:
       //    rank w's input; push: writer w's slot of this inbox), summed in rotated order through
       //    LDS, rounded once, stored in this rank's partials.
@@ -200,12 +211,12 @@ DINLINE void reduce_scatter(
             recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
                 &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, end, got,
-                offs_m, chunk * kChunkN, 1);
+                0, chunk * kChunkN, 1);
           else
             recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
                 input_ptr_array, input_ptr_array_size, w, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, end, got,
-                offs_m, chunk * kChunkN, 1);
+                0, chunk * kChunkN, 1);
           DTYPE rounded[1][kPacks][kPackElems];
           reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
           store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0,
@@ -256,8 +267,8 @@ DINLINE void reduce_scatter(
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
-    if constexpr (ACCUMULATE == Accumulate::lds) {
+                              status_stride_field, status_size_field, rank, timeout_ticks, kFirst, 0);
+    if constexpr (kAccumulate == Accumulate::lds) {
       static_assert(DIRECTION == Direction::pull, "the rows walk through LDS pulls");
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");

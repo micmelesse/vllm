@@ -1059,8 +1059,8 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
 
 
 # THE TABLE'S CONFIGS AT SIZE: each exact config of an op's kernel the table holds (its picks and a
-# tune's candidates), AT ITS OWN GRID, at row counts where the two-shots run in passes, against the
-# reference. The every-build sweep runs each build at grid 16 and 1 or 33 rows; three node crashes
+# tune's candidates), AT ITS OWN GRID, at the largest row counts (a call past the regions refused by
+# name), against the reference. The every-build sweep runs each build at grid 16 and 1 or 33 rows; three node crashes
 # came timing the fused add-RMSNorm's large-size candidates (2026-10-26T00-10-51Z, 00-29-16Z,
 # 00-45-50Z), sizes no correctness test had run. Run it on a build with the device's bounds checks
 # compiled in (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEVICE_CHECKS=1) to trap a stray access where it is.

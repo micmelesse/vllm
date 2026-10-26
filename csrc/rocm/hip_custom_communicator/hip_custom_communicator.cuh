@@ -1519,8 +1519,7 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
                                     int64_t partials_bytes, Template fn,
                                     const KernelConfig& c, DType dtype,
                                     int64_t m, int64_t n,
-                                    std::optional<Error> own_error,
-                                    bool in_passes) {
+                                    std::optional<Error> own_error) {
   if (collective && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (own_error) return own_error;
@@ -1600,15 +1599,15 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
                    : int4_payload_bytes(1, partials / elem_bytes(dtype))) >
                   partials_bytes)
     return Error::partials_too_small;
-  if (!in_passes && partials > partials_bytes)
+  // A COLLECTIVE RUNS THE WHOLE CALL IN ONE PASS: the regions are sized from the largest call the
+  // server makes, so a call past them is refused here, never cut into bands. Its input is in the
+  // staging whole: an eager exact call's host copy (INPUT TABLES; a captured one's is read where
+  // it is, refused here alike, so the eager and captured calls of one shape agree), or a pushed
+  // input. A norm on rows (not a collective) uses neither region.
+  if (collective && partials > partials_bytes)
     return Error::partials_too_small;
-  // A BUILD THAT DOES NOT RUN IN PASSES has its input in the inputs whole:
-  // an eager exact call's host copy (INPUT TABLES; a captured
-  // one's is read where it is, refused here alike, so the eager and captured
-  // calls of one shape agree), or an INT4 call's quantized payload (the INT4
-  // all-reduce: pushed).
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!in_passes && bytes > staging_bytes)
+  if (collective && bytes > staging_bytes)
     return Error::staging_too_small;
   return std::nullopt;
 }
@@ -1917,7 +1916,7 @@ inline std::variant<Config, Error> all_reduce_config(
     int world, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k, hipStream_t stream) {
+    int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   const Template fn = k.fn;
@@ -1938,56 +1937,20 @@ inline std::variant<Config, Error> all_reduce_config(
   // epoch as it was.
   const bool unfenced = algorithm == Algorithm::one_shot_push && q == Quantization::exact;
   if (unfenced && volume(c.launch.grid) > kUnfencedBlocks) return Error::launch_out_of_range;
-  // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
-  // the whole input). INT4 pushes its input's shares quantized, whole,
-  // instead.
-  const bool in_passes = q == Quantization::exact;
-  // THE BAND: the rows a pass, what the inbox (the staging) holds in
-  // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
-  // the two-shot's is one rank's share of the band (the flat walk's, whole
-  // packs, rounded up), [WORLD, slot], whose band the partials also hold (a
-  // row of its slice a row). Rounding up costs a two-shot at most one pack a
-  // slot, so the band one row less than the inputs' rows always fits.
-  const int64_t row_bytes = n * elem_bytes(dtype);
+  // THE WHOLE CALL IN ONE PASS (the regions are sized from the largest call; refused() refuses a
+  // call past them). The two-shots' exact share is the flat walk's, whole packs, rounded up: a
+  // rank's slice of a row in the partials, and the pushed two-shot's inbox [WORLD, slot] in the
+  // staging, its slot a share of the whole call.
   const int64_t pack = a.pack_bytes;  // the build's
   const int64_t packs = n * elem_bytes(dtype) / pack;
   const int64_t slice_bytes = (packs + world - 1) / world * pack;
-  const auto slot_packs = [&](int64_t rows) {
-    return (rows * packs + world - 1) / world;
-  };
-  int64_t band = 0;
-  if ((in_place && !is_two_shot(algorithm)) || unfenced) {
-    band = m;  // nothing staged: one pass (the lines' passes are the kernel's)
-  } else if (in_place) {
-    // THE IN-PLACE TWO-SHOT'S BAND: what the partials hold, a row of its
-    // slice a row; the input is read where it is.
-    band = slice_bytes > 0 ? partials_bytes / slice_bytes : 0;
-  } else if (row_bytes > 0 && !is_two_shot(algorithm)) {
-    band = staging_bytes / (world * row_bytes);
-  } else if (row_bytes > 0) {
-    band = staging_bytes / row_bytes;
-    if (band > 0 && world * slot_packs(band) * pack > staging_bytes) --band;
-    if (slice_bytes > 0 && partials_bytes / slice_bytes < band)
-      band = partials_bytes / slice_bytes;
-  }
-  const int64_t rows = band < m ? band : m;  // a pass's rows
+  const int64_t slot = (m * packs + world - 1) / world * pack / elem_bytes(dtype);
   if (const std::optional<Error> e =
-          refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n,
-                  std::nullopt, in_passes))
+          refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n, std::nullopt))
     return *e;
-  if (in_place && is_two_shot(algorithm) && band < 1)
-    return Error::partials_too_small;
-  if (in_passes && band < 1) return Error::staging_too_small;
-  // AN EAGER IN-PLACE CALL'S INPUT IS COPIED WHOLE into the staging
-  // (its table, INPUT TABLES); a captured one is read where it
-  // is, registered at capture exit.
-  if (in_place) {
-    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-    HIP_CHECK(hipStreamIsCapturing(stream, &capture));
-    if (capture != hipStreamCaptureStatusActive &&
-        m * n * elem_bytes(dtype) > staging_bytes)
-      return Error::staging_too_small;
-  }
+  // THE EXACT PUSHED TWO-SHOT'S INBOX, its slots rounded up to whole packs.
+  const bool inbox = !quantize_int4 && algorithm == Algorithm::two_shot_push;
+  if (inbox && world * slot * elem_bytes(dtype) > staging_bytes) return Error::staging_too_small;
   Config config{};
   config.shared_memory_bytes = 0;
   config.weight_dtype = dtype;
@@ -2003,27 +1966,17 @@ inline std::variant<Config, Error> all_reduce_config(
   config.quantize_int4 = quantize_int4;
   config.pack_bytes = a.pack_bytes;  // the build's: the instance dispatch finds
   // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): the pushed two-shot's.
-  const bool int4_flat = !in_passes && algorithm == Algorithm::two_shot_push;
+  const bool int4_flat = quantize_int4 && algorithm == Algorithm::two_shot_push;
   const int64_t share = int4_flat_share(m, n, world);
   config.partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.partials_stride_n = 1;
   // THE ONE-SHOTS USE NO PARTIALS: an empty view.
-  config.partials_size_m = !is_two_shot(algorithm) ? 0 : int4_flat ? 1 : in_passes ? rows : m;
+  config.partials_size_m = !is_two_shot(algorithm) ? 0 : int4_flat ? 1 : m;
   config.partials_size_n = int4_flat ? share : slice_bytes / elem_bytes(dtype);
-  config.staging_stride_m = in_place || unfenced                ? 0
-                         : int4_flat                       ? world * share
-                         : !in_passes || !is_two_shot(algorithm) ? n
-                             : slot_packs(rows) * pack / elem_bytes(dtype);
+  config.staging_stride_m = in_place || unfenced ? 0 : int4_flat ? world * share : inbox ? slot : n;
   config.staging_stride_n = in_place || unfenced ? 0 : 1;
-  config.staging_size_m = in_place || unfenced ? 0
-                       : int4_flat ? 1
-                       : !in_passes ? m
-                       : is_two_shot(algorithm) ? world
-                                         : world * rows;
-  config.staging_size_n = in_place || unfenced                ? 0
-                       : int4_flat                       ? world * share
-                       : !in_passes || !is_two_shot(algorithm) ? n
-                           : slot_packs(rows) * pack / elem_bytes(dtype);
+  config.staging_size_m = in_place || unfenced ? 0 : int4_flat ? 1 : inbox ? world : m;
+  config.staging_size_n = in_place || unfenced ? 0 : int4_flat ? world * share : inbox ? slot : n;
   // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank, row) of
   // kUnfencedSlotBytes of payload each whatever the build (so a row is the same bytes at every
   // build, its epoch its own), a writer's rows contiguous.
@@ -2085,7 +2038,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   const int algorithm = algorithm_of(k.config.build);
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n,
-          weight_refused(op, dtype, weight_dtype), false))
+          weight_refused(op, dtype, weight_dtype)))
     return *e;
   const AllReduceRmsNormBuildConfig& r =
       std::get<AllReduceRmsNormBuildConfig>(c.build);
@@ -2160,7 +2113,7 @@ all_reduce_add_rms_norm_config(
   const int algorithm = algorithm_of(k.config.build);
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n,
-          weight_refused(op, dtype, weight_dtype), false))
+          weight_refused(op, dtype, weight_dtype)))
     return *e;
   const AllReduceAddRmsNormBuildConfig& r =
       std::get<AllReduceAddRmsNormBuildConfig>(c.build);
@@ -2260,8 +2213,7 @@ all_reduce_add_attn_res_rms_norm_config(
   const int algorithm = algorithm_of(k.config.build);
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e =
-          refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n, std::nullopt,
-                  false))
+          refused(true, world, staging_bytes, partials_bytes, fn, c, dtype, m, n, std::nullopt))
     return *e;
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
@@ -2358,7 +2310,7 @@ inline std::variant<Config, Error> rms_norm_config(int world, int64_t m, int64_t
                                                    const Chosen& k) {
   const OpType op = OpType::rms_norm;
   if (const std::optional<Error> e = refused(false, 1, 0, 0, k.fn, k.config, dtype, m, n,
-                                             weight_refused(op, dtype, weight_dtype), true))
+                                             weight_refused(op, dtype, weight_dtype)))
     return *e;
   const Config config = rows_config(world, k, n, dtype, weight_dtype, 0);
   const void* kernel = nullptr;
@@ -2377,7 +2329,7 @@ inline std::variant<Config, Error> add_rms_norm_config(int world, int64_t m, int
                                                        const Chosen& k) {
   const OpType op = OpType::add_rms_norm;
   if (const std::optional<Error> e = refused(false, 1, 0, 0, k.fn, k.config, dtype, m, n,
-                                             weight_refused(op, dtype, weight_dtype), true))
+                                             weight_refused(op, dtype, weight_dtype)))
     return *e;
   const Config config = rows_config(world, k, n, dtype, weight_dtype, 0);
   const void* kernel = nullptr;
@@ -2396,7 +2348,7 @@ inline std::variant<Config, Error> add_attn_res_rms_norm_config(int world, int64
                                                                 int num_blocks, const Chosen& k) {
   const OpType op = OpType::add_attn_res_rms_norm;
   if (const std::optional<Error> e =
-          refused(false, 1, 0, 0, k.fn, k.config, dtype, m, n, std::nullopt, true))
+          refused(false, 1, 0, 0, k.fn, k.config, dtype, m, n, std::nullopt))
     return *e;
   // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
   // attn_res_wide): [tile_m][num_blocks + 1] floats.
@@ -2547,7 +2499,7 @@ inline std::variant<Config, Error> all_reduce(
     return *e;
   std::variant<Config, Error> checked = all_reduce_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
-      dtype, k, stream);
+      dtype, k);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::all_reduce>(config, [&]<Config C>() {

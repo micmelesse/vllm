@@ -263,27 +263,19 @@ DINLINE void all_reduce_two_shot_pull(
       store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(got, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
     }
   } else {
-    // PULL TWO-SHOT, EXACT: a band of partials_size_m rows a pass.
-    for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
-      const int band =
-          min(partials_size_m, input_size_m - r0);  // this pass's rows
-      DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-      // 1-3. Barrier, sum this rank's share of the band from every rank's input into its
-      //      partials, barrier.
-      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::pull, Until::started, false>(
-          static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
-          input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, nullptr, 0, 0, 1, 0, 0,
-          partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-          partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-          signals_stride_writer, signals_size_parity, signals_size_block,
-          signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank, timeout_ticks);
-
-      // 4. All-gather: every rank's summed share out of its partials, at its
-      //    place in the output.
-      all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, CONTIGUOUS, Walk::flat, false>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-                        partials_stride_n, partials_size_m, partials_size_n, band_output,
-                        output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
-    }
+    // PULL TWO-SHOT, EXACT: barrier, this rank's share of every rank's input (read in place
+    // through the input table) summed into its partials, barrier; then all-gather.
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, CONTIGUOUS, Walk::flat, Direction::pull, false>(
+        static_cast<const DTYPE*>(nullptr), 0, 1, input_size_m, input_size_n, input_ptr_array,
+        input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, nullptr, 0, 0, 1, 0, 0,
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+        partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, CONTIGUOUS, Walk::flat, false>(
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+        partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
+        input_size_m, input_size_n, 0, 0, 0, rank);
   }
 }
 
@@ -517,44 +509,20 @@ DINLINE void all_reduce_two_shot_push(
     int rank,
     uint64_t timeout_ticks) {
   // PUSH TWO-SHOT: reduce-scatter (each rank's share pushed into that rank's inbox at slot [rank],
-  // barrier, the inbox summed into its partials, barrier), then all-gather. The next call's first
-  // barrier keeps a rank from overwriting its partials while a peer still reads them.
-  if constexpr (QUANTIZE_INT4) {
-    // INT4: one pass (its payloads are sized to the whole call), the shares quantized, summed in
-    // registers after an ordered first barrier.
-    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, Accumulate::registers, Direction::push, Until::launched, TAIL>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
-        partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field, 0, rank,
-        timeout_ticks);
-    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, TAIL>(
-        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
-        input_size_m, input_size_n, 0, 0, 0, rank);
-  } else {
-    // EXACT: a band of partials_size_m rows a pass, so any size fits, summed through LDS after a
-    // visible first barrier.
-    for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
-      const int band = min(partials_size_m, input_size_m - r0);
-      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::push, Until::visible, false>(
-          input_ptr, input_stride_m, input_stride_n, band, input_size_n,
-          static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
-          staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-          staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
-          partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-          signals_stride_writer, signals_size_parity, signals_size_block,
-          signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank,
-          timeout_ticks);
-      all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, false>(
-          partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-          partials_size_m, partials_size_n, output_ptr + r0 * output_stride_m, output_stride_m,
-          output_stride_n, band, input_size_n, 0, 0, 0, rank);
-    }
-  }
+  // barrier, the inbox summed into this rank's partials, barrier), then all-gather. The next
+  // call's first barrier keeps a rank from overwriting its partials while a peer still reads them.
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, Direction::push, TAIL>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
+  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, TAIL>(
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+      partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
+      input_size_m, input_size_n, 0, 0, 0, rank);
 }
 
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
