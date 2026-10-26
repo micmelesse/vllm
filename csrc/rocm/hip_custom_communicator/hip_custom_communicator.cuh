@@ -1574,7 +1574,6 @@ class Handle {
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
     add(own, release_unfenced_epochs());
-    add(own, release_status());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1628,7 +1627,6 @@ class Handle {
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
     add(own, release_unfenced_epochs());
-    add(own, release_status());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1670,7 +1668,6 @@ class Handle {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
       add(own, release_unfenced_epochs());
-      add(own, release_status());
       add(own, release_region_ptr_arrays());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
@@ -1767,17 +1764,15 @@ class Handle {
   static constexpr int64_t status_size_field() { return kStatusFields; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
-  // THE STATUS, every field's word, read while kernels run: a copy on the status's own stream
-  // (non-blocking: it never queues behind a launch, a spinning one included), mirrored into the
-  // log's host words for a post-mortem (`last_log`). The fault's fields are whole only once
-  // `state` is FaultState::written; the reader checks.
+  // THE STATUS, every field's word, read while kernels run (host-mapped: it
+  // never waits on the device). The fault's fields are whole only once `state`
+  // is FaultState::written; the reader checks.
   std::array<uint32_t, kStatusFields> status() const {
     std::array<uint32_t, kStatusFields> words{};
-    if (status_device_ == nullptr) return words;
-    HIP_CHECK(hipMemcpyAsync(words.data(), status_device_, sizeof(words),
-                             hipMemcpyDeviceToHost, status_stream_));
-    HIP_CHECK(hipStreamSynchronize(status_stream_));
-    for (int f = 0; f < kStatusFields; ++f) status_[f] = words[f];
+    words[static_cast<int>(StatusField::state)] = __atomic_load_n(
+        &status_[static_cast<int>(StatusField::state)], __ATOMIC_ACQUIRE);
+    for (int f = 0; f < kStatusFields; ++f)
+      if (f != static_cast<int>(StatusField::state)) words[f] = status_[f];
     return words;
   }
   // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value), the
@@ -1936,19 +1931,11 @@ class Handle {
 
   // Every wait on this rank leaves at its next check: for a communicator the
   // host has given up on.
-  // Its `abort` word set in device memory by a copy on the status's own stream (the waits poll it
-  // there, never over the host link), and in the log's host words for a post-mortem; an open that
-  // failed before the device status exists has only the latter.
+  // The log's words, not `status_`: an open that failed is abandoned before
+  // `status_` is set.
   void abort() {
     __atomic_store_n(&log_->status_host()[static_cast<int>(StatusField::abort)],
                      uint32_t{1}, __ATOMIC_RELEASE);
-    if (status_device_ == nullptr) return;
-    static const uint32_t kOne = 1;
-    const hipError_t e = hipMemcpyAsync(
-        status_device_ + static_cast<int>(StatusField::abort), &kOne, sizeof(kOne),
-        hipMemcpyHostToDevice, status_stream_);
-    if (e == hipSuccess) (void)hipStreamSynchronize(status_stream_);
-    else (void)hipGetLastError();
   }
 
   // WHY `kernel` CANNOT LAUNCH HERE, `grid` blocks of `block` threads and `shared_bytes` of dynamic
@@ -2145,21 +2132,13 @@ class Handle {
     }
     log.phase(OpenPhase::tables_written,
               static_cast<uint32_t>(kInputTableSlots));
-    // THE STATUS IN THIS RANK'S DEVICE MEMORY, UNCACHED (as the arena: a wait's poll reads it past
-    // every L2, so the host's abort, a copy, is seen): kStatusFields words, zeroed. A wait polls its
-    // `abort` every 256 checks and one that gives up writes its fault there with system-scope
-    // atomics (common.cuh's BARRIER); the host reads it and sets `abort` by copies on a stream of its
-    // own (`status`, `abort`), so no wait ever reaches host memory. Host-mapped until October 26:
-    // every waiting thread of a large grid on every GPU then polled one host line with system-scope
-    // atomics, and timing the large-size fused two-shots raised uncorrectable ATHUB errors (the
-    // path to host memory) and rebooted the node six times (2026-10-26T00-10-51Z to 02-14-50Z).
-    // The log's host words mirror it for a post-mortem (`last_log`).
+    // THE STATUS, host-mapped and coherent: the log's first words
+    // (log.cuh). A wait that gives up writes its fault with system-scope
+    // atomics while the host polls it, and the host sets its `abort`
+    // (common.cuh's BARRIER). The kernels take its device address as their
+    // own argument, a buffer of kStatusFields words.
     status_ = log.status_host();
-    HIP_CHECK(hipStreamCreateWithFlags(&status_stream_, hipStreamNonBlocking));
-    HIP_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&status_device_),
-                                    kStatusFields * sizeof(uint32_t), kArenaMallocFlags));
-    HIP_CHECK(hipMemset(status_device_, 0, kStatusFields * sizeof(uint32_t)));
-    device_status_ = status_device_;
+    device_status_ = log.status_device();
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -2240,25 +2219,6 @@ class Handle {
     return out;
   }
   // THE EPOCHS freed (ours, local): with our arena, in teardown's second half. Idempotent.
-  // THE STATUS (ours, local): its device words and its stream, with our arena, in teardown's
-  // second half. Idempotent.
-  Arena::Released release_status() {
-    Arena::Released out;
-    if (status_device_ != nullptr) {
-      const hipError_t e = hipFree(status_device_);
-      if (e != hipSuccess) {
-        (void)hipGetLastError();
-        out.error = e;
-      }
-      status_device_ = nullptr;
-      device_status_ = nullptr;
-    }
-    if (status_stream_ != nullptr) {
-      (void)hipStreamDestroy(status_stream_);
-      status_stream_ = nullptr;
-    }
-    return out;
-  }
   Arena::Released release_unfenced_epochs() {
     Arena::Released out;
     if (unfenced_epochs_ != nullptr) {
@@ -2407,10 +2367,8 @@ class Handle {
   // One teardown at a time: close, abandon (a signal, exit) and the
   // destructor.
   std::mutex teardown_;
-  uint32_t* status_ = nullptr;             // the log's host words: the status's mirror
-  uint32_t* device_status_ = nullptr;      // what the kernels take: status_device_
-  uint32_t* status_device_ = nullptr;      // OWNED: the status, device memory (release_status)
-  hipStream_t status_stream_ = nullptr;    // OWNED: the status's copies (release_status)
+  uint32_t* status_ = nullptr;
+  uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
   // check_kernel's, by kernel, block size and dynamic LDS: why it cannot launch at all (if it
   // cannot), and the most of its blocks resident at once.
