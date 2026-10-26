@@ -1,37 +1,36 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE PLAIN ALL-REDUCE: its kernels, one section each. THE DEFAULT, PULLED IN
-// PLACE (all_reduce_pull_one_shot, all_reduce_pull_two_shot;
-// aiter's gfx950 cross_device_reduce_1stage / 2stage): ONE kernel a shape
-// reads every rank's input where the INPUT TABLE says (common.cuh's INTERFACE:
-// a captured call's registered tensors, or an eager call's copies in every
-// rank's staging, hip_custom_communicator.cuh's INPUT TABLES), no copy inside the kernel.
-// Its inputs are never written while it runs: the one-shot ends with a `read`
-// barrier and the two-shot's second barrier follows its every read of them, so
-// when a rank's launch ends every peer is done reading its input, and the next
-// call's host copy (stream-ordered after it) or the caller may overwrite it.
-// The INT4 two-shot (all_reduce_push_two_shot<..., int4>) encodes its
-// input itself: what crosses the links is quantized by its owner, so it cannot
-// be read in place; it pushes the quantized shares (below).
+// THE PLAIN ALL-REDUCE: one kernel, `all_reduce`, its ALGORITHM a template parameter, each
+// algorithm its own body under `if constexpr`.
+//   pull one-shot  every rank reads every rank's input through the input table and sums.
+//                  (aiter's cross_device_reduce_1stage)
+//   pull two-shot  each rank sums its share of every rank's input into its partials; then
+//                  every rank reads every rank's partials. (aiter's cross_device_reduce_2stage)
+//   push one-shot  each rank writes its input into every peer's inbox as lines that carry
+//                  this call's epoch; each rank waits for the epoch in its own inbox and
+//                  sums. No barrier. (NCCL's LL, aiter's ar_ll_gfx9)
+//   push two-shot  each rank writes every rank's share into that rank's inbox; each rank
+//                  sums its inbox into its partials; then every rank reads every partials.
+// An INT4 build's QUANTIZE instance moves INT4: each rank encodes its own input, so nothing
+// is read in place. The exact instance of an INT4 build is the exact body.
 //
-// THE PUSHED VARIANTS, each PUSHED: a rank reads only its own input (the
-// caller's tensor, which no peer reads) and stores it, or each rank's share of
-// it, into the peers' receive areas (the INBOX: [writer slot, ...]); each rank
-// sums the WORLD slots of its inbox LOCALLY. Nothing is copied in first.
-// all_reduce_push_one_shot (decode; forced until a tuned entry names it)
-// pushes LINES, the flag in the data, into its own inbox in the unfenced
-// region (the host's) and takes no barrier (its section says why the inbox is safe to
-// reuse). all_reduce_push_two_shot (forced only) pushes into the staging, a
-// band of rows a pass, and sums after an ordered barrier; the int4 two-shot
-// pushes its shares quantized. THE STAGING INBOX IS REUSED, launch after launch
-// and pass after pass, with no barrier of its own: a rank pushes into peer s's
-// slot only after passing the barrier that follows peer s's local sum of it
-// (the two-shots' second, `visible`), and a peer arrives there only once its
-// block's sum is done (its loads returned: the sums stored after depend on
-// them). Across launches every block of the previous launch passed it, so a
-// different grid or another kernel before is covered too: every kernel's reads
-// of the inputs region come before its last barrier.
+// THE WALKS. The one-shots walk [m, n] in TILE_M x TILE_N tiles, the grid striding over
+// them. The two-shots walk each rank's share as one flat range of the m * n elements, in
+// TILE_N chunks (TILE_M unused). A tile or chunk is whole 16-byte packs; steps past its
+// edge are masked.
+//
+// THE INPUTS ARE NOT WRITTEN WHILE A KERNEL RUNS: its last barrier follows every read of
+// them, so the next call's copy, stream-ordered after it, may overwrite them.
+//
+// THE STAGING INBOX IS REUSED WITHOUT A BARRIER OF ITS OWN: a rank writes into peer s's
+// slot only after the barrier that follows peer s's sum of that slot.
+//
+// THE PUSHED ONE-SHOT'S EPOCH: a counter per row on the device, +1 each call that writes the
+// row (never 0), so a graph replay counts on with no host code and the inbox is never
+// cleared. A row's bank is its epoch & 1. Two banks need no closing barrier: a rank writes
+// epoch e into a bank only after it saw the peer's e - 1, which the peer sends only after
+// it finished with e - 2, the bank's last use.
 
 #pragma once
 
@@ -41,144 +40,6 @@
 
 namespace hip_custom_communicator {
 
-// =============================================================================
-// all_reduce_pull_one_shot
-//
-// One-shot all-reduce, PULLED IN PLACE: sync (every rank's input ready and
-// visible), read every rank's input through the input table, sum, sync (every
-// peer done reading this rank's). aiter's `cross_device_reduce_1stage`. No band
-// loop: nothing is staged, so any size runs in one pass.
-// =============================================================================
-
-// THE BUFFER AS [m, n], every rank's at the table's strides (input_ptr_array_stride_m,
-// input_ptr_array_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
-// the tiles row-major. ANY BUILD WALKS ITS TILE (the dense map, STANDARDS 3.2):
-// TILE_M rows of threads a row each where they divide the block, else one row of
-// threads looping over the rows; a row of threads' packs in kPacks steps, the
-// last step's packs past the tile MASKED where the row of threads is not a
-// divisor of the tile (a thread past it loads the tile's last pack and stores
-// nothing: the clips are the tile's). The one rule left: the tile is whole packs
-// (a pack is one aligned 16-byte access; a tile edge inside one would split it
-// between two blocks).
-
-
-// =============================================================================
-// all_reduce_pull_two_shot
-//
-// Two-shot all-reduce, PULLED IN PLACE (exact): a band of `partials_size_m`
-// rows a pass (what the partials hold): sync, this rank's share of the band
-// read from every rank's input through the table and summed into its
-// partials, sync, every rank's summed share pulled out of its partials. aiter's
-// `cross_device_reduce_2stage`.
-// =============================================================================
-
-// THE PROBLEM as the pushed two-shot's (the flat walk, each rank's share one
-// contiguous range of the band's elements), every rank's input at the table's
-// strides. CONTIGUOUS: the table's rows and the output's back to back.
-
-
-// =============================================================================
-// all_reduce_push_one_shot
-//
-// One-shot all-reduce, PUSHED WITH THE FLAG IN THE LINE (NCCL's LL; aiter's
-// `ar_ll_gfx9`): each rank stores its own tile into slot [rank] of every peer's
-// inbox as LINES (common.cuh's Layout::line: 8 bytes of payload and this
-// call's epoch in each 16-byte line, one store), then polls its OWN inbox
-// until every peer's lines carry the epoch, and sums. ONE FABRIC TRIP AND NO
-// BARRIER: a line that carries the epoch is its data. The input is read only by
-// its owner.
-// =============================================================================
-
-// THE BUFFER AS [m, n] AT ITS STRIDES, a work item a TILE_M x TILE_N tile, the
-// grid striding over the tiles row-major: A TILE A BLOCK A PASS. THE INBOX
-// (`lines`), [writer, row, n] in payload elements, two banks of unfenced_size_m / 2
-// rows (the host's unfenced region), a block's TILE_M rows from blockIdx.x * TILE_M
-// of a bank (the grid's rows at most a bank's, select's), the row's pitch fixed
-// whatever the build; ONE WRITER'S ROWS ARE CONTIGUOUS (aiter's dense packet
-// index): as [bank, block, writer] slots, a writer's lines a block apart sat 32 KiB
-// apart.
-// THE EPOCH (`epochs`, [row, n], a row's word at column 0), PER ROW, ON THE
-// DEVICE: read at the start, +1 a pass that writes the row (never 0: the inbox
-// starts zeroed; past 0xffffffff it is 2, keeping the banks alternating), written
-// back at the end, so a CUDA-graph replay, which runs none of our host code,
-// counts on and the inbox is never cleared. A ROW'S, NOT A BLOCK'S: a block's rows
-// are its TILE_M's, so at another TILE_M a row is another block's, and a block's
-// count was not the row's (at TILE_M 2 block b writes rows 2b and 2b + 1; back at
-// TILE_M 1, block 2b + 1, behind block b, counted to the epoch b's stale line
-// carried and took it for data). A row's every write counts on its own epoch,
-// whichever block writes it. Every rank runs the same calls at the same builds and
-// grids, so row q's epoch is the same on every rank. (STANDARDS 3.2 says nothing
-// persists between launches; this counter does, by Michael's design, October 18:
-// the flag in the line needs a per-call value no host writes.) A ROW'S BANK =
-// its epoch & 1 (common.cuh's line layout).
-// WHY TWO BANKS NEED NO CLOSING BARRIER (aiter's argument, per row): a rank
-// writes row q's epoch e into a peer's bank (e & 1) only after it saw that
-// peer's row q lines of e - 1, which the peer sends only once it is done with
-// e - 2, the bank's last use: in the same launch, its row's one block passed
-// the __syncthreads after its pass e - 2; in an earlier launch, that launch ended
-// before the one sending e - 1 began (stream order). A rank starts call e + 2
-// only after every peer started e + 1, which they do only after finishing e.
-// The argument is a row's, not a thread's: a lane past the clip's columns writes
-// its clamped place too (the same bytes as its owner; common.cuh's line write), a
-// row past the clip is neither written nor counted, and the __syncthreads closing
-// each pass covers every lane.
-
-
-// =============================================================================
-// all_reduce_pull_one_shot_int4, all_reduce_pull_two_shot_int4, all_reduce_push_one_shot_int4
-//
-// THE INT4 BODIES of the one-shots and the pulled two-shot: an input moved INT4 is encoded by its
-// owner, so none is read in place. Each rank quantizes its input (a tile a block, Layout::tile, a
-// group 4 consecutive lanes' packs) into an [m, n] INT4 payload in its staging (the pulls) or
-// into slot [rank] of every rank's inbox there (the push), and the readers dequantize. A
-// one-shot's sum is stored exact; the pulled two-shot's sums cross the links again, INT4, out of
-// each owner's partials (a rank's rows whole tiles). Two barriers each, ordered then the last.
-// =============================================================================
-
-// =============================================================================
-// all_reduce_push_two_shot
-//
-// Two-shot all-reduce: reduce-scatter, then all-gather, the sum kept in this
-// rank's partials and pulled by the peers. THE
-// REDUCE-SCATTER IS PUSHED: each rank reads its own input and stores every
-// rank's share of it into that rank's inbox at slot [rank], sync (ordered),
-// each rank sums the WORLD slots of its share locally into its partials, sync,
-// every rank's summed share pulled out of its partials (aiter's
-// `cross_device_reduce_2stage` second half). INT4: the shares
-// quantized by the kernel before they are pushed; exact (none), a band of rows
-// a pass. No peer reads the caller's input.
-// =============================================================================
-
-// THE PROBLEM, [R, M, N]: R = WORLD ranks' inputs, each an [input_size_m,
-// input_size_n] buffer at its strides, summed elementwise. Reduce-scatter (each
-// rank sums its share over the ranks into its partials), sync, all-gather (every
-// rank's summed share out to the output). The kernel states the problem;
-// common.cuh's flat walk cuts it as [R, 1, M*N], each rank's share one
-// contiguous range of the elements, for long runs (its comment says why and
-// what it serves badly), a TILE_N chunk a step (the flat walk has no rows: TILE_M is
-// the one-shots'; any block and any tile walk it, rounded up to whole packs, the
-// collectives' flat walk says how). CONTIGUOUS: the input's and the output's rows
-// are back to back, the instance the host picks from their strides.
-// QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION); with int4
-// each share is quantized by this rank, from its own input, and pushed into the share's rank's inbox INT4 payload at this rank's slot
-// (the payload as an [m, n] one, writer w's slot where share w's groups lie),
-// and the sums' are the partials' INT4 payload, a group a thread (the INT4 flat
-// walk's). NONE: the same shares transferred exactly, a band of rows a pass.
-
-// EXACT, IN PASSES: a band of `partials_size_m` rows a pass (the host's: what
-// the inbox and the partials hold), so any size runs in one launch. A band is
-// the problem's rows [r0, r0 + band) at their strides. THE INBOX, the staging
-// region as [WORLD, slot]: writer w's slot at row w, staging_stride_m elements
-// a slot, holding writer w's copy of this rank's share of the band from the
-// slot's first element. EACH BLOCK PUSHES, OF EVERY RANK'S SHARE, THE CHUNKS
-// THAT RANK'S SAME BLOCK SUMS, so a peers barrier makes them visible.
-
-// =============================================================================
-// all_reduce: THE PLAIN ALL-REDUCE, ONE KERNEL: its ALGORITHM (common.cuh's Algorithm) is a
-// template parameter, and each algorithm it is built for (pull one-shot, pull two-shot, push one-shot, push two-shot) is its own
-// body under `if constexpr`, as its section above says. An algorithm it has no body for does not
-// compile.
-// =============================================================================
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
           int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION, int ALGORITHM,
           bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
@@ -205,30 +66,26 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-  // EACH ALGORITHM ITS OWN BODIES, and an INT4 build's two instances (QUANTIZE, a template
-  // parameter: the host launches the one its config's quantize_from_bytes names for the call's
-  // bytes): QUANTIZE, the INT4 body; not, the exact body, alone in its instance (the INT4
-  // kernel passing the call exact compiles as the exact kernel does, its registers its own).
+  // Each algorithm its own body; an INT4 build has two instances, QUANTIZE (the INT4 body)
+  // and not (the exact body), the host launching the one quantize_from_bytes names.
   static_assert(!QUANTIZE || QUANTIZATION == Quantization::int4, "only an INT4 build quantizes");
   if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     if constexpr (QUANTIZE) {
-      // INT4 PULL ONE-SHOT (all_reduce_pull_one_shot_int4, above): each rank quantizes its own input
-      // into its staging (an [m, n] INT4 payload: an input moved INT4 is encoded by its owner, never
-      // read in place), sync (ordered: every rank's payload visible), every rank's payload pulled and
-      // dequantized, summed, sync (every peer done reading this rank's staging).
+      // INT4 PULL ONE-SHOT: quantize into this rank's staging, barrier, dequantize and sum
+      // every rank's payload, barrier.
       constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
       constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
       constexpr int kRows = TILE_M / kThreadsM;
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      // THE TILE IN WHOLE INT4 GROUPS (TILE_N rounded up): a group is 4 consecutive lanes' packs, so
-      // a tile edge (and a masked step's edge) on a group keeps every group's lanes together.
+      // The tile in whole INT4 groups (a group is 4 lanes' packs), so a group's lanes stay
+      // together.
       constexpr int kTileN = (TILE_N + kInt4Group - 1) / kInt4Group * kInt4Group;
       constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
       constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
       const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
       const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-      // 1. This rank's input, quantized here, into its staging. The tiles a block's, in both passes,
-      //    so a barrier makes a block's own visible to its peers' same block (BARRIER).
+      // 1. This rank's input, quantized into its staging. A block owns the same tiles in both
+      //    passes, so the barrier makes them visible to its twin block on each peer.
       for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
         const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
         const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
@@ -236,8 +93,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
         store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, input_size_n, 1, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
       }
-      // Every rank's staging entry, read before the barrier (load's entry form), so its round trip
-      // runs under the barrier's.
+      // Every rank's staging entry, read before the barrier so its round trip overlaps it.
       char* staged[WORLD];
     #pragma unroll
       for (int r = 0; r < WORLD; ++r) staged[r] = load(staging_ptr_array, staging_ptr_array_size, r);
@@ -247,9 +103,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           signals_stride_writer, signals_size_parity, signals_size_block,
           signals_size_writer, status_ptr, status_stride_field, status_size_field,
           rank, timeout_ticks, Until::launched, 0);
-      // 3. Every rank's payload, in rank order, dequantized into DTYPE (each value rounded once, as
-      //    the format lands it), summed in fp32, rounded to DTYPE once: every rank sums the same
-      //    copies in the same order, so every rank's sums agree bitwise.
+      // 3. Every rank's payload dequantized, summed in rank order in fp32, rounded once: every
+      //    rank's sums agree bitwise.
       for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
         const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
         const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
@@ -278,21 +133,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           signals_size_writer, status_ptr, status_stride_field, status_size_field,
           rank, timeout_ticks, Until::read, 1);
     } else {
-      // PULL ONE-SHOT (all_reduce_pull_one_shot, above), EXACT.
+      // PULL ONE-SHOT, EXACT.
       constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
       constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
       constexpr int kRows = TILE_M / kThreadsM;
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      // THE TILE IN WHOLE PACKS (TILE_N rounded up): a tile edge inside a pack would split one aligned
-      // access between two blocks; any TILE_N walks, the row's columns past the input masked.
+      // The tile in whole packs (TILE_N rounded up); columns past the input are masked.
       constexpr int kTileN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
       constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
       // A ROW OF THREADS AS WIDE AS THE TILE IN WHOLE STEPS, else the last step masked at the tile.
       constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
       const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
       const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-      // 0. Every rank's input entry, read before the barrier (load's entry form: the table is fixed
-      // for the launch), so its round trip runs under the barrier's.
+      // 0. Every rank's input entry, read before the barrier so its round trip overlaps it.
       const DTYPE* input_entries[WORLD];
     #pragma unroll
       for (int r = 0; r < WORLD; ++r) input_entries[r] = load(input_ptr_array, input_ptr_array_size, r);
@@ -337,20 +190,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else if constexpr (ALGORITHM == Algorithm::two_shot_pull) {
     if constexpr (QUANTIZE) {
-      // INT4 PULL TWO-SHOT (all_reduce_pull_two_shot_int4, above): each rank quantizes its own input
-      // into its staging (an [m, n] INT4 payload), sync (ordered), each rank pulls ITS ROWS of every
-      // rank's payload (rank r's rows [r * kOwned, (r + 1) * kOwned), kOwned the rows a rank owns,
-      // whole tiles), dequantizes, sums in fp32 and quantizes the sum into its partials (an [kOwned,
-      // n] INT4 payload of its rows), sync (ordered: every rank's sums visible, and every peer done
-      // reading this rank's staging), every rank's rows pulled out of its owner's partials,
-      // dequantized, into the output. The next launch's first barrier keeps a rank from overwriting
-      // its partials while a peer still reads them (they are written only after it).
+      // INT4 PULL TWO-SHOT: quantize into this rank's staging, barrier; each rank sums its own
+      // rows (whole tiles) of every payload into its partials as INT4, barrier; every rank
+      // reads every owner's rows. The next launch's first barrier protects the partials.
       constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
       constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
       constexpr int kRows = TILE_M / kThreadsM;
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      // THE TILE IN WHOLE INT4 GROUPS (TILE_N rounded up): a group is 4 consecutive lanes' packs, so
-      // a tile edge (and a masked step's edge) on a group keeps every group's lanes together.
+      // The tile in whole INT4 groups (a group is 4 lanes' packs), so a group's lanes stay
+      // together.
       constexpr int kTileN = (TILE_N + kInt4Group - 1) / kInt4Group * kInt4Group;
       constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
       constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
@@ -376,9 +224,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           signals_stride_writer, signals_size_parity, signals_size_block,
           signals_size_writer, status_ptr, status_stride_field, status_size_field,
           rank, timeout_ticks, Until::launched, 0);
-      // 3. THIS RANK'S ROWS, every rank's payload of them pulled and dequantized (each value rounded
-      //    once to DTYPE, as the format lands it), summed in rank order in fp32, quantized from fp32
-      //    into this rank's partials at the row's place among its own.
+      // 3. This rank's rows: every rank's payload dequantized, summed in rank order in fp32,
+      //    quantized into this rank's partials.
       const int first = rank * owned;
       const int mine_m = max(0, min(owned, input_size_m - first));
       for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
@@ -421,15 +268,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(got, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
       }
     } else {
-      // PULL TWO-SHOT (all_reduce_pull_two_shot, above), EXACT.
+      // PULL TWO-SHOT, EXACT: a band of partials_size_m rows a pass.
       for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
         const int band =
             min(partials_size_m, input_size_m - r0);  // this pass's rows
         DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-        // 1-3. Every rank's input ready and visible (and, past the first pass, every peer has read
-        //    this rank's partials); this rank's share of the band from every rank's input, where the
-        //    table says, summed into its partials; every rank's sums visible and every peer done
-        //    reading this band of this rank's input.
+        // 1-3. Barrier, sum this rank's share of the band from every rank's input into its
+        //      partials, barrier.
         reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::pull, Until::started, false>(
             static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
             input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, nullptr, 0, 0, 1, 0, 0,
@@ -447,18 +292,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else if constexpr (ALGORITHM == Algorithm::one_shot_push) {
     if constexpr (QUANTIZE) {
-      // INT4 PUSH ONE-SHOT (all_reduce_push_one_shot_int4, above): each rank quantizes its own tile
-      // and pushes it into slot [rank] of every rank's inbox in the staging (WORLD slots of an [m, n]
-      // INT4 payload, kSlotBytes apart), sync (ordered: every rank's push visible), each rank
-      // dequantizes its inbox's every slot and sums locally, sync (every rank done with its inbox:
-      // the next launch's push may overwrite it). Not the exact one-shot's lines: a line's 8 bytes
-      // of payload hold no group's scale.
+      // INT4 PUSH ONE-SHOT: quantize this rank's tile into slot [rank] of every inbox in the
+      // staging, barrier, dequantize and sum this rank's inbox, barrier. Not lines: a line's
+      // 8 bytes hold no group's scale.
       constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
       constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
       constexpr int kRows = TILE_M / kThreadsM;
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-      // THE TILE IN WHOLE INT4 GROUPS (TILE_N rounded up): a group is 4 consecutive lanes' packs, so
-      // a tile edge (and a masked step's edge) on a group keeps every group's lanes together.
+      // The tile in whole INT4 groups (a group is 4 lanes' packs), so a group's lanes stay
+      // together.
       constexpr int kTileN = (TILE_N + kInt4Group - 1) / kInt4Group * kInt4Group;
       constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
       constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
@@ -512,43 +354,33 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           signals_size_writer, status_ptr, status_stride_field, status_size_field,
           rank, timeout_ticks, Until::read, 1);
     } else {
-      // PUSH ONE-SHOT (all_reduce_push_one_shot, above), EXACT.
-      // THE TILE'S WALK, the pulled one-shot's (its section): rows of threads where they divide the
-      // block, the last step's packs past the tile masked (a lane past it loads, and so sends, the
-      // tile's last pack: the same bytes its owner sends; its sum is stored nowhere).
+      // PUSH ONE-SHOT, EXACT.
+      // The pulled one-shot's tile walk; a lane past the tile sends the tile's last pack, the
+      // same bytes its owner sends.
       constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
       constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
-      // A THREAD'S PACK IS ONE LINE'S PAYLOAD, 8 bytes (aiter's packet), or the build's narrower pack
-      // alone in its line (PACK_BYTES 2 or 4: a row not whole 8 bytes): a block's stores spread over
-      // twice the waves of a 16-byte pack, half the stores a wave (16 stores a wave at 128 threads
-      // were ~9k cycles of issue stalls, ATT 2026-10-19T04-50-53Z).
+      // A thread's pack is one line's 8-byte payload (aiter's packet), or a narrower build's
+      // pack alone in its line.
       constexpr int kPackElems =
           (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) / static_cast<int>(sizeof(DTYPE));
       constexpr int kRows = TILE_M / kThreadsM;
-      // THE TILE IN WHOLE PACKS (TILE_N rounded up): a tile edge inside a pack would split one aligned
-      // access between two blocks; any TILE_N walks, the row's columns past the input masked.
+      // The tile in whole packs (TILE_N rounded up); columns past the input are masked.
       constexpr int kTileN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
       constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
       constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
       const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
       const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-      // THE BLOCK'S ROWS OF A BANK: TILE_M from blockIdx.x * TILE_M (the inbox's two banks of
-      // unfenced_size_m / 2 rows each; the grid's TILE_M rows at most that, select's).
+      // The block's TILE_M rows of a bank, from blockIdx.x * TILE_M.
       const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
         __builtin_trap();
-      // 0. THIS THREAD'S ROWS' LAST EPOCHS (a 16-byte line a row, the row's every thread's). The
-      //    epochs are this rank's alone, so a pointer of their own (`&unfenced_epochs_ptr, 1`): through
-      //    a device array each launch began with a cold scalar load before the epoch's (ATT
-      //    2026-10-19T04-50-53Z: ~5k cycles of lgkmcnt waits before the first send).
+      // 0. This thread's rows' last epochs, through a plain pointer: they are this rank's alone.
       int32_t last[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))];  // a 16-byte line a row, any pack
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
           &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
           1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, first_row, 0,
           1);
-      // The epochs are read (a wait for that load) only once the first tile's load is issued, so the
-      // two round trips overlap (ATT 2026-10-19T05-22-25Z: ~1.2k cycles a wave waited for the epoch
-      // alone). One row of threads' rows are the block's: read from the first lane, scalar.
+      // Read the epochs only after the first tile's load is issued, so the round trips overlap.
       uint32_t epochs[kRows] = {};
       bool ran = false;
       for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
@@ -556,21 +388,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         // The tile's rows and columns inside the input: the lines past them are nobody's.
         const int clip_m = min(TILE_M, input_size_m - offs_m);
         const int clip_n = min(kTileN, input_size_n - offs_n);
-        // 1. This rank's tile, read here, into slot [rank] of every peer's inbox, its lines carrying
-        //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, read back as a peer's in 2), A RANK THE COMPILER
-        //    KNOWS: no branch between the sends, whose joins waited for every store before
-        //    (s_waitcnt vmcnt(0)), so the remote stores ran one after another (ATT
-        //    2026-10-19T04-09-17Z: 40k of 60k cycles a wave; 2.3-2.9x aiter at 1-8 tokens). The
-        //    seven peers as (rank + i) % WORLD read from the first lane still compiled both of send's
-        //    paths and a scalar load of each peer's entry before its store: 863 -> 1535 instructions,
-        //    the stores 57 apart (ISA, d7da3439da).
-        // The input's columns this tile clips at: the input's, or the tile's end where a step is
-        // masked (so a lane past the tile holds its owner's pack).
+        // 1. Send this rank's tile into slot [rank] of every inbox, its own included: no branch
+        //    on a runtime rank between the sends (one serialized the remote stores).
+        // Clip at the input's columns, or at the tile's end where a step is masked.
         const int input_clip_n = kWhole ? input_size_n : offs_n + clip_n;
         DTYPE mine[kRows][kPacks][kPackElems];
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, mine, offs_m, offs_n, 1);
-        // This pass's epoch a row (its last + 1, never 0), its lines in its bank (epoch & 1). A row
-        // past the tile's is not written, so not counted.
+        // This call's epoch for each row (last + 1, never 0); its lines go in bank epoch & 1.
     #pragma unroll
         for (int i = 0; i < kRows; ++i) {
           const uint32_t before =
@@ -587,9 +411,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
         DTYPE peers[WORLD][kRows][kPacks][kPackElems];
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, first_row + clip_m, clip_n, peers, first_row, 0, 1, epochs, status_ptr, status_stride_field, status_size_field, timeout_ticks);
-        // 3. Summed in rank order in fp32, every rank's from the inbox (this rank's own line too, the
-        //    same bits as its input: no select on a runtime rank), rounded to DTYPE once: every rank
-        //    sums the same copies in the same order, so every rank's sums agree bitwise.
+        // 3. Sum in rank order in fp32 (this rank's own line too), round once: every rank's sums
+        //    agree bitwise.
         DTYPE rounded[kRows][kPacks][kPackElems];
     #pragma unroll
         for (int i = 0; i < kRows; ++i)
@@ -603,12 +426,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               rounded[i][k][j] = static_cast<DTYPE>(acc);
             }
         store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, offs_m, offs_n, 1);
-        // 4. The block is done with this pass's bank before any of its threads sends the next pass
-        //    (the bank argument above), and, the last pass, every wave has read the epoch (step 0).
+        // 4. The block is done with this bank before the next pass sends into it.
         __syncthreads();
       }
-      // 5. Each row's epoch, for its next write in the next launch: its row of threads' first lane's
-      //    store (the store's lanes past the line's one pack store nothing).
+      // 5. Store each row's epoch for the next launch (its row of threads' first lane).
       int32_t next[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
     #pragma unroll
       for (int i = 0; i < kRows; ++i)
@@ -619,14 +440,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           first_row, 0, 1);
     }
   } else if constexpr (ALGORITHM == Algorithm::two_shot_push) {
-    // PUSH TWO-SHOT (all_reduce_push_two_shot, above).
+    // PUSH TWO-SHOT. Exact runs a band of partials_size_m rows a pass, so any size fits.
     if constexpr (QUANTIZE) {
-      // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
-      // INT4 payload layout): the collectives find them from each region's sizes.
-      // 1-3. Every rank's share of this rank's input, quantized here, into that rank's inbox payload
-      // at slot [rank]; every peer launched and pushed its own into ours (ordered); this rank's share,
-      // every writer's slot summed, into its partials; every rank's sums visible and every peer done
-      // with its inbox (the next launch's push may overwrite it).
+      // The INT4 payloads live inside the staging and the partials (common.cuh's INT4 layout).
+      // 1-3. Quantize each rank's share into that rank's inbox at slot [rank], barrier, sum this
+      //      rank's inbox into its partials, barrier.
       reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZATION, CONTIGUOUS, Walk::flat, Accumulate::registers, Direction::push, Until::launched, TAIL>(
           input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
           static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
@@ -637,9 +455,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             signals_size_writer, status_ptr, status_stride_field, status_size_field, 0, rank,
           timeout_ticks);
 
-      // 4. All-gather: every rank's summed share out of its partials, at its place
-      // in the output. The next call's first sync keeps a rank from overwriting
-      // its partials while it is read (they are written only after it).
+      // 4. All-gather. The next call's first barrier keeps a rank from overwriting its partials
+      //    while a peer still reads them.
       all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZATION, CONTIGUOUS, Walk::flat, TAIL>(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
           partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
@@ -649,11 +466,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const int band =
             min(partials_size_m, input_size_m - r0);  // this pass's rows
         DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-        // 1-3. Every rank's share of this band, read here, into that rank's inbox at slot [rank] (the
-        //    chunks each rank's same block sums), then visible (and, past the first pass, every peer
-        //    has read this rank's partials); this rank's share, every writer's slot of its inbox
-        //    summed, into its partials; every rank's sums visible and every peer done with its inbox,
-        //    so the next band's (or launch's) push may overwrite it.
+        // 1-3. Push this band's shares into each rank's inbox, barrier, sum this rank's inbox
+        //      into its partials, barrier (the next band's push may then overwrite the inbox).
         reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::push, Until::visible, false>(
             input_ptr, input_stride_m, input_stride_n, band, input_size_n,
             static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
@@ -664,8 +478,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank,
             timeout_ticks);
 
-        // 4. All-gather: every rank's summed share out of its partials, at its place
-        // in the output.
+        // 4. All-gather: every rank's share out of its partials into the output.
         all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, false>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
                           partials_stride_n, partials_size_m, partials_size_n, band_output,
                           output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);

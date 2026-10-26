@@ -163,17 +163,10 @@ enum class Where : uint32_t {
   peer_barrier,  // a later barrier
 };
 
-// A RANK'S STATUS, in HOST-MAPPED memory (the communicator's status words), so the host reads it
-// and sets `abort` while a kernel still runs, and a graph replay, which runs
-// none of our host code, still reports: a buffer of 32-bit words, one a field,
-// `status[field]` at its stride (`status_stride_field`), the field a
-// StatusField. 32-BIT, as the record's fields always were: 64-bit words cost
-// the fault path a register pair a field and an occupancy step in 157 of 440
-// kernels (2026-10-13T16-59-48Z). A wait that outlives the timeout writes the
-// fault once (the first block to claim `state` wins) and sets `abort`; every
-// wait checks `abort` with its clock and leaves, so one fault ends the rank's
-// kernel instead of each block spinning out its own timeout. The host sets
-// `abort` to end a kernel it has given up on.
+// A RANK'S STATUS: 32-bit words in host-mapped memory, `status[field]` (a StatusField), so the host
+// reads it and sets `abort` while a kernel runs, and a graph replay still reports. A wait past its
+// timeout claims the fault once (the first block to claim `state`), writes it and sets `abort`;
+// every wait leaves once `abort` is set, so one fault ends the rank's kernel.
 // A FLAG'S STATES, the only values a barrier writes: `arrived` into a peer's
 // slot for it, `clear` into its own once it has seen it. Between launches every
 // flag is `clear`; any other value is not a state the protocol has, so the
@@ -218,46 +211,21 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 typedef __attribute__((address_space(1))) uint32_t global_u32;
 typedef __attribute__((address_space(1))) __fp16 global_f16;
 
-// HOW A CALL'S THREADS COVER THE BUFFER, the four's LAYOUT (a template parameter: each value is
-// different code):
-//   tile: the block over TILE_M rows of packs (LOAD, STORE, SEND AND RECV, above).
-//   run, flat: THE FLAT WALK (reduce_scatter.cuh): the buffer's rows from offs_m numbered row-major,
-//     slot s's elements from element s * x_stride_slot (a rank's share, or a pushed inbox's
-//     writer), the block WORLD rows of kLanes = THREADS_PER_BLOCK / WORLD threads (whole waves, so a
-//     row of threads' rank and slot stay wave-uniform), thread t's pack k element (offs_n /
-//     kPackElems + t % kLanes + k * kLanes) * kPackElems of its slot; a read past clip_n reads the
-//     last below it, a write skips it. run: the buffer contiguous, a slot one run (a uniform base
-//     and a 32-bit byte offset a pack); flat: strided, a pack's row and column divided out
-//     (element_at). Registers U[1][kPacks][kPackElems].
-//   group_run, group_flat: THE INT4 FLAT WALK: the block TILE_M rows of kThreadsN threads (one row,
-//     or WORLD rows a copy each: the caller's rank or slot a lane), WHOLE GROUPS A THREAD (thread
-//     t's group j offs_n / kInt4Group + t % kThreadsN + j * kThreadsN, its kInt4GroupPacks packs
-//     consecutive, so a thread quantizes alone: register pack k is the row's pack offs_n /
-//     kPackElems + ((k / kInt4GroupPacks) * kThreadsN + t) * kInt4GroupPacks + k % kInt4GroupPacks,
-//     t * kInt4GroupPacks + k at one group a thread),
-//     slots and run / flat as above. An INT4 payload is dense (group_run): an element's word at
-//     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
-//     U[1][G * kInt4GroupPacks][kPackElems], G groups a thread (raw: U[1][G * kInt4GroupPacks][2];
-//     with a slot dimension, every slot's).
-//   line: THE FLAG IN THE LINE (NCCL's LL; aiter's `ar_ll_gfx9` LLPackedMsg): the tile's threads
-//     and places, but the buffer holds every 8 bytes of payload in a 16-byte LINE, (4 bytes of
-//     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
-//     sees both flags of a line holds its data, with no barrier. Strides and sizes count the
-//     payload's elements; a row's lines take twice its payload's bytes (kLineBytes /
-//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. A FLAG
-//     A ROW, ITS BANK ITS PARITY: the buffer's rows are two banks (size_m / 2 rows each), a tile
-//     row's lines in the bank of its flag's parity (row + (flag & 1) * size_m / 2), so a row's
-//     consecutive writes alternate banks whatever the rows around it were last written with. send
-//     writes each row's lines carrying its flag;
-//     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
-//     writer c at slot input_slot + c) and POLLS until each line it waits for carries its row's flag: the
-//     rows and packs inside the clip (those past it are nobody's: their registers are left
-//     unread), EVERY WRITER, THIS RANK TOO: its own line is its own thread's store before the
-//     read, so its registers are its own payload (a runtime rank tested a writer at a time was 8
-//     masks of SGPRs and a select an element: 106 SGPRs, 79 spilled, ISA 2026-10-25). Both nontemporal 16-byte accesses, aiter's
-//     ll_store_b128 / ll_load_b128 (`global_*_dwordx4 ... nt`): a line moves in one transaction.
-//     The poll leaves past timeout_ticks or once the status's `abort` is set, as barrier's wait
-//     does (give_up, Where::start: the line wait is its kernel's only one).
+// HOW A CALL'S THREADS COVER THE BUFFER (LAYOUT, a template parameter of load, store, send, recv):
+//   tile        the block over TILE_M rows of packs.
+//   run, flat   the flat walk (reduce_scatter.cuh): rows from offs_m numbered row-major, slot s
+//               from element s * x_stride_slot, the block WORLD rows of kLanes threads, thread
+//               t's pack k at (offs_n / kPackElems + t % kLanes + k * kLanes). run: contiguous, a
+//               uniform base plus a 32-bit offset; flat: strided, row and column divided out.
+//               A read past clip_n reads the last pack below it; a write skips it.
+//   group_run,  the INT4 flat walk: whole groups a thread (a group's packs consecutive, so a
+//   group_flat  thread quantizes alone). An INT4 payload is dense: an element's word at
+//               element / 2 bytes, its group's scale at element / kInt4Group.
+//   line        the flag in the line (NCCL's LL, aiter's ar_ll_gfx9): every 8 bytes of payload in
+//               a 16-byte line with the flag twice, one store, so a reader that sees both flags
+//               holds the data. A row's lines sit in the bank of its flag's parity. load reads
+//               every writer's slot, this rank's too, and polls until each line carries the flag
+//               (leaving past timeout_ticks or on abort, as a barrier's wait does).
 enum class Layout { tile, run, flat, group_run, group_flat, line };
 
 // THE OPERATIONS THE INTERNALS CALL, declared before them (defined below, QUANTIZATION).
@@ -1337,115 +1305,41 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
 // =================================================================================================
 // BARRIER
 //
-// THE RANKS' SYNCHRONIZATION, over the SIGNALS buffer, [R, 2, B, R]:
-// `signals[owner][parity][block] [writer]` is the flag block `block` on rank
-// `writer` sets in rank `owner`'s memory, at a barrier of that parity. Every
-// dimension is a stride but the outer R's: owner r's signals are
-// signals_ptr_array's entry r (lane_ptr_array_at).
+// THE SIGNALS, [R, 2, B, R]: signals[owner][parity][block][writer] is the flag block `block` of
+// rank `writer` sets in rank `owner`'s memory at a barrier of that parity (owner r's signals are
+// signals_ptr_array's entry r).
 //
-// THE MEMORY ORDERING: the textbook one for cacheable memory shared across
-// GPUs, nothing that depends on the signals bypassing a cache, so it is correct
-// for whichever way the signals are backed (hip_custom_communicator.cuh's kArenaMallocFlags), cached
-// in the owner's L2 (MTYPE RW) and, through a peer's IPC mapping, in the peer's
-// L2 (MTYPE NC), or uncached. The rules are LLVM's AMDGPU memory model (AMDGPUUsage, "Memory
-// Model GFX942" and its code-sequence table; gfx950 takes the same scope bits):
-// keeping L2s of different agents coherent takes `buffer_wbl2 sc0 sc1` on the
-// writer and `buffer_inv sc0 sc1` on the reader, which is what a SYSTEM-scope
-// release and acquire compile to. Torch's ROCm symmetric-memory barrier does
-// the same (system-scope release/acquire on the flag, then plain loads of the
-// peers' data).
-//   SIGNAL: the flag store is a SYSTEM-scope atomic (store sc0 sc1), release
-//   when ordered: buffer_wbl2 sc0 sc1 + s_waitcnt first, which writes back this
-//   L2's dirty lines -- this rank's own writes the peers will read (its inputs'
-//   copy-in, its partials) and its pushes into peers' memory held as NC lines --
-//   and completes every store this wave issued, before the flag can be seen.
-//   An ordered barrier first waits for every wave's stores (s_waitcnt vmcnt(0)) and
-//   meets the block, so the one releasing lane covers the block's stores.
-//   WAIT: relaxed SYSTEM-scope loads of this rank's own flag (load sc0 sc1),
-//   then one SYSTEM-scope acquire once the flag is seen: s_waitcnt +
-//   buffer_inv sc0 sc1, which invalidates this CU's L1 and this L2's non-local
-//   (peer) lines. The peers' data read after it are plain loads: a peer's line
-//   is fetched again from the peer, which wrote it back before its flag; a
-//   local line a peer stored into was invalidated by that store's probe (the
-//   PTE C-bit, same section).
-//   CLEAR: a relaxed system-scope store into this rank's own flag, ordered
-//   before this lane's next flag store by that barrier's own release or
-//   wait for its stores (below).
-// The caller's input is never read by a peer: its owner copies it into its
-// inputs (ours), or pushes it into the peers' inputs (the plain all-reduce's
-// inboxes: remote stores, which the release's wait and write-back complete),
-// before the launch's first barrier, which is ordered (release before the
-// flag, acquire after it), so the reads of the inputs after it see them;
-// the pulls' first barrier (`started`) is not: what they read was written
-// before the launches, which the launch boundaries order (Until, below).
-// The tests that would catch a stale line: every op's output against
-// torch.distributed's across back-to-back calls on the same buffers, and the
-// signals' return to clear after every launch. Each flag is touched only
-// atomically (the `__scoped_atomic` builtins), all of it in the one function `barrier`. A rank's
-// data buffers are the kernels' (load, store).
+// THE PROTOCOL: lane i sets its slot in peer i's signals, waits for peer i's slot in this rank's,
+// then clears it. Block b pairs only with block b on every rank, so a read after a barrier may see
+// only what the same block on the peer wrote before it.
 //
-// NOTHING SURVIVES A LAUNCH: every flag is 0 between launches. A barrier sets 1
-// in each peer's slot for it, waits for 1 in each of its own, and sets those
-// back to 0. A slot is never set twice before it is cleared, because the
-// barriers of a launch alternate between the two flag sets (`parity`): a peer
-// sets my parity-p slot again only at its barrier after next, which it passes
-// only once I have signalled my next barrier, which I do only after my clear
-// has landed. Every kernel has an even number of barriers
-// (dev/lint_kernels.sh), so each launch starts at parity 0 on all-zero flags,
-// and a graph replay is the same launch again.
+// THE MEMORY ORDERING (LLVM's AMDGPU memory model, GFX942; gfx950 takes the same scope bits),
+// correct however the signals are backed (cached, peer-mapped, or uncached):
+//   signal  a system-scope atomic store. An ordered barrier first waits for every wave's stores
+//           and releases (buffer_wbl2 sc0 sc1), so this rank's writes land before its flag.
+//   wait    relaxed system-scope loads of the own flag, then one acquire (buffer_inv sc0 sc1);
+//           the peers' data after it are plain loads.
+//   clear   a relaxed store, landed before the lane's next flag goes out.
 //
-// A WAIT NEVER HANGS AND NEVER TRAPS: past the timeout it writes the rank's
-// fault record (where, which peer, the count against the one wanted) and leaves
-// the kernel, and every wait leaves once the status's `abort` is set; the host
-// reads the status (THE STATUS's `StatusField`). HIP_CUSTOM_COMMUNICATOR_DEBUG=1
-// skews every wait by a random per-block delay, so a race shows on every run.
+// NOTHING SURVIVES A LAUNCH: every flag is 0 between launches. A kernel's k-th barrier takes
+// parity k % 2 and every kernel has an even number of them (dev/lint_kernels.sh), so a slot is
+// never set twice before it is cleared and a graph replay starts on clean flags.
+//
+// A WAIT NEVER HANGS: past timeout_ticks, or once the status's `abort` is set, it writes the
+// fault record and leaves the kernel. HIP_CUSTOM_COMMUNICATOR_DEBUG=1 adds a random delay per
+// block, so a race shows on every run.
 // =================================================================================================
 
-// =================================================================================
-// HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in the INTERFACE): the
-// barriers, written against the signals buffer; a rank's data buffers are
-// ordered only by `barrier`.
-// =================================================================================
-
-// WHAT HOLDS ONCE A BARRIER IS PASSED: every peer has launched and what it
-// wrote before (its staged or pushed input) is visible to this side (a launch's first
-// barrier, ordered; it differs from `visible` only in naming its fault
-// `start`); what this side wrote before is
-// visible to the other side after; every peer is done reading this rank (so its
-// buffers may be reused). Every barrier pairs this block with the same block on
-// every rank.
-// STARTED (the pulls' first barrier: nothing written in the launch before it, every read after it
-// of what a peer wrote BEFORE its launch) is unordered, as aiter's `start_sync` (relaxed store,
-// relaxed polls, no fence): the launch boundaries order it. The writer's kernel end releases at
-// agent scope at least, `buffer_wbl2 sc1`, which LLVM's GFX942 model says is what makes local
-// writes coherent for another agent's CUs; this launch's start acquires, and nothing in it read a
-// peer's input before the barrier, so no stale line of one can be held. Its release and acquire
-// cost 0.3-0.5 us each a call at decode (2026-10-18T08-48-34Z, 08-52-54Z against 08-44-19Z).
+// WHAT A PASSED BARRIER PROMISES:
+//   launched  every peer launched, and what it wrote before is visible (ordered).
+//   visible   what each side's block wrote before is visible to the other's (ordered).
+//   read      every peer is done reading this rank's buffers (unordered).
+//   started   every peer launched (unordered, as aiter's start_sync): the pulls read only what a
+//             peer wrote before its launch, which the launch boundaries order.
 enum class Until { launched, visible, read, started };
 
-// THE BARRIER, one for every case, and the whole protocol in one place:
-// barrier<WORLD>(the signals buffer, the status buffer, rank, timeout_ticks, Until::read, 1),
-// each buffer its pointer, strides and sizes, as the kernel took them. Nothing outlives the
-// call. The PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a launch
-// starts on parity 0 and, its barriers even in number, ends on 1 (dev/lint_kernels.sh checks
-// both). WORLD is the kernel's, passed on. A read after a barrier may see only what the SAME
-// BLOCK on the peer wrote before it, so both sides must index the same data by the same block.
-//
-// Block b waits for block b on every rank, and for no other block: enough at
-// the ends, where it says "every peer has launched" or "every peer is done
-// reading me", and not enough between phases, where a block reads only what the
-// same-numbered block wrote. Ordered
-// (`visible`): the store releases and the wait acquires, so what the block put
-// before is visible to its peers' same-numbered block after. Unordered, it only
-// says when (launched: every peer has launched; read: every peer is done
-// reading us).
-//
-// Lane i sets its slot in peer i's signals, waits for peer i's in this rank's,
-// and clears it. The clear must land before the lane's NEXT flag goes out, or a
-// peer that sees that flag could set the slot again before the clear does and
-// lose it: an ordered barrier's wait for every wave's stores covers it; an
-// unordered one waits for the lane's own stores just before it signals, after
-// the whole phase between, so the clear has long landed.
+// THE BARRIER: barrier<WORLD>(the signals, the status, rank, timeout_ticks, until, parity), each
+// buffer its pointer, strides and sizes as the kernel took them.
 template <int WORLD>
 DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
