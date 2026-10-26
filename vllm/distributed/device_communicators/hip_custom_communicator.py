@@ -1719,7 +1719,6 @@ _open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet(
 _WATCH_S = 0.1
 
 
-@functools.cache
 class HipCustomCommunicator:
     """vLLM's TP all-reduce and its fused ops over our HIP kernels, behind
     CudaCommunicator. One per process group, because peer pointers are group-scoped.
