@@ -1050,7 +1050,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
                       c10::BFloat16, 2, 1,
                       kTarget.wave_size * traits<c10::BFloat16, kBuild.memory.pack_bytes>::N,
                       kTarget.wave_size, kTarget.wave_size, kBuild.memory.pack_bytes, 1,
-                      Quantization::exact, Algorithm::one_shot_pull, false, false>));
+                      Quantization::exact, Algorithm::one_shot_pull, false, false, false>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;
@@ -2626,6 +2626,17 @@ inline std::variant<Config, Error> all_reduce(
       throw std::runtime_error("hip_custom_communicator all_reduce before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
+    // THE INSTANCE THE CALL'S BYTES NAME: an INT4 build quantizing from its quantize_from_bytes
+    // on and passing the call exact below; an exact build never quantizing.
+    if (C.quantize != (C.quantization == Quantization::int4 &&
+                       input_size_m * input_size_n * elem_bytes(dtype) >=
+                           k.config.launch.quantize_from_bytes))
+      throw std::runtime_error(
+          "hip_custom_communicator all_reduce before its launch: the instance (quantize " +
+          std::to_string(C.quantize) + ") is not the one " +
+          std::to_string(input_size_m * input_size_n * elem_bytes(dtype)) +
+          " bytes name at quantize_from_bytes " +
+          std::to_string(k.config.launch.quantize_from_bytes));
     // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
     // it reads the staging.
     const bool in_table = config.in_place;

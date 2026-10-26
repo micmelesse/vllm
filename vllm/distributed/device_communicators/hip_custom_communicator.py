@@ -751,11 +751,16 @@ def check_table(raw: TunedTable) -> None:
         moved = {configs[j]["quantization"] for j in at}
         if e["mode"] == "exact" and moved != {"exact"}:
             raise ValueError(f"{where}: an exact input moves INT4")
-        # THE QUANTIZED ALL-REDUCE RUNS ITS INT4 KERNELS, every pick (each quantizing
-        # where its config says): no exact kernel in quantized mode.
-        if e["mode"] == "quantized" and name == "all_reduce" and moved != {"int4"}:
+        # THE QUANTIZED MODE RUNS THE ALL-REDUCE'S INT4 KERNELS, every pick (each
+        # passing a call exact itself below its quantize_from_bytes): no exact
+        # all-reduce kernel in quantized mode, the plain op's or a split's first.
+        if e["mode"] == "quantized" and any(
+            configs[j]["kernel"] == "all_reduce"
+            and configs[j]["quantization"] != "int4"
+            for j in at
+        ):
             raise ValueError(
-                f"{where}: a quantized all-reduce input picks an exact kernel"
+                f"{where}: a quantized input picks the exact all-reduce kernel"
             )
     for name in TUNED_OPS:
         for world in sorted(built.worlds):
@@ -1241,6 +1246,29 @@ class HipCustomCommunicator:
     # call its `should_` admitted is never refused.
 
     @final
+    def _assert_moves(self, configs: Sequence[Config]) -> None:
+        """WHAT A CALL'S CONFIGS MOVE IS THE COMMUNICATOR'S, asserted before any launch,
+        a plain call's (the table's) or a forced one's alike: in quantized mode every
+        config of the plain all-reduce's kernel (the plain op's, a split's first) is
+        INT4, never the exact kernel (an INT4 config passes a call below its
+        quantize_from_bytes exact itself); in exact mode no config is INT4; an exact
+        config has no quantize_from_bytes. (A fused op's kernel in quantized mode may
+        still be its exact one: its one-shots have no INT4 yet.)"""
+        for c in configs:
+            if self.quantization == "exact" and c.quantization != "exact":
+                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+            if (
+                self.quantization == "int4"
+                and c.kernel == "all_reduce"
+                and c.quantization != "int4"
+            ):
+                raise AssertionError(
+                    f"a quantized communicator given the exact all-reduce kernel: {c}"
+                )
+            if c.quantization == "exact" and c.quantize_from_bytes is not None:
+                raise AssertionError(f"an exact config with a quantize_from_bytes: {c}")
+
+    @final
     def _debug(
         self,
         op: str,
@@ -1413,6 +1441,7 @@ class HipCustomCommunicator:
             )
             configs = picked_configs(self.table, pick)
         logger.debug("all_reduce launches %s", configs)
+        self._assert_moves(configs)
         self._debug(
             "all_reduce",
             {"input": input},
@@ -1559,6 +1588,7 @@ class HipCustomCommunicator:
             )
             configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_rms_norm launches %s", configs)
+        self._assert_moves(configs)
         self._debug(
             "all_reduce_rms_norm",
             {"input": input, "weight": weight},
@@ -1779,6 +1809,7 @@ class HipCustomCommunicator:
             )
             configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_add_rms_norm launches %s", configs)
+        self._assert_moves(configs)
         self._debug(
             "all_reduce_add_rms_norm",
             {"input": input, "residual": residual, "weight": weight},
@@ -2011,6 +2042,7 @@ class HipCustomCommunicator:
             )
             configs = picked_configs(self.table, pick)
         logger.debug("all_reduce_add_attn_res_rms_norm launches %s", configs)
+        self._assert_moves(configs)
         self._debug(
             "all_reduce_add_attn_res_rms_norm",
             {
@@ -2242,6 +2274,7 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("rms_norm launches %s", config)
+        self._assert_moves([config])
         self._debug(
             "rms_norm",
             {"input": input, "weight": weight},
@@ -2350,6 +2383,7 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("add_rms_norm launches %s", config)
+        self._assert_moves([config])
         self._debug(
             "add_rms_norm",
             {"input": input, "residual": residual, "weight": weight},
@@ -2466,6 +2500,7 @@ class HipCustomCommunicator:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
         config = given_config
         logger.debug("add_attn_res_rms_norm launches %s", config)
+        self._assert_moves([config])
         self._debug(
             "add_attn_res_rms_norm",
             {
