@@ -485,7 +485,9 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
             for (int h = 0; h < kLines; ++h)
               missing |= waits[i][k] &&
                          (got[c][i][k][h][1] != flags[i] || got[c][i][k][h][3] != flags[i]);
-      if (!missing) break;
+      // THE WAVE LEAVES TOGETHER, once no lane misses a line: a lane's own exit kept a lane mask
+      // per exit live across the tile loop (the pushed one-shot spilled 42 SGPRs, 12 after).
+      if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
       if ((n & 255u) != 0) continue;
       // THE SLOW PATH every 256 polls, as barrier's wait: the clock and the status's `abort`.
       const uint64_t waited = wall_clock64() - t0;
@@ -493,7 +495,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
           __scoped_atomic_load_n(status_ptr + static_cast<int64_t>(StatusField::abort) *
                                                   status_stride_field,
                                  __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
-      if (!aborted && waited <= timeout_ticks) continue;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks) continue;
       if (!aborted) {
         // THE FAULT'S PEER AND WHAT IT SAW: the last writer whose line was not there.
         uint32_t peer = 0, seen = flags[0], want = flags[0];
