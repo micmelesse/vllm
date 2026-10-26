@@ -408,11 +408,12 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (input_slot < 0 || input_slot + WORLD > input_size_slot || flags == nullptr))
       __builtin_trap();
-    const char* slots[WORLD];
-#pragma unroll
-    for (int c = 0; c < WORLD; ++c)
-      slots[c] = reinterpret_cast<const char*>(input) +
-                 int64_t{input_slot + c} * input_stride_slot * int64_t{sizeof(U)} * kLineScale;
+    // EVERY WRITER'S SLOT FROM ONE BASE, a slot's bytes apart (the unfenced region's WORLD slots fit
+    // 32 bits): a writer's offset a lane's, so the poll keeps one scalar address, not WORLD.
+    const char* const first = reinterpret_cast<const char*>(input) +
+                              int64_t{input_slot} * input_stride_slot * int64_t{sizeof(U)} * kLineScale;
+    const uint32_t slot_bytes =
+        static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)} * kLineScale);
     // A PACK'S FIRST LINE, as a 32-bit byte offset into its slot, and whether its thread waits
     // for it (inside the clip). A ROW'S LINES ARE ITS PACKS' FIRST LINES, THEN THEIR SECOND (`half`
     // apart), so one load (or store) instruction's lanes cover one contiguous run, as aiter's
@@ -447,9 +448,12 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 #pragma unroll
           for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-            for (int h = 0; h < kLines; ++h)
-              got[c][i][k][h] = __builtin_nontemporal_load(
-                  (const global_u32x4*)(slots[c] + line_at[i][k] + h * half));
+            for (int h = 0; h < kLines; ++h) {
+              // Writer c's line, its offset from the first slot held in a lane.
+              uint32_t at = static_cast<uint32_t>(c) * slot_bytes + line_at[i][k] + h * half;
+              asm volatile("" : "+v"(at));
+              got[c][i][k][h] = __builtin_nontemporal_load((const global_u32x4*)(first + at));
+            }
       // NOT HOISTED: each pass reads the lines again.
       asm volatile("" ::: "memory");
       bool missing = false;
@@ -967,7 +971,9 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (row >= output_size_m || flags[i] == 0)) __builtin_trap();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
-        const int col = min(col_at(k), clip_n / kPackElems - 1);
+        // A pack's columns: its values', a raw INT4 pack's a word of kInt4Group / kInt4GroupPacks.
+        constexpr int kElems = kRaw ? kInt4Group / kInt4GroupPacks : kPackElems;
+        const int col = min(col_at(k), clip_n / kElems - 1);
         uint32_t words[2 * kLines] = {};
         if constexpr (QUANTIZE_INT4) {
           words[0] = payload[i][k][0];

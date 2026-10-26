@@ -197,13 +197,33 @@ DINLINE void all_gather(const DTYPE (&mine)[ROWS][PACKS][ELEMS], const uint32_t 
                         int64_t status_stride_field, int status_size_field, uint64_t timeout_ticks,
                         DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   static_assert(ALGORITHM == AllGatherAlgorithm::tile_push, "a tile sent and polled as lines");
-  // No branch on a runtime rank between the sends (one serialized the remote stores).
+  // INT4: the tile quantized once, every pack's word and its group's scale, then sent raw to every
+  // rank. No branch on a runtime rank between the sends (one serialized the remote stores).
+  if constexpr (QUANTIZE_INT4) {
+    uint32_t payload[ROWS][PACKS][2];
 #pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, Layout::line>(
-        mine, inbox_ptr_array, inbox_ptr_array_size, r, rank, inbox_stride_slot, inbox_stride_m,
-        inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m, clip_n, offs_m, 0, 1,
-        epochs);
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < PACKS; ++k) {
+        float scale;
+        quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
+                 reinterpret_cast<uint32_t(&)[1]>(payload[i][k][0]), scale);
+        payload[i][k][1] = __builtin_bit_cast(uint32_t, scale);
+      }
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r)
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::line>(
+          payload, inbox_ptr_array, inbox_ptr_array_size, r, rank, inbox_stride_slot,
+          inbox_stride_m, inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m,
+          clip_n, offs_m, 0, 1, epochs);
+  } else {
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r)
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(
+          mine, inbox_ptr_array, inbox_ptr_array_size, r, rank, inbox_stride_slot, inbox_stride_m,
+          inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m, clip_n, offs_m, 0,
+          1, epochs);
+  }
   load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, Layout::line>(
       inbox_ptr_array, inbox_ptr_array_size, rank, 0, inbox_stride_slot, inbox_stride_m,
       inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m, clip_n, copies, offs_m,
