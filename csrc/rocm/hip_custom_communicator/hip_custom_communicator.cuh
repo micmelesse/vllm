@@ -68,6 +68,13 @@
 
 namespace hip_custom_communicator {
 
+// WHAT A CONFIG MOVES ACROSS THE LINKS, the host's alone: a config's `quantization` field. A kernel
+// takes QUANTIZE_INT4 (bool), which the host derives per call from it and quantize_from_bytes.
+namespace Quantization {
+constexpr int exact = 0;
+constexpr int int4 = 1;
+}  // namespace Quantization
+
 // =================================================================================================
 // HARDWARE
 //
@@ -1882,7 +1889,7 @@ const void* kernel_pointer() {
   if constexpr (C.kernel == Template::all_reduce_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-            C.waves_per_eu, C.quantization, C.algorithm, C.chunked, C.tail>);
+            C.waves_per_eu, C.quantize_int4, C.algorithm, C.chunked, C.tail>);
   if constexpr (C.kernel == Template::rms_norm_rows)
     return reinterpret_cast<const void*>(
         rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
@@ -1890,7 +1897,7 @@ const void* kernel_pointer() {
   if constexpr (C.kernel == Template::all_reduce_add_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-            C.waves_per_eu, C.quantization, C.algorithm, C.chunked, C.tail>);
+            C.waves_per_eu, C.quantize_int4, C.algorithm, C.chunked, C.tail>);
   if constexpr (C.kernel == Template::add_rms_norm_rows)
     return reinterpret_cast<const void*>(
         add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
@@ -1898,7 +1905,7 @@ const void* kernel_pointer() {
   if constexpr (C.kernel == Template::all_reduce_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k, C.block.x,
-            C.wave_size, C.pack_bytes, C.waves_per_eu, C.quantization, C.algorithm,
+            C.wave_size, C.pack_bytes, C.waves_per_eu, C.quantize_int4, C.algorithm,
             C.chunked, C.tail>);
   if constexpr (C.kernel == Template::add_attn_res_rms_norm_rows)
     return reinterpret_cast<const void*>(
@@ -2741,7 +2748,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
     all_reduce_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-        C.waves_per_eu, C.quantization, C.algorithm, C.chunked, C.tail>
+        C.waves_per_eu, C.quantize_int4, C.algorithm, C.chunked, C.tail>
         <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -2888,7 +2895,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
     all_reduce_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-        C.waves_per_eu, C.quantization, C.algorithm, C.chunked, C.tail>
+        C.waves_per_eu, C.quantize_int4, C.algorithm, C.chunked, C.tail>
         <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -3078,7 +3085,7 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
     all_reduce_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k, C.block.x,
-        C.wave_size, C.pack_bytes, C.waves_per_eu, C.quantization, C.algorithm,
+        C.wave_size, C.pack_bytes, C.waves_per_eu, C.quantize_int4, C.algorithm,
         C.chunked, C.tail>
         <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),

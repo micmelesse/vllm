@@ -188,7 +188,6 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                                 "C.wave_size": str(WAVE_SIZE),
                                 "C.pack_bytes": str(pack),
                                 "C.waves_per_eu": str(waves),
-                                "C.quantization": "1" if q == "int4" else "0",
                                 "C.algorithm": str(ALGORITHM_VALUES[algorithm]),
                                 "C.contiguous": contiguous,
                                 "C.chunked": chunked,

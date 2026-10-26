@@ -62,18 +62,18 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // =================================================================================================
 
 // =================================================================================================
-// QUANTIZATION
+// QUANTIZE_INT4
 //
-// WHAT CROSSES THE LINKS in a two-shot, its QUANTIZATION: each buffer of the exchange in its own
+// WHAT CROSSES THE LINKS in a two-shot, its QUANTIZE_INT4: each buffer of the exchange in its own
 // dtype (none), or INT4, quick reduce's format (csrc/quickreduce): a GROUP is 32 consecutive
 // elements of a row, held as 4-bit values biased by 8 (a word 8 elements, its elements 2i and
 // 2i + 1 in bits 4i and 16 + 4i, so one shift and mask puts both in a 16-bit pair, quick reduce's
 // layout) and one fp16 scale, the group's largest magnitude / 7, ROUNDED TO FP16 BEFORE THE VALUES
 // ARE, so each is rounded against the scale stored; an element is (q - 8) * scale. A quantized buffer is two
 // buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32] fp16), each a pointer, its
-// strides and its sizes. Every function that moves the exchange takes a QUANTIZATION and both forms
+// strides and its sizes. Every function that moves the exchange takes a QUANTIZE_INT4 and both forms
 // of each buffer it moves (reduce_scatter, all_gather); load and store
-// take QUANTIZATION and work out the INT4 payload's layout from the region's own sizes. A LOAD DEQUANTIZES INTO
+// take QUANTIZE_INT4 and work out the INT4 payload's layout from the region's own sizes. A LOAD DEQUANTIZES INTO
 // ITS REGISTERS' DTYPE, each element rounded once, as quick reduce lands its values in its dtype; a
 // sum is fp32 and quantized from fp32.
 // A THREAD'S PACK IS ONE WORD OF ITS GROUP (8 elements of a 16-bit dtype), so a group is the packs
@@ -84,21 +84,13 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // 2026-10-16T03-10-32Z).
 // =================================================================================================
 
-// A TEMPLATE INT, not an enum: a kernel's demangled name then reads `0` or `1` where an
-// enum's reads `(hip_custom_communicator::Quantization)1`, which the ISA tools cut at the
-// parenthesis, so a kernel's two builds were one file.
-namespace Quantization {
-constexpr int exact = 0;
-constexpr int int4 = 1;
-}  // namespace Quantization
-
 // =================================================================================================
 // THE ALGORITHM: what an op's one kernel is built to do, its ALGORITHM template parameter (each op
 // file's `if constexpr` over it), the host's config field of the same name; exactly the variants
 // that exist. A one-shot reads every peer's whole input; a two-shot reduce-scatters, then gathers;
 // each pulled (a rank reads what it needs from its peers) or pushed (its peers store it in); rows
 // reads this rank's rows alone, no peer (a norm op's kernel, which Python runs after our
-// all-reduce). A template int, as QUANTIZATION is (a kernel's demangled name reads numbers).
+// all-reduce). A template int, as QUANTIZE_INT4 is (a kernel's demangled name reads numbers).
 // =================================================================================================
 namespace Algorithm {
 constexpr int one_shot_pull = 0;
@@ -228,7 +220,7 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //               (leaving past timeout_ticks or on abort, as a barrier's wait does).
 enum class Layout { tile, run, flat, group_run, group_flat, line };
 
-// THE OPERATIONS THE INTERNALS CALL, declared before them (defined below, QUANTIZATION).
+// THE OPERATIONS THE INTERNALS CALL, declared before them (defined below, QUANTIZE_INT4).
 template <typename U, int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]);
 template <typename DTYPE, int SLOTS, int K, int P>
@@ -339,14 +331,14 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
 // time, every slot's for it, so the address is computed once a position (the other way round cost
 // 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z). Nothing waits until the
 // registers are used, so loads issued here run under other work, a loop's calls included.
-// RAW INT4: QUANTIZATION int4 into uint32_t registers U[...][kPacks][2] keeps the payload
+// RAW INT4: QUANTIZE_INT4 int4 into uint32_t registers U[...][kPacks][2] keeps the payload
 // undecoded, [0] the pack's word and [1] its group's scale as fp32 bits: a caller summing every
 // rank's words (v_dot2, never a decoded tile of every rank: 172 VGPRs, reduce_scatter.cuh) or
 // loading every rank's before decoding any.
 // THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the fault's), `flags` the value each
 // row's lines waited for carry (kRows, a thread's rows), and the status buffer and limit its
 // poll gives up by; every other layout passes them as their defaults and reads none.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL, typename OUTPUT>
 DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride_slot,
                          int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
@@ -366,7 +358,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
   constexpr int kPackElems = std::extent_v<OUTPUT, kSlots ? 3 : 2>;
   using U = std::remove_all_extents_t<OUTPUT>;
   constexpr bool kRaw = std::is_same_v<U, uint32_t>;
-  static_assert(!kRaw || (QUANTIZATION == Quantization::int4 && kPackElems == 2),
+  static_assert(!kRaw || (QUANTIZE_INT4 && kPackElems == 2),
                 "uint32_t registers are an INT4 payload's words and scales");
   // THE LAYOUT, from the tile: kThreadsM rows of threads (TILE_M rows, kRows a thread) of kThreadsN
   // threads, the block's.
@@ -376,7 +368,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
   using V = vec<U, kPackElems>;
   // Slot c of the buffer, as its elements (none) or its bytes (int4).
-  using E = std::conditional_t<QUANTIZATION == Quantization::exact, const U, const uint8_t>;
+  using E = std::conditional_t<!QUANTIZE_INT4, const U, const uint8_t>;
   const auto base = [&](int c) -> E* {
     const int slot = kSlots ? (input_slot + c) % WORLD : input_slot;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (slot < 0 || slot >= input_size_slot)) __builtin_trap();
@@ -416,7 +408,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // THE LINE READ: every writer's lines of the tile at once (two a pack), then the check, again
     // until every line waited for carries the flag. A lane leaves the loop once its own are all
     // there; a lane past the clip waits for none.
-    static_assert(QUANTIZATION == Quantization::exact && kSlots && kCopies == WORLD,
+    static_assert(!QUANTIZE_INT4 && kSlots && kCopies == WORLD,
                   "a line read is every writer's exact copy");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
@@ -535,7 +527,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
-    static_assert(QUANTIZATION == Quantization::exact && !kSlots && kRows == 1,
+    static_assert(!QUANTIZE_INT4 && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
     // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
@@ -602,7 +594,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // 2026-10-20T20-15-38Z).
     const int at = TAIL ? min(g, static_cast<int>(int4_groups(clip_n)) - 1)
                         : min(g, clip_n / kInt4Group - 1);
-    if constexpr (QUANTIZATION == Quantization::exact) {
+    if constexpr (!QUANTIZE_INT4) {
       // ONE COPY, exact: its group's packs. Its scheduling is the caller's (the int4 push keeps two
       // ranks' groups in flight: reduce_scatter.cuh).
       static_assert(!kSlots, "an exact group is one copy");
@@ -721,7 +713,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
       asm volatile("" ::: "memory");
       __builtin_amdgcn_sched_barrier(0);
     }
-  } else if constexpr (QUANTIZATION == Quantization::exact && !kSlots) {
+  } else if constexpr (!QUANTIZE_INT4 && !kSlots) {
     const V* at = reinterpret_cast<const V*>(base(0));
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
@@ -785,7 +777,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // 2026-10-03T21-00-27Z). It waits for nothing: a loop of calls has every call's loads out.
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
-  } else if constexpr (QUANTIZATION == Quantization::exact) {
+  } else if constexpr (!QUANTIZE_INT4) {
     const U* at_copy[kCopies];
 #pragma unroll
     for (int c = 0; c < kCopies; ++c) at_copy[c] = base(c);
@@ -883,7 +875,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 // every rank quantizes once, before its loop.
 // THE LINE WRITE'S OWN (Layout::line): `flags`, the value each row's lines carry (kRows, a
 // thread's rows); every other layout passes it as its default.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL, typename INPUT>
 DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                           int64_t output_stride_slot, int64_t output_stride_m,
@@ -899,7 +891,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   constexpr int kPackElems = std::extent_v<INPUT, 2>;
   using U = std::remove_all_extents_t<INPUT>;
   constexpr bool kRaw = std::is_same_v<U, uint32_t>;
-  static_assert(!kRaw || (QUANTIZATION == Quantization::int4 && kPackElems == 2),
+  static_assert(!kRaw || (QUANTIZE_INT4 && kPackElems == 2),
                 "uint32_t registers are an INT4 payload's words and scales");
   // THE LAYOUT, from the tile: kThreadsM rows of threads (TILE_M rows, kRows a thread) of kThreadsN
   // threads, the block's.
@@ -908,7 +900,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
   using V = vec<U, kPackElems>;
-  using E = std::conditional_t<QUANTIZATION == Quantization::exact, U, uint8_t>;
+  using E = std::conditional_t<!QUANTIZE_INT4, U, uint8_t>;
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (output_slot < 0 || output_slot >= output_size_slot)) __builtin_trap();
   [[maybe_unused]] E* const at_copy = reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
   const int tid = static_cast<int>(threadIdx.x);
@@ -939,7 +931,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // never loaded: written clamped, they overwrote the last row's lines with stale registers
     // under the owner's flag (TILE_M 2 at one row, 2026-10-25T17-23-56Z). One row a thread of one
     // row of threads has none, its loop unbranched as before.
-    static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
+    static_assert(!QUANTIZE_INT4, "a line carries exact payload");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
     // first bytes.
@@ -977,7 +969,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
-    static_assert(QUANTIZATION == Quantization::exact && kRows == 1,
+    static_assert(!QUANTIZE_INT4 && kRows == 1,
                   "the flat walk writes one exact copy a row of threads");
     // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
@@ -1016,7 +1008,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks,
                   "a group a thread here: several are load's, recv's, store's and send's loop");
     const int g = offs_n / kInt4Group + tid % kThreadsN;
-    if constexpr (QUANTIZATION == Quantization::exact) {
+    if constexpr (!QUANTIZE_INT4) {
       if constexpr (TAIL) {
         // EXACT: the group's packs at their place, a short last group's inside the clip.
         if (g >= int4_groups(clip_n)) return;
@@ -1100,7 +1092,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         *(global_f16*)(reinterpret_cast<char*>(scales) + scale_at) = static_cast<__fp16>(scale);
       }
     }
-  } else if constexpr (QUANTIZATION == Quantization::exact) {
+  } else if constexpr (!QUANTIZE_INT4) {
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (row_at(i) >= clip_m) continue;
@@ -1633,7 +1625,7 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
         q[2 * p + e] = __builtin_bit_cast(
             uint32_t, __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + 15.0f));
     }
-    // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2 (QUANTIZATION's layout)
+    // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2 (QUANTIZE_INT4's layout)
     const auto nibbles = [](uint32_t high, uint32_t low) {
       uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift and an or)
       asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
@@ -1698,8 +1690,8 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&payload)[1][K][2]) {
 // it differs (THE FOUR, below); every rank's is the caller's loop over ranks (Michael, October 17:
 // "a loop of recv and send is more readable"). A load whose registers have a slot dimension reads
 // every slot of the entry (a pushed inbox's writers).
-//   QUANTIZATION: none, the buffer holds the registers' dtype; int4, it holds their INT4 payload
-//     (QUANTIZATION), its values from the slot's start and its scales at the offset its own sizes
+//   QUANTIZE_INT4: none, the buffer holds the registers' dtype; int4, it holds their INT4 payload
+//     (QUANTIZE_INT4), its values from the slot's start and its scales at the offset its own sizes
 //     give (int4_scales_offset), a read dequantizing into its registers' dtype, a write quantizing
 //     its registers once whichever ranks it writes them to.
 // ENTRY r, A SCALAR LOAD OF THE ARRAY (ptr_array_at; per lane: lane_ptr_array_at): the host writes a
@@ -1728,7 +1720,7 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&payload)[1][K][2]) {
 
 // LOAD: this rank's buffer (entry input_rank) into a thread's registers. Layout::line's poll
 // takes its rows' flags, the status and the limit (read_buffer's line read); no other layout reads them.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
@@ -1754,7 +1746,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 #pragma unroll
     for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
       Group group;
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           input_ptr_array, input_ptr_array_size, input_rank, input_slot, input_stride_slot,
           input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, group, offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
@@ -1776,7 +1768,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
                                   ? entries[0]
                                   : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
         input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
         flags, status_ptr, status_stride_field, status_size_field, timeout_ticks);
@@ -1797,7 +1789,7 @@ DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
 
 // RECV: rank input_rank's buffer (a peer's, over the fabric; the rank may differ by lane) into a
 // thread's registers. A one-entry array (`&entry, 1`, an entry loaded earlier) is that entry.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
@@ -1820,7 +1812,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 #pragma unroll
     for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
       Group group;
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           input_ptr_array, input_ptr_array_size, input_rank, input_slot, input_stride_slot,
           input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, group, offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
@@ -1839,17 +1831,17 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
     const int first = __builtin_amdgcn_readfirstlane(input_rank);
     if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
-      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
           input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
           row_step);
     else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
-      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           internal::ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
           input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, output, offs_m, offs_n, row_step);
     else
-      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           internal::lane_ptr_array_at<void, WORLD>(entries, input_ptr_array_size, input_rank),
           input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
           input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
@@ -1857,7 +1849,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 }
 
 // STORE: a thread's registers into this rank's buffer (entry output_rank).
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                    int output_rank, int output_slot, int64_t output_stride_slot,
@@ -1882,7 +1874,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
       for (int k = 0; k < kInt4GroupPacks; ++k)
 #pragma unroll
         for (int j = 0; j < kPackElems; ++j) group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           group, output_ptr_array, output_ptr_array_size, output_rank, output_slot,
           output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
           output_size_n, clip_m, clip_n, offs_m,
@@ -1893,7 +1885,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     void* const output = __builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1
                              ? entries[0]
                              : internal::ptr_array_at(entries, output_ptr_array_size, output_rank);
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
         input, output, output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
   }
@@ -1902,7 +1894,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 // SEND: a thread's registers into rank output_rank's buffer (a peer's, over the fabric; the rank
 // may differ by lane). Posted: the next ordered barrier's release completes and publishes it
 // (BARRIER); a Layout::line send carries its rows' `flags` in its lines and needs no barrier.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool QUANTIZE_INT4,
           Layout LAYOUT, bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                   int output_rank, int output_slot, int64_t output_stride_slot,
@@ -1927,7 +1919,7 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
       for (int k = 0; k < kInt4GroupPacks; ++k)
 #pragma unroll
         for (int j = 0; j < kPackElems; ++j) group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           group, output_ptr_array, output_ptr_array_size, output_rank, output_slot,
           output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
           output_size_n, clip_m, clip_n, offs_m,
@@ -1937,12 +1929,12 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
     const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
     const int first = __builtin_amdgcn_readfirstlane(output_rank);
     if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
-      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
           output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
           output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flags);
     else
-      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT, TAIL>(
           input,
           internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
           output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
