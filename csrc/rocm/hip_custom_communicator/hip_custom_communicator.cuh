@@ -1288,8 +1288,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
 // the compiled kernel, is each select's last check.
 // =================================================================================================
 
-// A KERNEL'S PARTIALS, row-major (a build in passes needs none: it runs in passes
-// of what the partials holds): the plain two-shot its slice of every row; a
+// A KERNEL'S PARTIALS, row-major, the whole call's: the plain two-shot its slice of every row; a
 // column two-shot the whole reduced tensor (each rank's columns at their
 // place); a row two-shot its rank's rows, twice where it leaves two results
 // (out and the residual). A one-shot reads the inputs and keeps nothing; `packs` a
@@ -2187,8 +2186,8 @@ inline std::variant<Config, Error> add_attn_res_rms_norm_config(int world, int64
 // payload at that call, in every built dtype and in either encoding (exact or
 // INT4: common.cuh's INT4 payload layout): the inputs the whole input (an eager
 // exact call's host copy, read through the eager input table; the pushed
-// all-reduce's inbox of WORLD slots, a band of rows a pass, so at least a row
-// a slot), or its INT4 payload; the partials the most any two-shot keeps
+// two-shot's whole-call inbox, its shares rounded up), or its INT4 payload; the partials the most
+// any two-shot keeps
 // (`partials_need`), or its INT4 payload (bounded as one row of its elements).
 // Each need grows with the rows and the row's width, so a call inside the box
 // fits by construction. Each rounded to a whole pack, and at least one.
@@ -2215,14 +2214,15 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
       }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
     if (input > staging) staging = input;
-    // THE PUSHED TWO-SHOT'S INBOX (forced) takes a pass of at least one row:
-    // WORLD slots of a row each covers its WORLD shares of one row rounded up
-    // to whole packs. The in-place pull's eager copy is the input whole,
-    // above. (The pushed one-shot's inbox is its own region, the arena's
+    // THE EXACT PUSHED TWO-SHOT'S INBOX, the whole call: WORLD slots of a share each, a share
+    // rounded up to whole packs. (The pushed one-shot's inbox is its own region, the arena's
     // UNFENCED REGION.)
-    const int64_t one_row_each = world * max_cols * elem_bytes(d);
-    if (one_row_each > staging) staging = one_row_each;
+    const int64_t inbox = world * ((max_rows * packs + world - 1) / world) * pack;
+    if (inbox > staging) staging = inbox;
   }
+  // THE TWO-SHOTS' INT4 INBOX (the flat walk): WORLD shares, each rounded up to whole groups.
+  const int64_t int4_inbox = int4_payload_bytes(1, world * int4_flat_share(max_rows, max_cols, world));
+  if (int4_inbox > staging) staging = int4_inbox;
   return {whole(partials), whole(staging)};
 }
 
