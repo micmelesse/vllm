@@ -588,9 +588,12 @@ using BuildConfig =
                  AllReduceAddRmsNormBuildConfig,
                  AllReduceAddAttnResRmsNormBuildConfig>;
 
-// A KERNEL'S LAUNCH: its grid, blocks in each dimension, never compiled in.
+// A KERNEL'S LAUNCH: its grid, blocks in each dimension, and whether an INT4 build QUANTIZES this
+// call (the tune's pick, a size's: below where quantizing pays, the INT4 kernel moves the call
+// exact itself), never compiled in. An exact build's is false.
 struct LaunchConfig {
   Dim3 grid;
+  bool quantize;
 };
 
 // THE COMPLETE CONFIG: the build and the launch.
@@ -1089,6 +1092,7 @@ constexpr bool int4_groups_a_thread(Template k, int algorithm) {
 constexpr bool int4_tail(Template k, int algorithm, int64_t m, int64_t n, int world) {
   if (k == Template::all_reduce && algorithm == Algorithm::two_shot_push)
     return m * n % kInt4Group != 0;
+  if (k == Template::all_reduce) return n % kInt4Group != 0;
   if (int4_groups_a_thread(k, algorithm)) return n % kInt4Group != 0;
   return n % kInt4Group != 0 || n / kInt4Group % world != 0;
 }
@@ -1471,7 +1475,8 @@ inline std::optional<Template> template_named(std::string_view name) {
 // no K), the quantization exact or int4. Each limit is the hardware's (STANDARDS 3.2).
 inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, Dim3 grid,
                                           Dim3 block, int waves_per_eu, int tile_m, int tile_n,
-                                          int tile_k, int quantization, int pack_bytes) {
+                                          int tile_k, int quantization, int pack_bytes,
+                                          bool quantize) {
   if (op_of(fn) != o || !has_algorithm(fn, algorithm)) return Error::no_such_template;
   if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
@@ -1484,6 +1489,8 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
   const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm ||
                      o == OpType::add_attn_res_rms_norm;
   if (!has_k && tile_k != 1) return Error::field_not_this_templates;
+  // QUANTIZE, an INT4 build's alone: an exact build moves nothing quantized.
+  if (quantization == Quantization::exact && quantize) return Error::field_not_this_templates;
   // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest); an element's at least is
   // the call's (refused): the dtype is not known here.
   if (pack_bytes < 2 || pack_bytes > kBuild.memory.pack_bytes ||
@@ -1500,7 +1507,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
   if (has_k)
     b = AllReduceAddAttnResRmsNormBuildConfig{algorithm, block, waves_per_eu, tile_m,
                                               tile_n, tile_k, quantization, pack_bytes};
-  return Chosen{fn, {b, {grid}}};
+  return Chosen{fn, {b, {grid, quantize}}};
 }
 
 // =================================================================================================
@@ -1567,12 +1574,18 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
   // INT4 ON A ONE-SHOT, which reads its peers' inputs as they are: named before
   // the build lookup, which lists no such build; INT4 AT A NARROWER PACK than the
   // widest: the format's word is a pack of 8 values (common.cuh's QUANTIZATION).
-  const bool int4 = quantization_of(c.build) == Quantization::int4;
+  const bool int4_build = quantization_of(c.build) == Quantization::int4;
   const int algorithm = algorithm_of(c.build);
-  if (int4 && (is_one_shot(algorithm) || algorithm == Algorithm::rows ||
-               (fn == Template::all_reduce && !is_push(algorithm)) ||
-               pack != kBuild.memory.pack_bytes))
+  if (int4_build && (algorithm == Algorithm::rows ||
+                     (fn != Template::all_reduce && is_one_shot(algorithm)) ||
+                     pack != kBuild.memory.pack_bytes))
     return Error::quantization_not_supported;
+  // A FUSED OP'S INT4 BUILD ALWAYS QUANTIZES: its kernels have no exact path of their own.
+  if (int4_build && fn != Template::all_reduce && !c.launch.quantize)
+    return Error::field_not_this_templates;
+  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it, else exact (the INT4 all-reduce
+  // kernel's own exact path below the size where quantizing pays).
+  const bool int4 = int4_build && c.launch.quantize;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its block, its
   // waves, its tile.
   const Dim3 block = block_of(c.build);
@@ -1587,12 +1600,27 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
   // kUnfencedSlotBytes / kLinePayloadBytes lines; a block's TILE_M rows of a bank's
   // kUnfencedBlocks.
   const int64_t line_pack = pack < kLinePayloadBytes ? pack : kLinePayloadBytes;
-  if (algorithm == Algorithm::one_shot_push &&
+  if (algorithm == Algorithm::one_shot_push && !int4 &&
       ((tile_n_of(c.build) * elem_bytes(dtype) + line_pack - 1) / line_pack >
            kUnfencedSlotBytes / kLinePayloadBytes ||
        int64_t{c.launch.grid.x} * tile_m_of(c.build) > kUnfencedBlocks))
     return Error::unfenced_too_small;
   if (!collective) return std::nullopt;
+  // THE PLAIN ALL-REDUCE'S INT4 ONE-SHOTS AND PULLED TWO-SHOT (kernels/all_reduce.cuh): the
+  // input's [m, n] INT4 payload in the staging (the pushed one-shot's, WORLD slots of it, whole
+  // kInt4ScalesAlign); the pulled two-shot's sums an [owned, n] one in the partials, a rank's rows
+  // whole tiles.
+  if (int4 && fn == Template::all_reduce && algorithm != Algorithm::two_shot_push) {
+    const int64_t payload = int4_payload_bytes(m, n);
+    const int64_t slot = (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
+    const int64_t tile_m = tile_m_of(c.build);
+    const int64_t owned = ((m + world - 1) / world + tile_m - 1) / tile_m * tile_m;
+    if ((algorithm == Algorithm::one_shot_push ? world * slot : payload) > staging_bytes)
+      return Error::staging_too_small;
+    if (algorithm == Algorithm::two_shot_pull && int4_payload_bytes(owned, n) > partials_bytes)
+      return Error::partials_too_small;
+    return std::nullopt;
+  }
   const int64_t packs = packs_of(n, dtype, pack);
   // An INT4 payload lies in the region that holds it exact (common.cuh's
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
@@ -1656,7 +1684,9 @@ struct Config {
   Dim3 block{};
   Dim3 grid{};
   int waves_per_eu{};
-  int quantization{};
+  int quantization{};  // the build's: the instance dispatch finds
+  // WHETHER THE CALL MOVES INT4: an INT4 build's launch field (LaunchConfig), false for exact.
+  bool quantize{};
   int shared_memory_bytes{};
   DType dtype{};
   DType weight_dtype{};
@@ -1844,7 +1874,7 @@ void with_config_build(const Config& config, F& f) {
             // (the norms and AttnRes), with a tail or not (the INT4 two-shots).
             const auto tailed = [&]<bool CONTIGUOUS, bool CHUNKED>() {
               if constexpr (compiled_quantization(B) == Quantization::int4 &&
-                            is_two_shot(B.algorithm)) {
+                            (is_two_shot(B.algorithm) || FN == Template::all_reduce)) {
                 if (config.tail) layout.template operator()<CONTIGUOUS, CHUNKED, true>();
                 else layout.template operator()<CONTIGUOUS, CHUNKED, false>();
               } else layout.template operator()<CONTIGUOUS, CHUNKED, false>();
@@ -1927,19 +1957,22 @@ inline std::variant<Config, Error> all_reduce_config(
   const int algorithm = algorithm_of(k.config.build);
   const KernelConfig& c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
+  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the launch's `quantize`), else
+  // exact (an exact build, or the INT4 kernel's own exact path).
+  const bool quantize = a.quantization == Quantization::int4 && c.launch.quantize;
+  const int q = quantize ? Quantization::int4 : Quantization::exact;
   // IN PLACE: the exact pull, every rank's input read where its table says.
-  const bool in_place = !is_push(algorithm) &&
-                        a.quantization == Quantization::exact;
+  const bool in_place = !is_push(algorithm) && q == Quantization::exact;
   // THE UNFENCED REGION: the pushed one-shot pushes lines into its own inbox there, a tile a
   // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
   // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
   // epoch as it was.
-  const bool unfenced = algorithm == Algorithm::one_shot_push;
+  const bool unfenced = algorithm == Algorithm::one_shot_push && q == Quantization::exact;
   if (unfenced && volume(c.launch.grid) > kUnfencedBlocks) return Error::launch_out_of_range;
   // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
   // the whole input). INT4 pushes its input's shares quantized, whole,
   // instead.
-  const bool in_passes = a.quantization == Quantization::exact;
+  const bool in_passes = q == Quantization::exact;
   // THE BAND: the rows a pass, what the inbox (the staging) holds in
   // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
   // the two-shot's is one rank's share of the band (the flat walk's, whole
@@ -1998,9 +2031,10 @@ inline std::variant<Config, Error> all_reduce_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
+  config.quantize = quantize;
   config.pack_bytes = a.pack_bytes;  // the build's: the instance dispatch finds
-  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share).
-  const bool int4_flat = !in_passes && is_two_shot(algorithm);
+  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): the pushed two-shot's.
+  const bool int4_flat = !in_passes && algorithm == Algorithm::two_shot_push;
   const int64_t share = int4_flat_share(m, n, world);
   config.partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.partials_stride_n = 1;
@@ -2032,8 +2066,26 @@ inline std::variant<Config, Error> all_reduce_config(
   config.dtype = dtype;
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
-  config.in_place = !is_push(config.algorithm) &&
-      config.quantization == Quantization::exact;
+  config.in_place = in_place;
+  // THE INT4 ONE-SHOTS' AND PULLED TWO-SHOT'S PAYLOADS (kernels/all_reduce.cuh), as bytes over the
+  // dtype's elements (what the launch's region checks read): the staging's [m, n] payload (the
+  // pushed one-shot's WORLD slots of it), and the pulled two-shot's [owned, n] sums in the
+  // partials. The kernels find them from the input's sizes.
+  if (quantize && algorithm != Algorithm::two_shot_push) {
+    const int64_t payload = int4_payload_bytes(m, n);
+    const int64_t slot = (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
+    const int64_t owned = ((m + world - 1) / world + a.tile_m - 1) / a.tile_m * a.tile_m;
+    const int64_t staged = algorithm == Algorithm::one_shot_push ? world * slot : payload;
+    const int64_t summed = algorithm == Algorithm::two_shot_pull ? int4_payload_bytes(owned, n) : 0;
+    config.staging_stride_m = 0;
+    config.staging_stride_n = 1;
+    config.staging_size_m = 1;
+    config.staging_size_n = (staged + elem_bytes(dtype) - 1) / elem_bytes(dtype);
+    config.partials_stride_m = 0;
+    config.partials_stride_n = 1;
+    config.partials_size_m = summed > 0 ? 1 : 0;
+    config.partials_size_n = (summed + elem_bytes(dtype) - 1) / elem_bytes(dtype);
+  }
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   config.tail = config.quantization == Quantization::int4 && int4_tail(fn, algorithm, m, n, world);
   const void* kernel = nullptr;
@@ -2595,7 +2647,7 @@ inline std::variant<Config, Error> all_reduce(
         world, kSignalsStrideParity, int64_t{kMaxRanks},
         int64_t{1}, int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks);
+        int64_t{kStatusFields}, rank, timeout_ticks, config.quantize);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
     // fault, every output finite where the input is.

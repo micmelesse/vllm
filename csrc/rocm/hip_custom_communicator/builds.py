@@ -144,7 +144,7 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
     """EVERY INSTANCE OF A BUILD the dispatch reaches (the host's `with_config_build`):
     each dtype and world, the weight's dtype where a norm takes one, contiguous or not
     (the plain two-shots), chunked or not (every kernel but the plain all-reduce's),
-    with a tail or not (an INT4 two-shot)."""
+    with a tail or not (an INT4 two-shot, or any INT4 build of the plain all-reduce)."""
     algorithm, block, _, _, waves, tile_m, tile_n, tile_k, q, pack = b
     # AN INT4 BUILD AT A NARROWER PACK compiles its exact body (the host's
     # compiled_quantization: INT4's word is a pack of 8 values; the call is refused).
@@ -168,7 +168,7 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                     for chunked in ("false",) if plain else ("true", "false"):
                         for tail in (
                             ("true", "false")
-                            if q == "int4" and two_shot
+                            if q == "int4" and (two_shot or plain)
                             else ("false",)
                         ):
                             values = {

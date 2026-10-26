@@ -120,7 +120,7 @@ int64_t hip_custom_communicator_all_reduce(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_all_reduce_rms_norm(
     int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
     int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
@@ -140,7 +140,7 @@ int64_t hip_custom_communicator_all_reduce_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
     int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
@@ -162,7 +162,7 @@ int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
     int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
@@ -190,7 +190,7 @@ int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_rms_norm(
     int64_t world, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& weight,
@@ -208,7 +208,7 @@ int64_t hip_custom_communicator_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_add_rms_norm(
     int64_t world, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& residual,
@@ -228,7 +228,7 @@ int64_t hip_custom_communicator_add_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
 int64_t hip_custom_communicator_add_attn_res_rms_norm(
     int64_t world, bool checked_after_launch, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
@@ -254,4 +254,4 @@ int64_t hip_custom_communicator_add_attn_res_rms_norm(
     int64_t tile_m,
     int64_t tile_n,
     int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes);
+    const std::string& quantization, int64_t pack_bytes, bool quantize);
