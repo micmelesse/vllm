@@ -50,6 +50,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     abandon_open,
     build_info,
     check_table,
+    config_of_record,
     get_nearest_pick,
     picked_configs,
     supported,
@@ -486,8 +487,6 @@ def _call(
                     input=summed,
                     weight=args.weight,
                     eps=EPS,
-                    kernel=norm_config.kernel,
-                    algorithm=norm_config.algorithm,
                     grid_x=norm_config.grid_x,
                     grid_y=norm_config.grid_y,
                     grid_z=norm_config.grid_z,
@@ -497,7 +496,6 @@ def _call(
                     waves_per_eu=norm_config.waves_per_eu,
                     tile_m=norm_config.tile_m,
                     tile_n=norm_config.tile_n,
-                    tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
                     pack_bytes=norm_config.pack_bytes,
                 )
@@ -510,8 +508,6 @@ def _call(
                     residual=args.residual,
                     weight=args.weight,
                     eps=EPS,
-                    kernel=norm_config.kernel,
-                    algorithm=norm_config.algorithm,
                     grid_x=norm_config.grid_x,
                     grid_y=norm_config.grid_y,
                     grid_z=norm_config.grid_z,
@@ -521,7 +517,6 @@ def _call(
                     waves_per_eu=norm_config.waves_per_eu,
                     tile_m=norm_config.tile_m,
                     tile_n=norm_config.tile_n,
-                    tile_k=norm_config.tile_k,
                     quantization=norm_config.quantization,
                     pack_bytes=norm_config.pack_bytes,
                 )
@@ -539,8 +534,6 @@ def _call(
             write_index=args.write_index,
             eps=ATTN_RES_EPS,
             output_eps=EPS,
-            kernel=norm_config.kernel,
-            algorithm=norm_config.algorithm,
             grid_x=norm_config.grid_x,
             grid_y=norm_config.grid_y,
             grid_z=norm_config.grid_z,
@@ -586,7 +579,6 @@ def _call(
         return [
             comm.all_reduce(
                 input=x,
-                kernel=config.kernel,
                 algorithm=config.algorithm,
                 grid_x=config.grid_x,
                 grid_y=config.grid_y,
@@ -597,7 +589,6 @@ def _call(
                 waves_per_eu=config.waves_per_eu,
                 tile_m=config.tile_m,
                 tile_n=config.tile_n,
-                tile_k=config.tile_k,
                 quantization=config.quantization,
                 pack_bytes=config.pack_bytes,
             )
@@ -609,7 +600,6 @@ def _call(
                 input=x,
                 weight=args.weight,
                 eps=EPS,
-                kernel=config.kernel,
                 algorithm=config.algorithm,
                 grid_x=config.grid_x,
                 grid_y=config.grid_y,
@@ -620,7 +610,6 @@ def _call(
                 waves_per_eu=config.waves_per_eu,
                 tile_m=config.tile_m,
                 tile_n=config.tile_n,
-                tile_k=config.tile_k,
                 quantization=config.quantization,
                 pack_bytes=config.pack_bytes,
             )
@@ -633,7 +622,6 @@ def _call(
                 residual=args.residual,
                 weight=args.weight,
                 eps=EPS,
-                kernel=config.kernel,
                 algorithm=config.algorithm,
                 grid_x=config.grid_x,
                 grid_y=config.grid_y,
@@ -644,7 +632,6 @@ def _call(
                 waves_per_eu=config.waves_per_eu,
                 tile_m=config.tile_m,
                 tile_n=config.tile_n,
-                tile_k=config.tile_k,
                 quantization=config.quantization,
                 pack_bytes=config.pack_bytes,
             )
@@ -662,7 +649,6 @@ def _call(
         write_index=args.write_index,
         eps=ATTN_RES_EPS,
         output_eps=EPS,
-        kernel=config.kernel,
         algorithm=config.algorithm,
         grid_x=config.grid_x,
         grid_y=config.grid_y,
@@ -735,6 +721,45 @@ def _should(comm: HipCustomCommunicator, op: Op, x: torch.Tensor, args: Args) ->
     return comm.should_allreduce_add_rms_norm(x, args.weight)
 
 
+@dataclass(frozen=True)
+class _Kernel:
+    """AN OP'S KERNEL AS BUILT: its op, and its builds (build_info's record of the op)."""
+
+    op: str
+    builds: tuple[dict[str, int | str], ...]
+
+
+def _templates() -> dict[str, _Kernel]:
+    """Each op's kernel by its name (build_info's ops, one kernel an op)."""
+    return {r.kernel: _Kernel(op, r.builds) for op, r in build_info().ops.items()}
+
+
+def _record(
+    kernel: str, build: dict[str, int | str], quantization: Quantization, grid_x: int
+) -> Config:
+    """KERNEL `kernel` AT `build` moving `quantization` on `grid_x` blocks: its op's
+    config, read as the table holds a config (`config_of_record`)."""
+    return config_of_record(
+        {
+            "kernel": kernel,
+            "algorithm": build["algorithm"],
+            "grid_x": grid_x,
+            "grid_y": 1,
+            "grid_z": 1,
+            "block_x": int(build["block_x"]),
+            "block_y": int(build["block_y"]),
+            "block_z": int(build["block_z"]),
+            "waves_per_eu": int(build["waves_per_eu"]),
+            "tile_m": int(build["tile_m"]),
+            "tile_n": int(build["tile_n"]),
+            "tile_k": int(build["tile_k"]),
+            "quantization": quantization,
+            "pack_bytes": int(build["pack_bytes"]),
+            "quantize_from_bytes": None,
+        }
+    )
+
+
 def _forced(
     variant: Variant, cols: int = 0, quantization: Quantization = "exact"
 ) -> Config | None:
@@ -744,7 +769,7 @@ def _forced(
     build = next(
         (
             b
-            for b in build_info().templates[variant.kernel].builds
+            for b in _templates()[variant.kernel].builds
             if b["algorithm"] == variant.algorithm
             and b["quantization"] == quantization
             and int(b["tile_n"]) >= cols
@@ -753,22 +778,7 @@ def _forced(
     )
     if build is None:
         return None
-    return Config(
-        kernel=variant.kernel,
-        algorithm=variant.algorithm,
-        grid_x=16,
-        grid_y=1,
-        grid_z=1,
-        block_x=int(build["block_x"]),
-        block_y=int(build["block_y"]),
-        block_z=int(build["block_z"]),
-        waves_per_eu=int(build["waves_per_eu"]),
-        tile_m=int(build["tile_m"]),
-        tile_n=int(build["tile_n"]),
-        tile_k=int(build["tile_k"]),
-        quantization=quantization,
-        pack_bytes=int(build["pack_bytes"]),
-    )
+    return _record(variant.kernel, build, quantization, 16)
 
 
 def _forced_whole(
@@ -794,7 +804,7 @@ def _variants(op: Op) -> list[Variant]:
                 kernel=name,
                 algorithm=cast(Algorithm, b["algorithm"]),
             )
-            for name, t in build_info().templates.items()
+            for name, t in _templates().items()
             if t.op == op
             for b in t.builds
         )
@@ -986,23 +996,8 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
 def _built_configs(kernel: str) -> list[Config]:
     """Every build of `kernel` as a config, at a grid of 16 (rows past it looped)."""
     return [
-        Config(
-            kernel=kernel,
-            algorithm=cast(Algorithm, b["algorithm"]),
-            grid_x=16,
-            grid_y=1,
-            grid_z=1,
-            block_x=int(b["block_x"]),
-            block_y=int(b["block_y"]),
-            block_z=int(b["block_z"]),
-            waves_per_eu=int(b["waves_per_eu"]),
-            tile_m=int(b["tile_m"]),
-            tile_n=int(b["tile_n"]),
-            tile_k=int(b["tile_k"]),
-            quantization=cast(Quantization, b["quantization"]),
-            pack_bytes=int(b["pack_bytes"]),
-        )
-        for b in build_info().templates[kernel].builds
+        _record(kernel, b, cast(Quantization, b["quantization"]), 16)
+        for b in _templates()[kernel].builds
     ]
 
 
@@ -1013,10 +1008,10 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
     (`_int4_case`) at its shapes; any tile at any block (its tails its own). A build the
     host refuses by name at a size (its capacity) is said, never run."""
     layer = ATTN_RES_LAYERS[0] if op == "all_reduce_add_attn_res_rms_norm" else None
-    (kernel,) = [n for n, t in build_info().templates.items() if t.op == op]
+    (kernel,) = [n for n, t in _templates().items() if t.op == op]
     forcings: list[Forcing] = [*_built_configs(kernel)]
     if op in ROWS:
-        (rows_kernel,) = [n for n, t in build_info().templates.items() if t.op == ROWS[op]]
+        (rows_kernel,) = [n for n, t in _templates().items() if t.op == ROWS[op]]
         forcings += [Composed(norm_config=c) for c in _built_configs(rows_kernel)]
     wrongs: list[str] = []
     for forcing in forcings:
@@ -1073,11 +1068,10 @@ AT_SIZE = ((4096, LATENT), (2048, HIDDEN), (4096, HIDDEN), (8192, LATENT))
 def _table_configs(kernel: str) -> list[Config]:
     """Every exact config of `kernel` the table holds, at its own grid, deduplicated."""
     table = json.loads(_TABLE.read_text())["gfx950"]
-    fields = Config.__dataclass_fields__
     out: list[Config] = []
     for c in table["configs"]:
         if c["kernel"] == kernel and c["quantization"] == "exact":
-            config = Config(**{k: c[k] for k in fields})
+            config = config_of_record(c)
             if config not in out:
                 out.append(config)
     return out
@@ -1085,7 +1079,7 @@ def _table_configs(kernel: str) -> list[Config]:
 
 def _table_configs_at_size_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
     layer = ATTN_RES_LAYERS[0] if op == "all_reduce_add_attn_res_rms_norm" else None
-    (kernel,) = [n for n, t in build_info().templates.items() if t.op == op]
+    (kernel,) = [n for n, t in _templates().items() if t.op == op]
     wrongs: list[str] = []
     for config in _table_configs(kernel):
         for rows, hidden in AT_SIZE:
@@ -1433,7 +1427,7 @@ def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         for variant in _variants(op):
             if any(
                 b["algorithm"] == variant.algorithm and b["quantization"] == "int4"
-                for b in build_info().templates[variant.kernel].builds
+                for b in _templates()[variant.kernel].builds
             ):
                 for shape in INT4_SHAPES:
                     _int4_case(comm, rank, op, variant, shape)
@@ -1634,9 +1628,9 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
-    assert built.templates
-    assert sorted(t.op for t in built.templates.values()) == sorted(built.op_names)
-    for name, t in built.templates.items():
+    assert _templates()
+    assert sorted(t.op for t in _templates().values()) == sorted(built.op_names)
+    for name, t in _templates().items():
         assert t.op in built.op_names, name
         for b in t.builds:
             assert b["algorithm"] in get_args(Algorithm), (name, b)
@@ -1671,7 +1665,7 @@ def test_the_builds_are_the_tables_configs() -> None:
         b = {f: c[f] for f in fields}
         if b not in want.setdefault(c["kernel"], []):
             want[c["kernel"]].append(b)
-    got = {name: list(t.builds) for name, t in build_info().templates.items()}
+    got = {name: list(t.builds) for name, t in _templates().items()}
     assert got == want
 
 
@@ -1684,11 +1678,10 @@ def test_the_tuned_table_checks() -> None:
 
     table = json.loads(_TABLE.read_text())["gfx950"]
     check_table(table)
-    built = build_info()
     for k in table["picks"]:
         op = table["inputs"][k["input"]]["op"].removeprefix("hip_custom_communicator.")
         kernels = [table["configs"][j]["kernel"] for j in k["configs"]]
-        ops = tuple(built.templates[kernel].op for kernel in kernels)
+        ops = tuple(_templates()[kernel].op for kernel in kernels)
         assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, k)
     assert any(len(k["configs"]) == 2 for k in table["picks"])
     # AN UNSOUND TABLE, named: a build its kernel does not list, an exact input moving

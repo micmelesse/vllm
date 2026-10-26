@@ -45,12 +45,12 @@ import warnings
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import Any, ClassVar, Literal, final
+from typing import Any, ClassVar, Literal, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -94,9 +94,20 @@ _ROWS: Mapping[Op, Op] = {
 # values, or INT4. A communicator's setting for its plain calls, and a config's field.
 Quantization = Literal["exact", "int4"]
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
-# WHICH BODY OF AN OP'S ONE KERNEL a config runs, by the name its op's build
-# gives it (C++'s `algorithms`, `build_info`'s): a one-shot or a two-shot, pulled
-# or pushed, or a norm on this rank's rows (its one, "rows"). A config's field.
+# WHICH BODY OF AN OP'S ONE KERNEL a config runs, each op's by the names its build
+# gives them (C++'s `algorithms`, its op file's enum): a one-shot or a two-shot,
+# pulled or pushed. A norm on this rank's rows has one, which the table names "rows".
+AllReduceAlgorithm = Literal[
+    "one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push"
+]
+AllReduceRmsNormAlgorithm = Literal["one_shot_pull", "two_shot_pull", "two_shot_push"]
+AllReduceAddRmsNormAlgorithm = Literal[
+    "one_shot_pull", "two_shot_pull", "two_shot_push"
+]
+AllReduceAddAttnResRmsNormAlgorithm = Literal[
+    "one_shot_pull", "two_shot_pull", "two_shot_push"
+]
+# Any op's, by name: what a lookup across ops (`get_kernel_config`) is asked for.
 Algorithm = Literal[
     "one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push", "rows"
 ]
@@ -353,21 +364,15 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 
 @dataclass(frozen=True)
-class TemplateBuild:
-    """One C++ template as built (an op's one kernel): its op, and the builds dispatch
-    instantiates (its catalog list), each its fields by name as a forcing passes them
-    (algorithm, block_x, block_y, block_z, waves_per_eu, its tile and its
-    quantization; never the launch, which a forced call gives itself)."""
-
-    op: str
-    builds: tuple[dict[str, int | str], ...]
-
-
-@dataclass(frozen=True)
 class OpRecord:
-    """ONE OP'S PLAIN CALL as built (C++'s `kOps`): what a call of it with nothing
-    forced must be to run, which `should` reads."""
+    """ONE OP AS BUILT (C++'s `kOps`): its kernel by name, the builds dispatch
+    instantiates, each its fields by name as the table holds them (algorithm, block_x,
+    block_y, block_z, waves_per_eu, its tile and its quantization; never the launch,
+    which a config gives itself), and what a call of it with nothing forced must be to
+    run, which `should` reads."""
 
+    kernel: str
+    builds: tuple[dict[str, int | str], ...]
     dtypes: frozenset[torch.dtype]  # its input's
     weight_dtypes: frozenset[torch.dtype]  # its weight's besides its input's; none
     two_d: bool  # its input is [rows, cols], not any shape read as rows of the last
@@ -376,8 +381,8 @@ class OpRecord:
 @dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack bytes, its ops', errors' and fault places' names, its templates, and each
-    op's plain call. What a call may hold is a communicator's (`Capacity`)."""
+    pack bytes, its ops', errors' and fault places' names, and each op as built. What
+    a call may hold is a communicator's (`Capacity`)."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
@@ -387,9 +392,8 @@ class BuildInfo:
     op_names: tuple[str, ...]
     error_names: tuple[str, ...]
     where_names: tuple[str, ...]
-    # Each template by name, in C++'s `Template` order: what a tuner searches.
-    templates: dict[str, TemplateBuild]
-    # Each op by name, in C++'s `Op` order: its plain call.
+    # Each op by name, in C++'s `OpType` order: its kernel, its builds (what a tuner
+    # searches) and its plain call.
     ops: dict[str, OpRecord]
     # The pushed one-shot's most blocks: a block's own slots in the unfenced region.
     unfenced_blocks: int
@@ -405,9 +409,9 @@ def build_info() -> BuildInfo:
         ops,
         errors,
         where_names,
-        names,
-        template_ops,
-        fields,
+        kernels,
+        kernel_ops,
+        field_names,
         flat,
         counts,
         op_dtypes,
@@ -416,27 +420,31 @@ def build_info() -> BuildInfo:
         unfenced_blocks,
         algorithms,
     ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
-    templates: dict[str, TemplateBuild] = {}
-    at, width, build = 0, len(fields), 0
-    for name, op, count in zip(names, template_ops, counts):
+    assert list(kernel_ops) == list(ops), "an op's kernel out of the ops' order"
+    records: dict[str, OpRecord] = {}
+    at = at_dtype = at_weight = build = 0
+    width = len(field_names)
+    for op, kernel, count, facts in zip(
+        ops, kernels, counts, range(0, len(op_facts), 3)
+    ):
         builds: list[dict[str, int | str]] = []
         for _ in range(count):
-            given = dict(zip(fields, flat[at : at + width]))
+            given = dict(zip(field_names, flat[at : at + width]))
             q = _QUANTIZATIONS[given.pop("quantization")]
             fields_set = {f: v for f, v in given.items() if v != 0}
-            builds.append({"algorithm": algorithms[build]} | fields_set | {"quantization": q})
+            builds.append(
+                {"algorithm": algorithms[build]} | fields_set | {"quantization": q}
+            )
             at += width
             build += 1
-        templates[name] = TemplateBuild(op, tuple(builds))
-    records: dict[str, OpRecord] = {}
-    at_dtype = at_weight = 0
-    for op, at in zip(ops, range(0, len(op_facts), 3)):
-        num_dtypes, num_weights, two_d = op_facts[at : at + 3]
+        num_dtypes, num_weights, two_d = op_facts[facts : facts + 3]
         dtypes_in = op_dtypes[at_dtype : at_dtype + num_dtypes]
         weights_in = op_weights[at_weight : at_weight + num_weights]
         at_dtype += num_dtypes
         at_weight += num_weights
         records[op] = OpRecord(
+            kernel,
+            tuple(builds),
             frozenset(_DTYPES[d] for d in dtypes_in),
             frozenset(_DTYPES[d] for d in weights_in),
             bool(two_d),
@@ -448,7 +456,6 @@ def build_info() -> BuildInfo:
         tuple(ops),
         tuple(errors),
         tuple(where_names),
-        templates,
         records,
         unfenced_blocks,
     )
@@ -634,18 +641,97 @@ _CONFIG_KEYS = (
 )
 
 
+# EACH OP'S CONFIG, ONE CLASS AN OP, a field each (C++'s arguments, in `_CONFIG_KEYS`'
+# order): its algorithm (its own), its grid, its block and the block's waves a EU, its
+# tile, what it moves, its pack, and the call's bytes from which an INT4 config
+# quantizes (`quantize_from_bytes`: a launch's, the tune's pick; below them its INT4
+# build passes the call exact; 0, it always quantizes; an exact config's None). Its
+# kernel, its algorithms and what it does not choose (a norm on rows' one algorithm, a
+# kernel without K's tile_k) are the class's: the table and C++ name every field of
+# every op, so a config reads them alike, but a call cannot force them. Every op's C++
+# call is handed each field by name, a line each (STANDARDS 3).
 @dataclass(frozen=True)
-class Config:
-    """ONE KERNEL'S CONFIG, a field each (`_CONFIG_KEYS`, C++'s arguments, in their
-    order): the kernel, its algorithm, its grid, its block and the block's waves a EU,
-    its tile, what it moves, its pack, and the call's bytes from which an INT4 config
-    quantizes (`quantize_from_bytes`: a launch's, the tune's pick; below them its INT4
-    build passes the call exact; 0, it always quantizes; an exact config's 0). Every
-    op's C++ call is handed each field by name, a line each, never a tuple or a dict
-    unpacked: a field one side lacks is an error naming it (STANDARDS 3)."""
+class AllReduceConfig:
+    """THE ALL-REDUCE'S CONFIG."""
 
-    kernel: str
-    algorithm: Algorithm
+    kernel: ClassVar[str] = "all_reduce"
+    algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAlgorithm)
+    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
+    algorithm: AllReduceAlgorithm
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class AllReduceRmsNormConfig:
+    """THE ALL-REDUCE THEN RMSNORM'S CONFIG, one kernel."""
+
+    kernel: ClassVar[str] = "all_reduce_rms_norm"
+    algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceRmsNormAlgorithm)
+    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
+    algorithm: AllReduceRmsNormAlgorithm
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class AllReduceAddRmsNormConfig:
+    """THE ALL-REDUCE THEN ADD-RMSNORM'S CONFIG, one kernel."""
+
+    kernel: ClassVar[str] = "all_reduce_add_rms_norm"
+    algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
+    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
+    algorithm: AllReduceAddRmsNormAlgorithm
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class AllReduceAddAttnResRmsNormConfig:
+    """THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM'S CONFIG, one kernel: TILE_K
+    sources a step."""
+
+    kernel: ClassVar[str] = "all_reduce_add_attn_res_rms_norm"
+    algorithms: ClassVar[tuple[str, ...]] = get_args(
+        AllReduceAddAttnResRmsNormAlgorithm
+    )
+    algorithm: AllReduceAddAttnResRmsNormAlgorithm
     grid_x: int
     grid_y: int
     grid_z: int
@@ -663,26 +749,141 @@ class Config:
     quantize_from_bytes: int | None = None
 
 
-def _config(c: Mapping[str, Any]) -> Config:
-    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as a
-    `Config`."""
-    return Config(
-        kernel=c["kernel"],
-        algorithm=c["algorithm"],
-        grid_x=c["grid_x"],
-        grid_y=c["grid_y"],
-        grid_z=c["grid_z"],
-        block_x=c["block_x"],
-        block_y=c["block_y"],
-        block_z=c["block_z"],
-        waves_per_eu=c["waves_per_eu"],
-        tile_m=c["tile_m"],
-        tile_n=c["tile_n"],
-        tile_k=c["tile_k"],
-        quantization=c["quantization"],
-        pack_bytes=c["pack_bytes"],
-        quantize_from_bytes=c["quantize_from_bytes"],
+@dataclass(frozen=True)
+class RmsNormConfig:
+    """THE RMSNORM ON THIS RANK'S ROWS' CONFIG."""
+
+    kernel: ClassVar[str] = "rms_norm_rows"
+    algorithms: ClassVar[tuple[str, ...]] = ("rows",)
+    algorithm: ClassVar[str] = "rows"  # its one
+    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class AddRmsNormConfig:
+    """THE ADD-RMSNORM ON THIS RANK'S ROWS' CONFIG."""
+
+    kernel: ClassVar[str] = "add_rms_norm_rows"
+    algorithms: ClassVar[tuple[str, ...]] = ("rows",)
+    algorithm: ClassVar[str] = "rows"  # its one
+    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class AddAttnResRmsNormConfig:
+    """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG: TILE_K sources a step."""
+
+    kernel: ClassVar[str] = "add_attn_res_rms_norm_rows"
+    algorithms: ClassVar[tuple[str, ...]] = ("rows",)
+    algorithm: ClassVar[str] = "rows"  # its one
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    quantization: Quantization
+    pack_bytes: int
+    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
+    # forcing (C++'s 0, it always quantizes).
+    quantize_from_bytes: int | None = None
+
+
+Config = (
+    AllReduceConfig
+    | AllReduceRmsNormConfig
+    | AllReduceAddRmsNormConfig
+    | AllReduceAddAttnResRmsNormConfig
+    | RmsNormConfig
+    | AddRmsNormConfig
+    | AddAttnResRmsNormConfig
+)
+# EACH KERNEL'S CONFIG CLASS, by the kernel's name (the table's `kernel`).
+_CONFIGS: Mapping[str, type[Config]] = {
+    c.kernel: c
+    for c in (
+        AllReduceConfig,
+        AllReduceRmsNormConfig,
+        AllReduceAddRmsNormConfig,
+        AllReduceAddAttnResRmsNormConfig,
+        RmsNormConfig,
+        AddRmsNormConfig,
+        AddAttnResRmsNormConfig,
     )
+}
+
+
+def config_of_record(c: Mapping[str, Any]) -> Config:
+    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as its
+    kernel's config: its algorithm one of the kernel's, and a field the class holds
+    (a norm on rows' algorithm, tile_k without K) the class's."""
+    cls = _CONFIGS[c["kernel"]]
+    if c["algorithm"] not in cls.algorithms:
+        raise ValueError(f"{c['kernel']} has no algorithm {c['algorithm']}")
+    own = {f.name for f in fields(cls)}
+    for k in ("algorithm", "tile_k"):
+        if k not in own and c[k] != getattr(cls, k):
+            raise ValueError(f"{c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}")
+    return cls(**{k: c[k] for k in _CONFIG_KEYS if k in own})
+
+
+def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
+    """WHAT A CONFIG AS THE TABLE HOLDS IT (`c`, `_CONFIG_KEYS`) FORCED ON `op` IS
+    REFUSED FOR, or None (a caller holding configs flat, gd's): another op's kernel or
+    an algorithm its kernel lacks, no_such_kernel; tile_k on a kernel without K,
+    field_not_this_templates."""
+    cls = _CONFIGS.get(c["kernel"])
+    if (
+        cls is None
+        or kernel_op(c["kernel"]) != op
+        or c["algorithm"] not in cls.algorithms
+    ):
+        return Error.no_such_kernel
+    if "tile_k" not in {f.name for f in fields(cls)} and c["tile_k"] != cls.tile_k:
+        return Error.field_not_this_templates
+    return None
+
+
+def kernel_op(kernel: str) -> str | None:
+    """The op whose one kernel `kernel` is (build_info's), or None."""
+    return next((o for o, r in build_info().ops.items() if r.kernel == kernel), None)
+
+
+def _record(config: Config) -> dict[str, Any]:
+    """`config` as the table holds a config (`_CONFIG_KEYS`, every op's every field)."""
+    return {k: getattr(config, k) for k in _CONFIG_KEYS}
 
 
 def _moves_exact(config: Config, input: torch.Tensor) -> bool:
@@ -718,7 +919,8 @@ def check_table(raw: TunedTable) -> None:
         where = f"the tuned table: configs[{i}]"
         if list(c) != ["op", *_CONFIG_KEYS]:
             raise ValueError(f"{where} has keys {list(c)}, not {['op', *_CONFIG_KEYS]}")
-        template = built.templates.get(c["kernel"])
+        op = kernel_op(c["kernel"])
+        record = built.ops[op] if op is not None else None
         build = {
             k: c[k]
             for k in _CONFIG_KEYS
@@ -732,13 +934,17 @@ def check_table(raw: TunedTable) -> None:
                 f"{where}: quantize_from_bytes is null for an exact config, an INT4 "
                 "one's count of bytes"
             )
-        if i in picked and (template is None or build not in template.builds):
+        if i in picked and (record is None or build not in record.builds):
             raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
-        if template is not None and c["op"] != _QUALIFIED + template.op:
-            raise ValueError(
-                f"{where}: {c['kernel']} is {template.op}'s, not {c['op']}'s"
-            )
-        ops_of_configs.append(template.op if template is not None else None)
+        if op is not None and c["op"] != _QUALIFIED + op:
+            raise ValueError(f"{where}: {c['kernel']} is {op}'s, not {c['op']}'s")
+        # ITS OP'S CONFIG: its algorithm its kernel's, what it does not choose its.
+        if c["kernel"] in _CONFIGS:
+            try:
+                config_of_record(c)
+            except ValueError as e:
+                raise ValueError(f"{where}: {e}") from None
+        ops_of_configs.append(op)
     for i, e in enumerate(inputs):
         where = f"the tuned table: inputs[{i}]"
         name = str(e.get("op", ""))
@@ -798,9 +1004,219 @@ def check_table(raw: TunedTable) -> None:
                     )
 
 
-def get_given_config(
-    kernel: str | None,
-    algorithm: Algorithm | None,
+# AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS, a function an op: every field given (the
+# config), or none (None: a plain call, the table's pick). Some but not all is refused,
+# forced_incomplete: C++ takes every field. `quantize_from_bytes`, a launch's, may be
+# left out of a forcing: None (an INT4 config then always quantizes; an exact one has
+# none).
+
+
+def get_given_all_reduce_config(
+    algorithm: AllReduceAlgorithm | None,
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> AllReduceConfig | None:
+    """THE ALL-REDUCE'S CONFIG AS GIVEN."""
+    if (
+        algorithm is not None
+        and grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return AllReduceConfig(
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        algorithm is None
+        and grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced all_reduce gives algorithm, grid x y z, block x y z, "
+        "waves_per_eu, tile m n, quantization and pack_bytes",
+    )
+
+
+def get_given_all_reduce_rms_norm_config(
+    algorithm: AllReduceRmsNormAlgorithm | None,
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> AllReduceRmsNormConfig | None:
+    """THE ALL-REDUCE THEN RMSNORM'S CONFIG AS GIVEN."""
+    if (
+        algorithm is not None
+        and grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return AllReduceRmsNormConfig(
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        algorithm is None
+        and grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced all_reduce_rms_norm gives algorithm, grid x y z, block x "
+        "y z, waves_per_eu, tile m n, quantization and pack_bytes",
+    )
+
+
+def get_given_all_reduce_add_rms_norm_config(
+    algorithm: AllReduceAddRmsNormAlgorithm | None,
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> AllReduceAddRmsNormConfig | None:
+    """THE ALL-REDUCE THEN ADD-RMSNORM'S CONFIG AS GIVEN."""
+    if (
+        algorithm is not None
+        and grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return AllReduceAddRmsNormConfig(
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        algorithm is None
+        and grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced all_reduce_add_rms_norm gives algorithm, grid x y z, "
+        "block x y z, waves_per_eu, tile m n, quantization and pack_bytes",
+    )
+
+
+def get_given_all_reduce_add_attn_res_rms_norm_config(
+    algorithm: AllReduceAddAttnResRmsNormAlgorithm | None,
     grid_x: int | None,
     grid_y: int | None,
     grid_z: int | None,
@@ -813,16 +1229,11 @@ def get_given_config(
     tile_k: int | None,
     quantization: Quantization | None,
     pack_bytes: int | None,
-    quantize_from_bytes: int | None = None,
-) -> Config | None:
-    """AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS: every field given (the config), or none
-    (None: a plain call, the table's pick). Some but not all is refused,
-    forced_incomplete: C++ takes every field. `quantize_from_bytes`, a launch's, may be
-    left out of a forcing: None (an INT4 config then always quantizes; an exact one has
-    none)."""
+    quantize_from_bytes: int | None,
+) -> AllReduceAddAttnResRmsNormConfig | None:
+    """THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM'S CONFIG AS GIVEN."""
     if (
-        kernel is not None
-        and algorithm is not None
+        algorithm is not None
         and grid_x is not None
         and grid_y is not None
         and grid_z is not None
@@ -836,8 +1247,7 @@ def get_given_config(
         and quantization is not None
         and pack_bytes is not None
     ):
-        return Config(
-            kernel=kernel,
+        return AllReduceAddAttnResRmsNormConfig(
             algorithm=algorithm,
             grid_x=grid_x,
             grid_y=grid_y,
@@ -854,8 +1264,7 @@ def get_given_config(
             quantize_from_bytes=quantize_from_bytes,
         )
     if (
-        kernel is None
-        and algorithm is None
+        algorithm is None
         and grid_x is None
         and grid_y is None
         and grid_z is None
@@ -873,8 +1282,205 @@ def get_given_config(
         return None
     raise CommunicatorError(
         Error.forced_incomplete,
-        "a forced call gives kernel, algorithm, grid x y z, block x y z, waves_per_eu, "
-        "tile m n k, quantization and pack_bytes",
+        "a forced all_reduce_add_attn_res_rms_norm gives algorithm, grid x "
+        "y z, block x y z, waves_per_eu, tile m n k, quantization and "
+        "pack_bytes",
+    )
+
+
+def get_given_rms_norm_config(
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> RmsNormConfig | None:
+    """THE RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
+    if (
+        grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return RmsNormConfig(
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced rms_norm gives grid x y z, block x y z, waves_per_eu, "
+        "tile m n, quantization and pack_bytes",
+    )
+
+
+def get_given_add_rms_norm_config(
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> AddRmsNormConfig | None:
+    """THE ADD-RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
+    if (
+        grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return AddRmsNormConfig(
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced add_rms_norm gives grid x y z, block x y z, waves_per_eu, "
+        "tile m n, quantization and pack_bytes",
+    )
+
+
+def get_given_add_attn_res_rms_norm_config(
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    tile_k: int | None,
+    quantization: Quantization | None,
+    pack_bytes: int | None,
+    quantize_from_bytes: int | None,
+) -> AddAttnResRmsNormConfig | None:
+    """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
+    if (
+        grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and tile_k is not None
+        and quantization is not None
+        and pack_bytes is not None
+    ):
+        return AddAttnResRmsNormConfig(
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
+            pack_bytes=pack_bytes,
+            quantize_from_bytes=quantize_from_bytes,
+        )
+    if (
+        grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and tile_k is None
+        and quantization is None
+        and pack_bytes is None
+        and quantize_from_bytes is None
+    ):
+        return None
+    raise CommunicatorError(
+        Error.forced_incomplete,
+        "a forced add_attn_res_rms_norm gives grid x y z, block x y z, "
+        "waves_per_eu, tile m n k, quantization and pack_bytes",
     )
 
 
@@ -942,7 +1548,7 @@ def get_nearest_configs(
 
 def picked_configs(table: TunedTable, pick: Mapping[str, Any]) -> list[Config]:
     """A pick's configs (its record in the arch's `table`), in the order they launch."""
-    return [_config(table["configs"][j]) for j in pick["configs"]]
+    return [config_of_record(table["configs"][j]) for j in pick["configs"]]
 
 
 def get_kernel_config(
@@ -960,7 +1566,9 @@ def get_kernel_config(
     of any op, else the first such config of the table's; moving INT4 where it
     has no INT4 config, its exact config moved INT4 (a build it lists). None where it
     has neither."""
-    builds = build_info().templates[kernel].builds
+    op = kernel_op(kernel)
+    assert op is not None, f"no op's kernel is {kernel}"
+    builds = build_info().ops[op].builds
     variant = {"kernel": kernel, "algorithm": algorithm}
 
     def takes(c: dict[str, Any], moving: Quantization) -> bool:
@@ -999,7 +1607,7 @@ def get_kernel_config(
             c = next((c for c in raw["configs"] if takes(c, moving)), None)
         if c is not None:
             return replace(
-                _config(c),
+                config_of_record(c),
                 quantization=quantization,
                 quantize_from_bytes=None if quantization == "exact" else 0,
             )
@@ -1257,8 +1865,8 @@ class HipCustomCommunicator:
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
     # Each op takes its own tensors and values, then, keyword-only, what the tuner and
-    # the tests force: a config, every field given or none (`get_given_config`). None
-    # is a plain call: the table's nearest input's configs (`get_nearest_configs`), one
+    # the tests force: its config's fields, every one given or none
+    # (`get_given_<op>_config`). None is a plain call: the table's nearest input's configs (`get_nearest_configs`), one
     # kernel, or our all-reduce then the op's norm on rows. The norms on rows have no
     # table: a call of one gives its config. A forced call asks no `should_`: C++
     # answers it. An op raises a RuntimeError naming the Error it is refused for; a
@@ -1323,7 +1931,7 @@ class HipCustomCommunicator:
                 for name, t in tensors.items()
             },
             "values": dict(values),
-            "configs": [asdict(c) for c in configs],
+            "configs": [_record(c) for c in configs],
             "table_input": (
                 None if pick is None else self.table["inputs"][pick["input"]]
             ),
@@ -1383,8 +1991,7 @@ class HipCustomCommunicator:
         self,
         input: torch.Tensor,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
+        algorithm: AllReduceAlgorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1394,7 +2001,6 @@ class HipCustomCommunicator:
         waves_per_eu: int | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        tile_k: int | None = None,
         quantization: Quantization | None = None,
         pack_bytes: int | None = None,
         quantize_from_bytes: int | None = None,
@@ -1419,8 +2025,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
+        given_config = get_given_all_reduce_config(
             algorithm=algorithm,
             grid_x=grid_x,
             grid_y=grid_y,
@@ -1431,7 +2036,6 @@ class HipCustomCommunicator:
             waves_per_eu=waves_per_eu,
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
             quantize_from_bytes=quantize_from_bytes,
@@ -1529,8 +2133,7 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
+        algorithm: AllReduceRmsNormAlgorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1540,7 +2143,6 @@ class HipCustomCommunicator:
         waves_per_eu: int | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        tile_k: int | None = None,
         quantization: Quantization | None = None,
         pack_bytes: int | None = None,
         quantize_from_bytes: int | None = None,
@@ -1566,8 +2168,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
+        given_config = get_given_all_reduce_rms_norm_config(
             algorithm=algorithm,
             grid_x=grid_x,
             grid_y=grid_y,
@@ -1578,7 +2179,6 @@ class HipCustomCommunicator:
             waves_per_eu=waves_per_eu,
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
             quantize_from_bytes=quantize_from_bytes,
@@ -1751,8 +2351,7 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
+        algorithm: AllReduceAddRmsNormAlgorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1762,7 +2361,6 @@ class HipCustomCommunicator:
         waves_per_eu: int | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        tile_k: int | None = None,
         quantization: Quantization | None = None,
         pack_bytes: int | None = None,
         quantize_from_bytes: int | None = None,
@@ -1789,8 +2387,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
+        given_config = get_given_all_reduce_add_rms_norm_config(
             algorithm=algorithm,
             grid_x=grid_x,
             grid_y=grid_y,
@@ -1801,7 +2398,6 @@ class HipCustomCommunicator:
             waves_per_eu=waves_per_eu,
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
             quantize_from_bytes=quantize_from_bytes,
@@ -1984,8 +2580,7 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
+        algorithm: AllReduceAddAttnResRmsNormAlgorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2024,8 +2619,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
+        given_config = get_given_all_reduce_add_attn_res_rms_norm_config(
             algorithm=algorithm,
             grid_x=grid_x,
             grid_y=grid_y,
@@ -2235,8 +2829,6 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2246,7 +2838,6 @@ class HipCustomCommunicator:
         waves_per_eu: int | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        tile_k: int | None = None,
         quantization: Quantization | None = None,
         pack_bytes: int | None = None,
         quantize_from_bytes: int | None = None,
@@ -2270,9 +2861,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
-            algorithm=algorithm,
+        given_config = get_given_rms_norm_config(
             grid_x=grid_x,
             grid_y=grid_y,
             grid_z=grid_z,
@@ -2282,7 +2871,6 @@ class HipCustomCommunicator:
             waves_per_eu=waves_per_eu,
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
             quantize_from_bytes=quantize_from_bytes,
@@ -2347,8 +2935,6 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2358,7 +2944,6 @@ class HipCustomCommunicator:
         waves_per_eu: int | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        tile_k: int | None = None,
         quantization: Quantization | None = None,
         pack_bytes: int | None = None,
         quantize_from_bytes: int | None = None,
@@ -2383,9 +2968,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
-            algorithm=algorithm,
+        given_config = get_given_add_rms_norm_config(
             grid_x=grid_x,
             grid_y=grid_y,
             grid_z=grid_z,
@@ -2395,7 +2978,6 @@ class HipCustomCommunicator:
             waves_per_eu=waves_per_eu,
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
             quantize_from_bytes=quantize_from_bytes,
@@ -2468,8 +3050,6 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        kernel: str | None = None,
-        algorithm: Algorithm | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2504,9 +3084,7 @@ class HipCustomCommunicator:
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_config(
-            kernel=kernel,
-            algorithm=algorithm,
+        given_config = get_given_add_attn_res_rms_norm_config(
             grid_x=grid_x,
             grid_y=grid_y,
             grid_z=grid_z,
