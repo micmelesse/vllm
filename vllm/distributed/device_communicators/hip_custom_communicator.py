@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import Any, ClassVar, Literal, final, get_args
+from typing import Any, ClassVar, Literal, final
 
 import torch
 from torch.distributed import ProcessGroup
@@ -94,13 +94,12 @@ _ROWS: Mapping[Op, Op] = {
 # values, or INT4. A communicator's setting for its plain calls, and a config's field.
 Quantization = Literal["exact", "int4"]
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
-# WHICH BODY OF AN OP'S ONE KERNEL a config runs, C++'s `Algorithm` by name (number for
-# number): a one-shot or a two-shot, pulled or pushed, or a norm on this rank's rows. Exactly
-# the ones that exist. A config's field.
+# WHICH BODY OF AN OP'S ONE KERNEL a config runs, by the name its op's build
+# gives it (C++'s `algorithms`, `build_info`'s): a one-shot or a two-shot, pulled
+# or pushed, or a norm on this rank's rows (its one, "rows"). A config's field.
 Algorithm = Literal[
     "one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push", "rows"
 ]
-_ALGORITHMS: tuple[Algorithm, ...] = get_args(Algorithm)
 
 
 class Error(IntEnum):
@@ -415,18 +414,19 @@ def build_info() -> BuildInfo:
         op_weights,
         op_facts,
         unfenced_blocks,
+        algorithms,
     ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
     templates: dict[str, TemplateBuild] = {}
-    at, width = 0, len(fields)
+    at, width, build = 0, len(fields), 0
     for name, op, count in zip(names, template_ops, counts):
         builds: list[dict[str, int | str]] = []
         for _ in range(count):
             given = dict(zip(fields, flat[at : at + width]))
-            variant = {"algorithm": _ALGORITHMS[given.pop("algorithm")]}
             q = _QUANTIZATIONS[given.pop("quantization")]
             fields_set = {f: v for f, v in given.items() if v != 0}
-            builds.append(variant | fields_set | {"quantization": q})
+            builds.append({"algorithm": algorithms[build]} | fields_set | {"quantization": q})
             at += width
+            build += 1
         templates[name] = TemplateBuild(op, tuple(builds))
     records: dict[str, OpRecord] = {}
     at_dtype = at_weight = 0

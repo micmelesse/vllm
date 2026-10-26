@@ -49,26 +49,27 @@ FIELDS = (
     "pack_bytes",
 )
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
-# THE ALGORITHMS, as the host names them and numbers them (Algorithm: a kernel's ALGORITHM int).
-ALGORITHM_VALUES = {"one_shot_pull": 0, "one_shot_push": 1, "two_shot_pull": 2,
-                    "two_shot_push": 3, "rows": 4}
 
 
-# EACH KERNEL'S BuildConfig (a fused op's, or its norm's: one type an op family).
-FAMILIES = {
+# EACH KERNEL'S BuildConfig, its op's (one type an op), and its ALGORITHM's enum, its op file's;
+# a norm on rows has one algorithm (the table's "rows") and no enum.
+BUILDS = {
     "all_reduce": "AllReduceBuildConfig",
     "all_reduce_rms_norm": "AllReduceRmsNormBuildConfig",
-    "rms_norm_rows": "AllReduceRmsNormBuildConfig",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormBuildConfig",
-    "add_rms_norm_rows": "AllReduceAddRmsNormBuildConfig",
     "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormBuildConfig",
-    "add_attn_res_rms_norm_rows": "AllReduceAddAttnResRmsNormBuildConfig",
+    "rms_norm_rows": "RmsNormBuildConfig",
+    "add_rms_norm_rows": "AddRmsNormBuildConfig",
+    "add_attn_res_rms_norm_rows": "AddAttnResRmsNormBuildConfig",
 }
-
-
-def family(kernel: str) -> str:
-    """The op's BuildConfig a kernel's builds are (a fused op's, or its norm's)."""
-    return FAMILIES[kernel]
+ALGORITHM_ENUMS = {
+    "all_reduce": "AllReduceAlgorithm",
+    "all_reduce_rms_norm": "AllReduceRmsNormAlgorithm",
+    "all_reduce_add_rms_norm": "AllReduceAddRmsNormAlgorithm",
+    "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormAlgorithm",
+}
+# THE KERNELS WITH A K (TILE_K, AttnRes's sources a step).
+WITH_K = ("all_reduce_add_attn_res_rms_norm", "add_attn_res_rms_norm_rows")
 
 
 def tables(path: Path, archs: list[str]) -> list[dict]:
@@ -89,16 +90,21 @@ def named(tables: list[dict]) -> dict[str, list[tuple]]:
     return out
 
 
+def algorithm_value(kernel: str, algorithm: str) -> str:
+    """A build's algorithm as its kernel's template argument (its op file's enum)."""
+    return f"{ALGORITHM_ENUMS[kernel]}::{algorithm}"
+
+
 def literal(kernel: str, b: tuple) -> str:
     algorithm, bx, by, bz, waves, tm, tn, tk, q, pack = b
-    fields = [f"Algorithm::{algorithm}"]
+    fields = [algorithm_value(kernel, algorithm)] if kernel in ALGORITHM_ENUMS else []
     fields += [f"{{{bx}, {by}, {bz}}}", str(waves), str(tm), str(tn)]
-    if family(kernel) == "AllReduceAddAttnResRmsNormBuildConfig":
+    if kernel in WITH_K:
         fields.append(str(tk))
     elif tk != 1:
         raise SystemExit(f"{kernel}: tile_k {tk}, but the kernel has no K")
     fields += [QUANTIZATIONS[q], str(pack)]
-    return f"    {family(kernel)}{{{', '.join(fields)}}},"
+    return f"    {BUILDS[kernel]}{{{', '.join(fields)}}},"
 
 
 # THE MACHINE'S FACTS AND WHAT IS COMPILED, as the host holds them (kTarget, kBuild:
@@ -121,22 +127,24 @@ def arguments(host: str) -> dict[str, str]:
     body = body[: body.index("\n}\n")]
     out = {}
     for m in re.finditer(
-        r"C\.kernel == Template::(\w+)\)\s*return reinterpret_cast<const void\*>\(\s*"
+        r"B\.op == OpType::\w+\)\s*return reinterpret_cast<const void\*>\(\s*"
         r"(\w+)<(.*?)>\);",
         body,
         re.S,
     ):
-        assert m.group(1) == m.group(2), m.group(0)
-        out[m.group(1)] = " ".join(m.group(3).split())
+        out[m.group(1)] = " ".join(m.group(2).split())
     return out
 
 
 def algorithms(host: str) -> dict[str, list[str]]:
-    """Each kernel's algorithms as the host lists them (`kAlgorithms_<kernel>`: the bodies its
-    op file has), by kernel."""
+    """Each kernel's algorithms by name as its op's build lists them (its `algorithms`: the
+    bodies its op file has; a norm on rows has one, "rows"), by kernel."""
     out = {}
-    for m in re.finditer(r"constexpr int kAlgorithms_(\w+)\[\] = \{(.*?)\};", host, re.S):
-        out[m.group(1)] = re.findall(r"\w*Algorithm::(\w+)", m.group(2))
+    for kernel, build in BUILDS.items():
+        body = host[host.index(f"struct {build} {{") :]
+        body = body[: body.index("\n};\n")]
+        named = re.search(r"algorithms\[\] = \{(.*?)\};", body, re.S)
+        out[kernel] = re.findall(r'"(\w+)"', named.group(1)) if named else ["rows"]
     return out
 
 
@@ -180,20 +188,21 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                             values = {
                                 "T": t,
                                 "W": w,
-                                "C.world": str(world),
-                                "C.tile_m": str(tile_m),
-                                "C.tile_n": str(tile_n),
-                                "C.tile_k": str(tile_k),
-                                "C.block.x": str(block),
-                                "C.wave_size": str(WAVE_SIZE),
-                                "C.pack_bytes": str(pack),
-                                "C.waves_per_eu": str(waves),
-                                "C.algorithm": str(ALGORITHM_VALUES[algorithm]),
-                                "C.contiguous": contiguous,
-                                "C.chunked": chunked,
-                                "C.tail": tail,
-                                "C.quantize_int4": quantize_int4,
+                                "I.world": str(world),
+                                "B.tile_m": str(tile_m),
+                                "B.tile_n": str(tile_n),
+                                "B.tile_k": str(tile_k),
+                                "B.block.x": str(block),
+                                "I.wave_size": str(WAVE_SIZE),
+                                "B.pack_bytes": str(pack),
+                                "B.waves_per_eu": str(waves),
+                                "I.contiguous": contiguous,
+                                "I.chunked": chunked,
+                                "I.tail": tail,
+                                "I.quantize_int4": quantize_int4,
                             }
+                            if kernel in ALGORITHM_ENUMS:
+                                values["B.algorithm"] = algorithm_value(kernel, algorithm)
                             got = ", ".join(values[a.strip()] for a in args.split(","))
                             if f"{kernel}<{got}>" not in out:
                                 out.append(f"{kernel}<{got}>")
@@ -205,8 +214,8 @@ def main() -> None:
     host = Path(sys.argv[4]).read_text()
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
     found = tables(table_path, archs)
-    # EVERY BUILD THE TABLE NAMES AT ONE OF ITS KERNEL'S ALGORITHMS (the host's
-    # kAlgorithms_<kernel>: a body the kernel has, or the config names nothing to compile).
+    # EVERY BUILD THE TABLE NAMES AT ONE OF ITS KERNEL'S ALGORITHMS (its op's build's
+    # `algorithms`: a body the kernel has, or the config names nothing to compile).
     has = algorithms(host)
     for kernel, bs in named(found).items():
         for b in bs:
@@ -243,9 +252,6 @@ def main() -> None:
         "static_assert(kBuild.supports.dtypes == std::array<DType, 2>{"
         + ", ".join(f"DType::{d}" for d, _ in DTYPES)
         + "}, \"builds.py's dtypes are not the host's\");",
-        "static_assert("
-        + " && ".join(f"Algorithm::{a} == {v}" for a, v in ALGORITHM_VALUES.items())
-        + ", \"builds.py's algorithms are not the host's\");",
         "",
     ]
     files = []

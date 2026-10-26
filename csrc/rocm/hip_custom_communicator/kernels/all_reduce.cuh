@@ -40,15 +40,8 @@
 
 namespace hip_custom_communicator {
 
-// THE ALL-REDUCE'S ALGORITHMS (its ALGORITHM):
-// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
-// reads numbers.
-namespace AllReduceAlgorithm {
-constexpr int one_shot_pull = 0;
-constexpr int one_shot_push = 1;
-constexpr int two_shot_pull = 2;
-constexpr int two_shot_push = 3;
-}  // namespace AllReduceAlgorithm
+// THE ALL-REDUCE'S ALGORITHMS: its ALGORITHM, exactly the bodies it has.
+enum class AllReduceAlgorithm { one_shot_pull, one_shot_push, two_shot_pull, two_shot_push };
 
 // THE PULLED ONE-SHOT: every rank reads every rank's input through the input table and sums (aiter's
 // cross_device_reduce_1stage).
@@ -461,7 +454,7 @@ DINLINE void all_reduce_two_shot_push(
       input_size_m, input_size_n, 0, 0, 0, rank);
 }
 
-template <int ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+template <AllReduceAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CONTIGUOUS,
           bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)

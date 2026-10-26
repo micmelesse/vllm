@@ -14,23 +14,11 @@
 
 namespace hip_custom_communicator {
 
-// THE ALL-REDUCE-RMSNORM'S ALGORITHMS (its ALGORITHM):
-// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
-// reads numbers.
-namespace AllReduceRmsNormAlgorithm {
-constexpr int one_shot_pull = 0;
-constexpr int two_shot_pull = 2;
-constexpr int two_shot_push = 3;
-}  // namespace AllReduceRmsNormAlgorithm
+// THE ALL-REDUCE-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it has.
+enum class AllReduceRmsNormAlgorithm { one_shot_pull, two_shot_pull, two_shot_push };
 
-// THE ALL-REDUCE-ADD-RMSNORM'S ALGORITHMS (its ALGORITHM):
-// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
-// reads numbers.
-namespace AllReduceAddRmsNormAlgorithm {
-constexpr int one_shot_pull = 0;
-constexpr int two_shot_pull = 2;
-constexpr int two_shot_push = 3;
-}  // namespace AllReduceAddRmsNormAlgorithm
+// THE ALL-REDUCE-ADD-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it has.
+enum class AllReduceAddRmsNormAlgorithm { one_shot_pull, two_shot_pull, two_shot_push };
 
 // =============================================================================
 // all_reduce_pull_one_shot_add_rms_norm
@@ -93,9 +81,9 @@ constexpr int two_shot_push = 3;
 // all_reduce_rms_norm: THE ALL-REDUCE THEN RMSNORM, ONE KERNEL: its ALGORITHM (AllReduceRmsNormAlgorithm) is a
 // template parameter, each algorithm its own body under `if constexpr`.
 // =============================================================================
-template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK,
-          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool QUANTIZE_INT4, int ALGORITHM,
-          bool CHUNKED, bool TAIL>
+template <AllReduceRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, typename WEIGHT_DTYPE,
+          int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int WAVES_PER_EU, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -668,9 +656,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // all_reduce_add_rms_norm: THE ALL-REDUCE THEN THE ADD AND RMSNORM, ONE KERNEL: its ALGORITHM (AllReduceAddRmsNormAlgorithm) is a
 // template parameter, each algorithm its own body under `if constexpr`.
 // =============================================================================
-template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK,
-          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool QUANTIZE_INT4, int ALGORITHM,
-          bool CHUNKED, bool TAIL>
+template <AllReduceAddRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, typename WEIGHT_DTYPE,
+          int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int WAVES_PER_EU, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,

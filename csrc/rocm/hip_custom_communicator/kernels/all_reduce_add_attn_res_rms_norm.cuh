@@ -16,14 +16,8 @@
 
 namespace hip_custom_communicator {
 
-// THE ALL-REDUCE-ADD-ATTNRES-RMSNORM'S ALGORITHMS (its ALGORITHM):
-// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
-// reads numbers.
-namespace AllReduceAddAttnResRmsNormAlgorithm {
-constexpr int one_shot_pull = 0;
-constexpr int two_shot_pull = 2;
-constexpr int two_shot_push = 3;
-}  // namespace AllReduceAddAttnResRmsNormAlgorithm
+// THE ALL-REDUCE-ADD-ATTNRES-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it has.
+enum class AllReduceAddAttnResRmsNormAlgorithm { one_shot_pull, two_shot_pull, two_shot_push };
 
 // =============================================================================
 // all_reduce_pull_one_shot_add_attn_res_rms_norm
@@ -110,9 +104,9 @@ constexpr int two_shot_push = 3;
 // all_reduce_add_attn_res_rms_norm: THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM, ONE KERNEL: its ALGORITHM (AllReduceAddAttnResRmsNormAlgorithm) is a
 // template parameter, each algorithm its own body under `if constexpr`.
 // =============================================================================
-template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK,
-          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool QUANTIZE_INT4, int ALGORITHM,
-          bool CHUNKED, bool TAIL>
+template <AllReduceAddAttnResRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int WAVES_PER_EU, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
