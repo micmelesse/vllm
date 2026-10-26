@@ -588,12 +588,12 @@ using BuildConfig =
                  AllReduceAddRmsNormBuildConfig,
                  AllReduceAddAttnResRmsNormBuildConfig>;
 
-// A KERNEL'S LAUNCH: its grid, blocks in each dimension, and whether an INT4 build QUANTIZES this
-// call (the tune's pick, a size's: below where quantizing pays, the INT4 kernel moves the call
-// exact itself), never compiled in. An exact build's is false.
+// A KERNEL'S LAUNCH: its grid, blocks in each dimension, and the call's bytes from which an INT4
+// build QUANTIZES (the tune's pick: below it the INT4 build passes the call exact, through its
+// instance that does; 0, it always quantizes), never compiled in. An exact build's is 0.
 struct LaunchConfig {
   Dim3 grid;
-  bool quantize;
+  int64_t quantize_from_bytes;
 };
 
 // THE COMPLETE CONFIG: the build and the launch.
@@ -1476,7 +1476,7 @@ inline std::optional<Template> template_named(std::string_view name) {
 inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, Dim3 grid,
                                           Dim3 block, int waves_per_eu, int tile_m, int tile_n,
                                           int tile_k, int quantization, int pack_bytes,
-                                          bool quantize) {
+                                          std::optional<int64_t> quantize_from_bytes) {
   if (op_of(fn) != o || !has_algorithm(fn, algorithm)) return Error::no_such_template;
   if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
@@ -1489,8 +1489,11 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
   const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm ||
                      o == OpType::add_attn_res_rms_norm;
   if (!has_k && tile_k != 1) return Error::field_not_this_templates;
-  // QUANTIZE, an INT4 build's alone: an exact build moves nothing quantized.
-  if (quantization == Quantization::exact && quantize) return Error::field_not_this_templates;
+  // QUANTIZE FROM, an INT4 build's alone (none given: 0, it always quantizes): an exact build
+  // moves nothing quantized, and has none.
+  if (quantization == Quantization::exact && quantize_from_bytes)
+    return Error::field_not_this_templates;
+  if (quantize_from_bytes.value_or(0) < 0) return Error::field_not_positive;
   // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest); an element's at least is
   // the call's (refused): the dtype is not known here.
   if (pack_bytes < 2 || pack_bytes > kBuild.memory.pack_bytes ||
@@ -1507,7 +1510,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
   if (has_k)
     b = AllReduceAddAttnResRmsNormBuildConfig{algorithm, block, waves_per_eu, tile_m,
                                               tile_n, tile_k, quantization, pack_bytes};
-  return Chosen{fn, {b, {grid, quantize}}};
+  return Chosen{fn, {b, {grid, quantize_from_bytes.value_or(0)}}};
 }
 
 // =================================================================================================
@@ -1580,12 +1583,12 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
                      (fn != Template::all_reduce && is_one_shot(algorithm)) ||
                      pack != kBuild.memory.pack_bytes))
     return Error::quantization_not_supported;
-  // A FUSED OP'S INT4 BUILD ALWAYS QUANTIZES: its kernels have no exact path of their own.
-  if (int4_build && fn != Template::all_reduce && !c.launch.quantize)
+  // A FUSED OP'S INT4 BUILD ALWAYS QUANTIZES: its kernels have no exact instance of their own.
+  if (int4_build && fn != Template::all_reduce && c.launch.quantize_from_bytes != 0)
     return Error::field_not_this_templates;
-  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it, else exact (the INT4 all-reduce
-  // kernel's own exact path below the size where quantizing pays).
-  const bool int4 = int4_build && c.launch.quantize;
+  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the call's bytes from its
+  // quantize_from_bytes on), else exact (the INT4 build's instance passing it exact).
+  const bool int4 = int4_build && m * n * elem_bytes(dtype) >= c.launch.quantize_from_bytes;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its block, its
   // waves, its tile.
   const Dim3 block = block_of(c.build);
@@ -1685,7 +1688,8 @@ struct Config {
   Dim3 grid{};
   int waves_per_eu{};
   int quantization{};  // the build's: the instance dispatch finds
-  // WHETHER THE CALL MOVES INT4: an INT4 build's launch field (LaunchConfig), false for exact.
+  // WHETHER THE CALL MOVES INT4, its INT4 build's QUANTIZE instance (the call's bytes from its
+  // quantize_from_bytes on); false for exact. A fused op's INT4 build always does.
   bool quantize{};
   int shared_memory_bytes{};
   DType dtype{};
@@ -1848,7 +1852,7 @@ void with_config_build(const Config& config, F& f) {
           constexpr auto B = decltype(b)::value;
           constexpr int WORLD = decltype(world)::value;
           {
-            const auto layout = [&]<bool CONTIGUOUS, bool CHUNKED, bool TAIL>() {
+            const auto layout = [&]<bool CONTIGUOUS, bool CHUNKED, bool TAIL, bool QUANTIZE>() {
               constexpr Config C = [=] {
                 Config c{};
                 c.kernel = FN;
@@ -1866,18 +1870,25 @@ void with_config_build(const Config& config, F& f) {
                 c.contiguous = CONTIGUOUS;
                 c.chunked = CHUNKED;
                 c.tail = TAIL;
+                c.quantize = QUANTIZE;
                 return c;
               }();
               f.template operator()<C>();
             };
             // THE INSTANCES a build has: contiguous or strided (the plain two-shots), chunked or not
-            // (the norms and AttnRes), with a tail or not (the INT4 two-shots).
+            // (the norms and AttnRes), with a tail or not (the INT4 two-shots), and the plain
+            // all-reduce's INT4 build quantizing (its INT4 body) or passing the call exact (its
+            // exact body); a fused op's INT4 build always quantizes.
             const auto tailed = [&]<bool CONTIGUOUS, bool CHUNKED>() {
-              if constexpr (compiled_quantization(B) == Quantization::int4 &&
-                            (is_two_shot(B.algorithm) || FN == Template::all_reduce)) {
-                if (config.tail) layout.template operator()<CONTIGUOUS, CHUNKED, true>();
-                else layout.template operator()<CONTIGUOUS, CHUNKED, false>();
-              } else layout.template operator()<CONTIGUOUS, CHUNKED, false>();
+              constexpr bool kInt4 = compiled_quantization(B) == Quantization::int4;
+              if constexpr (kInt4 && FN == Template::all_reduce) {
+                if (!config.quantize) layout.template operator()<CONTIGUOUS, CHUNKED, false, false>();
+                else if (config.tail) layout.template operator()<CONTIGUOUS, CHUNKED, true, true>();
+                else layout.template operator()<CONTIGUOUS, CHUNKED, false, true>();
+              } else if constexpr (kInt4 && is_two_shot(B.algorithm)) {
+                if (config.tail) layout.template operator()<CONTIGUOUS, CHUNKED, true, true>();
+                else layout.template operator()<CONTIGUOUS, CHUNKED, false, true>();
+              } else layout.template operator()<CONTIGUOUS, CHUNKED, false, kInt4>();
             };
             if constexpr (FN == Template::all_reduce && is_two_shot(B.algorithm)) {
               if (config.contiguous) tailed.template operator()<true, false>();
@@ -1918,7 +1929,7 @@ const void* kernel_pointer() {
   if constexpr (C.kernel == Template::all_reduce)
     return reinterpret_cast<const void*>(
         all_reduce<T, C.world, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-            C.waves_per_eu, C.quantization, C.algorithm, C.contiguous, C.tail>);
+            C.waves_per_eu, C.quantization, C.algorithm, C.contiguous, C.tail, C.quantize>);
   if constexpr (C.kernel == Template::all_reduce_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
@@ -1957,9 +1968,12 @@ inline std::variant<Config, Error> all_reduce_config(
   const int algorithm = algorithm_of(k.config.build);
   const KernelConfig& c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the launch's `quantize`), else
-  // exact (an exact build, or the INT4 kernel's own exact path).
-  const bool quantize = a.quantization == Quantization::int4 && c.launch.quantize;
+  // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the call's bytes from the launch's
+  // quantize_from_bytes on), else exact (an exact build, or the INT4 build's instance passing it
+  // exact).
+  const bool quantize = a.quantization == Quantization::int4 &&
+                        input_size_m * input_size_n * elem_bytes(dtype) >=
+                            c.launch.quantize_from_bytes;
   const int q = quantize ? Quantization::int4 : Quantization::exact;
   // IN PLACE: the exact pull, every rank's input read where its table says.
   const bool in_place = !is_push(algorithm) && q == Quantization::exact;
@@ -2087,7 +2101,7 @@ inline std::variant<Config, Error> all_reduce_config(
     config.partials_size_n = (summed + elem_bytes(dtype) - 1) / elem_bytes(dtype);
   }
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  config.tail = config.quantization == Quantization::int4 && int4_tail(fn, algorithm, m, n, world);
+  config.tail = quantize && int4_tail(fn, algorithm, m, n, world);
   const void* kernel = nullptr;
   with_config<OpType::all_reduce>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
@@ -2625,7 +2639,7 @@ inline std::variant<Config, Error> all_reduce(
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
     all_reduce<T, C.world, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-        C.waves_per_eu, C.quantization, C.algorithm, C.contiguous, C.tail>
+        C.waves_per_eu, C.quantization, C.algorithm, C.contiguous, C.tail, C.quantize>
         <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
@@ -2647,7 +2661,7 @@ inline std::variant<Config, Error> all_reduce(
         world, kSignalsStrideParity, int64_t{kMaxRanks},
         int64_t{1}, int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks, config.quantize);
+        int64_t{kStatusFields}, rank, timeout_ticks);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
     // fault, every output finite where the input is.

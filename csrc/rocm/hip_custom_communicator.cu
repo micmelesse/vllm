@@ -452,7 +452,7 @@ Picked forced_config(hip_custom_communicator::OpType o, const std::string& kerne
     const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   using namespace hip_custom_communicator;
   const std::optional<Template> fn = template_named(kernel);
   if (!fn) return Error::no_such_template;
@@ -460,7 +460,7 @@ Picked forced_config(hip_custom_communicator::OpType o, const std::string& kerne
                 Dim3{narrowed(grid_x), narrowed(grid_y), narrowed(grid_z)},
                 Dim3{narrowed(block_x), narrowed(block_y), narrowed(block_z)},
                 narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
-                quantization_from(quantization), narrowed(pack_bytes), quantize);
+                quantization_from(quantization), narrowed(pack_bytes), quantize_from_bytes);
 }
 }  // namespace
 
@@ -503,11 +503,11 @@ Answer hip_custom_communicator_all_reduce(int64_t rank, int64_t world, int64_t s
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return all_reduce_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
       staging_bytes, partials_bytes, table_slot, checked_after_launch, input, output,
       forced_config(hip_custom_communicator::OpType::all_reduce, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -579,11 +579,11 @@ Answer hip_custom_communicator_all_reduce_rms_norm(int64_t rank, int64_t world, 
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return all_reduce_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
       staging_bytes, partials_bytes, table_slot, checked_after_launch, input, weight, output, eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -624,11 +624,11 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(int64_t rank, int64_t wor
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return all_reduce_add_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
       staging_bytes, partials_bytes, table_slot, checked_after_launch, input, residual, weight, output, residual_output, eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -767,11 +767,11 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t rank, in
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return all_reduce_add_attn_res_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
       staging_bytes, partials_bytes, table_slot, checked_after_launch, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -800,10 +800,10 @@ Answer hip_custom_communicator_rms_norm(int64_t world, bool checked_after_launch
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return rms_norm_with(world, checked_after_launch, input, weight, output, eps,
       forced_config(hip_custom_communicator::OpType::rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -838,10 +838,10 @@ Answer hip_custom_communicator_add_rms_norm(int64_t world, bool checked_after_la
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return add_rms_norm_with(world, checked_after_launch, input, residual, weight, output, residual_output, eps,
       forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -895,8 +895,8 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t world, bool checked
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, bool quantize) {
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   return add_attn_res_rms_norm_with(world, checked_after_launch, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
       forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize));
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
