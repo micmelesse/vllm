@@ -617,10 +617,10 @@ class Config:
     """ONE KERNEL'S CONFIG, a field each (`_CONFIG_KEYS`, C++'s arguments, in their
     order): the kernel, its algorithm, its grid, its block and the block's waves a EU,
     its tile, what it moves, its pack, and whether an INT4 config quantizes the call
-    (`quantize`: a launch's, the tune's pick; below where quantizing pays, the INT4 kernel
-    moves the call exact itself; an exact config's is False). Every op's C++ call is handed each field by name, a line
-    each, never a tuple or a dict unpacked: a field one side lacks is an error naming it
-    (STANDARDS 3)."""
+    (`quantize`: a launch's, the tune's pick; below where quantizing pays, the INT4
+    kernel moves the call exact itself; an exact config's is False). Every op's C++ call
+    is handed each field by name, a line each, never a tuple or a dict unpacked: a field
+    one side lacks is an error naming it (STANDARDS 3)."""
 
     kernel: str
     algorithm: Algorithm
@@ -636,7 +636,8 @@ class Config:
     tile_k: int
     quantization: Quantization
     pack_bytes: int
-    # None, left out: an INT4 config quantizes (a forcing's default, as `get_given_config`'s).
+    # None, left out: an INT4 config quantizes (a forcing's default, as
+    # `get_given_config`'s).
     quantize: bool | None = None
 
     def __post_init__(self) -> None:
@@ -741,10 +742,12 @@ def check_table(raw: TunedTable) -> None:
         moved = {configs[j]["quantization"] for j in at}
         if e["mode"] == "exact" and moved != {"exact"}:
             raise ValueError(f"{where}: an exact input moves INT4")
-        # THE QUANTIZED ALL-REDUCE RUNS ITS INT4 KERNELS, every pick (each quantizing where
-        # its config says): no exact kernel in quantized mode.
+        # THE QUANTIZED ALL-REDUCE RUNS ITS INT4 KERNELS, every pick (each quantizing
+        # where its config says): no exact kernel in quantized mode.
         if e["mode"] == "quantized" and name == "all_reduce" and moved != {"int4"}:
-            raise ValueError(f"{where}: a quantized all-reduce input picks an exact kernel")
+            raise ValueError(
+                f"{where}: a quantized all-reduce input picks an exact kernel"
+            )
     for name in TUNED_OPS:
         for world in sorted(built.worlds):
             for mode in _MODES.values():
@@ -778,8 +781,8 @@ def get_given_config(
 ) -> Config | None:
     """AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS: every field given (the config), or none
     (None: a plain call, the table's pick). Some but not all is no config, refused,
-    forced_incomplete: C++ takes every field. `quantize`, a launch's, may be left out of a
-    forcing: an INT4 config then quantizes."""
+    forced_incomplete: C++ takes every field. `quantize`, a launch's, may be left out of
+    a forcing: an INT4 config then quantizes."""
     if (
         kernel is not None
         and algorithm is not None
@@ -811,7 +814,6 @@ def get_given_config(
             tile_k=tile_k,
             quantization=quantization,
             pack_bytes=pack_bytes,
-            quantize=quantize,
             quantize=quantization == "int4" if quantize is None else quantize,
         )
     if (
@@ -1423,9 +1425,7 @@ class HipCustomCommunicator:
                     partials_bytes=self._layout.partials_bytes,
                     table_slot=self._table_slot(
                         input,
-                        (
-                            config.quantization == "exact" or not config.quantize
-                        )
+                        (config.quantization == "exact" or not config.quantize)
                         and not config.algorithm.endswith("_push"),
                     ),
                     checked_after_launch=self._checked,
@@ -1615,7 +1615,8 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         (
-                            reduce_config.quantization == "exact" or not reduce_config.quantize
+                            reduce_config.quantization == "exact"
+                            or not reduce_config.quantize
                         )
                         and not reduce_config.algorithm.endswith("_push"),
                     ),
@@ -1841,7 +1842,8 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         (
-                            reduce_config.quantization == "exact" or not reduce_config.quantize
+                            reduce_config.quantization == "exact"
+                            or not reduce_config.quantize
                         )
                         and not reduce_config.algorithm.endswith("_push"),
                     ),
@@ -2094,7 +2096,8 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         (
-                            reduce_config.quantization == "exact" or not reduce_config.quantize
+                            reduce_config.quantization == "exact"
+                            or not reduce_config.quantize
                         )
                         and not reduce_config.algorithm.endswith("_push"),
                     ),
