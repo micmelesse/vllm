@@ -114,19 +114,17 @@ DINLINE void all_reduce_one_shot_pull(
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, kFirst, 0);
-  // 3. Every rank's tile (INT4: dequantized), summed in rank order in fp32, rounded once: every
-  //    rank's sums agree bitwise.
+  // 3. Every rank's tile (INT4: decoded; its payload a row of input_size_n), summed in rank order
+  //    in fp32, rounded once: every rank's sums agree bitwise.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
     const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
-    DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) {
-      if constexpr (QUANTIZE_INT4)
-        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile, TAIL>(&entries[r], 1, 0, 0, 0, input_size_n, 1, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], offs_m, offs_n, 1);
-      else
-        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&entries[r], 1, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], offs_m, offs_n, 1);
-    }
+    DTYPE copies[WORLD][kRows][kPacks][kPackElems];
+    all_gather<AllGatherAlgorithm::tile_pull, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
+               THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
+        entries, QUANTIZE_INT4 ? int64_t{input_size_n} : input_ptr_array_stride_m,
+        QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, input_size_m, input_size_n, clip_n,
+        offs_m, offs_n, copies);
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -134,9 +132,9 @@ DINLINE void all_reduce_one_shot_pull(
       for (int k = 0; k < kPacks; ++k)
 #pragma unroll
         for (int j = 0; j < kPackElems; ++j) {
-          float acc = static_cast<float>(peers[0][i][k][j]);
+          float acc = static_cast<float>(copies[0][i][k][j]);
 #pragma unroll
-          for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
+          for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
     store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
@@ -249,111 +247,81 @@ DINLINE void all_reduce_one_shot_push(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
+  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
+  constexpr int kRows = TILE_M / kThreadsM;
+  // A THREAD'S PACK: INT4's, a word of its group; exact, one line's 8-byte payload (aiter's packet),
+  // or a narrower build's pack alone in its line.
+  constexpr int kPackElems =
+      QUANTIZE_INT4 ? traits<DTYPE, PACK_BYTES>::N
+                    : (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) /
+                          static_cast<int>(sizeof(DTYPE));
+  // The tile in whole packs, INT4 in whole groups (a group is 4 lanes' packs, so its lanes stay
+  // together); columns past the input are masked.
+  constexpr int kUnit = QUANTIZE_INT4 ? kInt4Group : kPackElems;
+  constexpr int kTileN = (TILE_N + kUnit - 1) / kUnit * kUnit;
+  constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
+  constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
+  const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
+  // THE INBOX, slot r rank r's tile. INT4's in the staging, a slot an [m, n] INT4 payload whole
+  // kInt4ScalesAlign, filled before a barrier: a line has no room for a group's scale. Exact's in
+  // the unfenced region, the block's TILE_M rows of a bank from blockIdx.x * TILE_M, lines carrying
+  // each row's epoch: no barrier.
+  const int64_t slot_bytes =
+      (int4_payload_bytes(input_size_m, input_size_n) + kInt4ScalesAlign - 1) / kInt4ScalesAlign *
+      kInt4ScalesAlign;
+  const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && !QUANTIZE_INT4 &&
+      static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
+    __builtin_trap();
+  // 0. Exact: this thread's rows' last epochs, through a plain pointer: they are this rank's alone.
+  int32_t last[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))];  // a 16-byte line a row
+  uint32_t epochs[kRows] = {};
+  bool ran = false;
+  if constexpr (!QUANTIZE_INT4)
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
+        1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, last, first_row, 0, 1);
+  // 1. INT4: this rank's input, encoded, into slot [rank] of every rank's inbox (this one's too),
+  //    then every rank's visible (ordered).
   if constexpr (QUANTIZE_INT4) {
-    // INT4 PUSH ONE-SHOT: quantize this rank's tile into slot [rank] of every inbox in the
-    // staging, barrier, dequantize and sum this rank's inbox, barrier. Not lines: a line's
-    // 8 bytes hold no group's scale.
-    constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
-    constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
-    constexpr int kRows = TILE_M / kThreadsM;
-    constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    // The tile in whole INT4 groups (a group is 4 lanes' packs), so a group's lanes stay
-    // together.
-    constexpr int kTileN = (TILE_N + kInt4Group - 1) / kInt4Group * kInt4Group;
-    constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
-    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
-    const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
-    const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-    // A SLOT: an [m, n] INT4 payload, whole kInt4ScalesAlign (the payload's own alignment).
-    const int64_t slot_bytes =
-        (int4_payload_bytes(input_size_m, input_size_n) + kInt4ScalesAlign - 1) / kInt4ScalesAlign *
-        kInt4ScalesAlign;
-    // 1. This rank's tile, quantized here, into slot [rank] of every rank's inbox (this one's too).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
       const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
       DTYPE mine[kRows][kPacks][kPackElems];
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-  #pragma unroll
+#pragma unroll
       for (int r = 0; r < WORLD; ++r)
         send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size, r, rank, slot_bytes, input_size_n, 1, WORLD, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
     }
-    // 2. Every rank's push into this rank's inbox visible (ordered).
     barrier<WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks, Until::launched, 0);
-    // 3. Every slot of this rank's inbox, dequantized into DTYPE, summed in rank order in fp32,
-    //    rounded to DTYPE once: every rank sums the same copies in the same order.
-    for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-      const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
-      const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
-      DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot_bytes, input_size_n, 1, WORLD, input_size_m, input_size_n, input_size_m, clip_n, peers, offs_m, offs_n, 1);
-      DTYPE rounded[kRows][kPacks][kPackElems];
-  #pragma unroll
-      for (int i = 0; i < kRows; ++i)
-  #pragma unroll
-        for (int k = 0; k < kPacks; ++k)
-  #pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            float acc = static_cast<float>(peers[0][i][k][j]);
-  #pragma unroll
-            for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
-            rounded[i][k][j] = static_cast<DTYPE>(acc);
-          }
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
-    }
-    // 4. Every rank done with its inbox: the next launch may push into it.
-    barrier<WORLD>(
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks, Until::read, 1);
-  } else {
-    // PUSH ONE-SHOT, EXACT.
-    // The pulled one-shot's tile walk; a lane past the tile sends the tile's last pack, the
-    // same bytes its owner sends.
-    constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
-    constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
-    // A thread's pack is one line's 8-byte payload (aiter's packet), or a narrower build's
-    // pack alone in its line.
-    constexpr int kPackElems =
-        (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) / static_cast<int>(sizeof(DTYPE));
-    constexpr int kRows = TILE_M / kThreadsM;
-    // The tile in whole packs (TILE_N rounded up); columns past the input are masked.
-    constexpr int kTileN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
-    constexpr int kPacks = (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
-    constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
-    const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
-    const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-    // The block's TILE_M rows of a bank, from blockIdx.x * TILE_M.
-    const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
-      __builtin_trap();
-    // 0. This thread's rows' last epochs, through a plain pointer: they are this rank's alone.
-    int32_t last[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))];  // a 16-byte line a row, any pack
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
-        1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, first_row, 0,
-        1);
-    // Read the epochs only after the first tile's load is issued, so the round trips overlap.
-    uint32_t epochs[kRows] = {};
-    bool ran = false;
-    for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-      const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
-      // The tile's rows and columns inside the input: the lines past them are nobody's.
-      const int clip_m = min(TILE_M, input_size_m - offs_m);
-      const int clip_n = min(kTileN, input_size_n - offs_n);
-      // 1. Send this rank's tile into slot [rank] of every inbox, its own included: no branch
-      //    on a runtime rank between the sends (one serialized the remote stores).
-      // Clip at the input's columns, or at the tile's end where a step is masked.
-      const int input_clip_n = kWhole ? input_size_n : offs_n + clip_n;
-      DTYPE mine[kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, mine, offs_m, offs_n, 1);
-      // This call's epoch for each row (last + 1, never 0); its lines go in bank epoch & 1.
-  #pragma unroll
+  }
+  // 2. Every rank's tile out of this rank's inbox, summed in rank order in fp32 (this rank's own
+  //    copy too), rounded once: every rank's sums agree bitwise.
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
+    // The tile inside the input (exact: the lines past it are nobody's).
+    const int clip_m = min(TILE_M, input_size_m - offs_m);
+    const int clip_n = kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
+    DTYPE mine[kRows][kPacks][kPackElems];
+    DTYPE copies[WORLD][kRows][kPacks][kPackElems];
+    if constexpr (QUANTIZE_INT4) {
+      all_gather<AllGatherAlgorithm::tile_push, true, DTYPE, WORLD, TILE_M, THREADS_PER_BLOCK,
+                 WAVE_SIZE, TAIL>(
+          mine, epochs, staging_ptr_array, staging_ptr_array_size, slot_bytes, input_size_n, 1,
+          WORLD, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, rank,
+          status_ptr, status_stride_field, status_size_field, timeout_ticks, copies);
+    } else {
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
+      // This call's epoch for each row (last + 1, never 0; read after the first tile's load is
+      // issued, so the round trips overlap); its lines go in bank epoch & 1.
+#pragma unroll
       for (int i = 0; i < kRows; ++i) {
         const uint32_t before =
             ran ? epochs[i]
@@ -363,39 +331,46 @@ DINLINE void all_reduce_one_shot_push(
         epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
       }
       ran = true;
-  #pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, first_row + clip_m, clip_n, first_row, 0, 1, epochs);
-      // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
-      DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, first_row + clip_m, clip_n, peers, first_row, 0, 1, epochs, status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      // 3. Sum in rank order in fp32 (this rank's own line too), round once: every rank's sums
-      //    agree bitwise.
-      DTYPE rounded[kRows][kPacks][kPackElems];
-  #pragma unroll
-      for (int i = 0; i < kRows; ++i)
-  #pragma unroll
-        for (int k = 0; k < kPacks; ++k)
-  #pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            float acc = static_cast<float>(peers[0][i][k][j]);
-  #pragma unroll
-            for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
-            rounded[i][k][j] = static_cast<DTYPE>(acc);
-          }
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, offs_m, offs_n, 1);
-      // 4. The block is done with this bank before the next pass sends into it.
-      __syncthreads();
+      all_gather<AllGatherAlgorithm::tile_push, false, DTYPE, WORLD, TILE_M, THREADS_PER_BLOCK,
+                 WAVE_SIZE, TAIL>(
+          mine, epochs, unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot,
+          unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
+          unfenced_size_n, first_row + clip_m, min(kTileN, input_size_n - offs_n), first_row, 0,
+          rank, status_ptr, status_stride_field, status_size_field, timeout_ticks, copies);
     }
-    // 5. Store each row's epoch for the next launch (its row of threads' first lane).
+    DTYPE rounded[kRows][kPacks][kPackElems];
+#pragma unroll
+    for (int i = 0; i < kRows; ++i)
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < kPackElems; ++j) {
+          float acc = static_cast<float>(copies[0][i][k][j]);
+#pragma unroll
+          for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(copies[r][i][k][j]);
+          rounded[i][k][j] = static_cast<DTYPE>(acc);
+        }
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
+    // Exact: the block is done with this bank before the next pass sends into it.
+    if constexpr (!QUANTIZE_INT4) __syncthreads();
+  }
+  // 3. INT4: every rank done with its inbox, so the next launch may push into it. Exact: each
+  //    row's epoch stored for the next launch (its row of threads' first lane).
+  if constexpr (QUANTIZE_INT4) {
+    barrier<WORLD>(
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks, Until::read, 1);
+  } else {
     int32_t next[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
-  #pragma unroll
+#pragma unroll
     for (int i = 0; i < kRows; ++i)
       next[i][0][0] = ran ? static_cast<int32_t>(epochs[i]) : last[i][0][0];
     store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n,
-        first_row, 0, 1);
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block, unfenced_epochs_size_n,
+        unfenced_epochs_size_block, unfenced_epochs_size_n, first_row, 0, 1);
   }
 }
 

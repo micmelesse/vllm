@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE ALL-GATHER, written once with the common ops (load, store, the codec): every rank's summed
-// share out of its partials, after reduce_scatter's second barrier. Its variations are template
-// parameters, its walks written inline.
+// THE ALL-GATHER, written once with the common ops (load, store, the codec): every rank's piece
+// to every rank. The two-shots' (flat, columns): every rank's summed share out of its partials,
+// after reduce_scatter's second barrier, into the output. The one-shots' (tile_pull, tile_push):
+// every rank's copy of one tile of the input into this thread's registers, which the one-shot then
+// sums. Its variations are template parameters, its walks written inline.
 
 #pragma once
 
@@ -14,9 +16,10 @@
 
 namespace hip_custom_communicator {
 
-// WHICH ALL-GATHER, the reduce-scatter's cut walked back: flat, each rank's contiguous range of the
-// flattened tensor; columns, each pack from the rank owning its columns.
-enum class AllGatherAlgorithm { flat, columns };
+// WHICH ALL-GATHER: the reduce-scatter's cut walked back (flat, each rank's contiguous range of the
+// flattened tensor; columns, each pack from the rank owning its columns), or a tile of every rank's
+// input (tile_pull, read where each rank published it; tile_push, out of this rank's inbox).
+enum class AllGatherAlgorithm { flat, columns, tile_pull, tile_push };
 
 // flat (the plain two-shot): `output` a buffer, DTYPE*, of output_size_m x output_size_n at its
 // strides; every rank's share (reduce_scatter's flat walk: rows numbered row-major, a rank's share
@@ -157,6 +160,61 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         for (int k = 0; k < kPacks; ++k)
           dequantize(raw[k][i][0][0], __builtin_bit_cast(float, raw[k][i][0][1]), output[i][k]);
     }
+  }
+}
+
+// tile_pull (the pulled one-shot): every rank's copy of the tile at row offs_m and column offs_n of
+// the size_m x size_n input into `copies`, a TILE_M x kPacks tile a rank, each read from `entries[r]`,
+// where rank r published it, at strides (stride_m, stride_n): its input through the input table, or
+// its INT4 payload, decoded.
+template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, bool TAIL, typename ENTRY, int ROWS, int PACKS,
+          int ELEMS>
+DINLINE void all_gather(ENTRY (&entries)[WORLD], int64_t stride_m, int64_t stride_n, int size_m,
+                        int size_n, int clip_n, int offs_m, int offs_n,
+                        DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+  static_assert(ALGORITHM == AllGatherAlgorithm::tile_pull, "a tile from where each rank published it");
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r)
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, Layout::tile, TAIL>(
+        &entries[r], 1, 0, 0, 0, stride_m, stride_n, 1, size_m, size_n, size_m, clip_n, copies[r],
+        offs_m, offs_n, 1);
+}
+
+// tile_push (the pushed one-shot): every rank's copy of a tile into `copies`, out of this rank's
+// inbox, slot r rank r's. Exact: this rank's tile, `mine`, sent now into slot [rank] of every
+// rank's inbox in the unfenced region, as lines carrying each row's epoch (`epochs`), then this
+// rank's inbox polled until every line carries it: no barrier. INT4: the inbox is in the staging,
+// filled before the launch's first barrier (a line has no room for a group's scale), so its slots
+// are read and decoded.
+template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, bool TAIL, int ROWS, int PACKS, int ELEMS>
+DINLINE void all_gather(const DTYPE (&mine)[ROWS][PACKS][ELEMS], const uint32_t (&epochs)[ROWS],
+                        char* const* inbox_ptr_array, int inbox_ptr_array_size,
+                        int64_t inbox_stride_slot, int64_t inbox_stride_m, int64_t inbox_stride_n,
+                        int inbox_size_slot, int inbox_size_m, int inbox_size_n, int clip_m,
+                        int clip_n, int offs_m, int offs_n, int rank, uint32_t* status_ptr,
+                        int64_t status_stride_field, int status_size_field, uint64_t timeout_ticks,
+                        DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+  static_assert(ALGORITHM == AllGatherAlgorithm::tile_push, "a tile out of this rank's inbox");
+  if constexpr (QUANTIZE_INT4) {
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile, TAIL>(
+        inbox_ptr_array, inbox_ptr_array_size, rank, 0, inbox_stride_slot, inbox_stride_m,
+        inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m, clip_n, copies,
+        offs_m, offs_n, 1);
+  } else {
+    // No branch on a runtime rank between the sends (one serialized the remote stores).
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r)
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(
+          mine, inbox_ptr_array, inbox_ptr_array_size, r, rank, inbox_stride_slot,
+          inbox_stride_m, inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m,
+          clip_n, offs_m, offs_n, 1, epochs);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(
+        inbox_ptr_array, inbox_ptr_array_size, rank, 0, inbox_stride_slot, inbox_stride_m,
+        inbox_stride_n, inbox_size_slot, inbox_size_m, inbox_size_n, clip_m, clip_n, copies,
+        offs_m, offs_n, 1, epochs, status_ptr, status_stride_field, status_size_field,
+        timeout_ticks);
   }
 }
 
