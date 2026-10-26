@@ -167,10 +167,10 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                     ("true", "false") if plain and two_shot else ("false",)
                 ):
                     for chunked in ("false",) if plain else ("true", "false"):
-                        # (tail, enable_int4): an INT4 two-shot with a tail or not; the plain
+                        # (tail, quantize_int4): an INT4 two-shot with a tail or not; the plain
                         # all-reduce's INT4 build also launched exact (its exact instance, the
                         # exact build's at that shape); a fused op's INT4 build always moves INT4.
-                        for tail, enable_int4 in (
+                        for tail, quantize_int4 in (
                             (("true", "true"), ("false", "true"), ("false", "false"))
                             if q == "int4" and plain
                             else (("true", "true"), ("false", "true"))
@@ -193,7 +193,7 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                                 "C.contiguous": contiguous,
                                 "C.chunked": chunked,
                                 "C.tail": tail,
-                                "C.enable_int4": enable_int4,
+                                "C.quantize_int4": quantize_int4,
                             }
                             got = ", ".join(values[a.strip()] for a in args.split(","))
                             if f"{kernel}<{got}>" not in out:
