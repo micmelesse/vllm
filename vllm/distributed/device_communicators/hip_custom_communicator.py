@@ -19,7 +19,7 @@ force one, for the tuner and
 the tests: every one or none. C++ takes every field of every call, checks the config,
 and answers -1 or the Error it refused it for: it holds no table and picks nothing.
 
-THE MEMORY (C++'s `Handle`): the communicator's arena is one allocation per rank,
+THE MEMORY (C++'s `communicator_state`): the communicator's arena is one allocation per rank,
 which every rank opened at open over legacy HIP IPC. Every exact call reads every
 rank's input IN PLACE through an input table (aiter's gfx950 pattern): a captured
 call's tensors, registered when `capture()` exits (one exchange of their IPC handles
@@ -530,7 +530,7 @@ def last_log() -> Log | None:
 # ---- ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"): a process should
 # not die holding its peers' memory open, nor free its own while they read it. So an
 # exit, SIGTERM and SIGINT tear every open communicator down ALONE (C++'s
-# `Handle::abandon`): every wait told to leave, the device given a bounded wait, every
+# `abandon_state`): every wait told to leave, the device given a bounded wait, every
 # BORROWED peer IPC mapping closed, then our own arena freed once the device finished,
 # each step in the state log.
 # It never waits on a peer: one may be dead. C++ also runs it from its own process-exit
@@ -2652,7 +2652,7 @@ class HipCustomCommunicator:
         A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
         every rank's device finishes, a handshake over the CPU group, every rank
         closes its peers' IPC mappings, a second handshake, then each frees its own
-        (C++'s `Handle::close`; each step a `ClosePhase` in `log()`). Each handshake
+        (C++'s `close_state`; each step a `ClosePhase` in `log()`). Each handshake
         is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
         costs at most that, never a hang: the failed handshake is logged and the
         teardown carries on alone. Ordering that matters is the caller's -- close

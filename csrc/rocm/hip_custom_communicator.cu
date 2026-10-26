@@ -33,10 +33,10 @@
 #include "hip_custom_communicator/hip_custom_communicator.cuh"
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. `Handle` (handle.cuh) is a stateful C++ object and a
+// THE TORCH OP BOUNDARY. `communicator_state` (hip_custom_communicator.cuh) is a C++ struct and a
 // torch op is a free function over schema types, so the object crosses as an
 // opaque pointer -- the same `fptr_t = int64_t` vLLM's custom all-reduce and
-// quick-reduce use. The IPC handles never cross: the Handle gathers them over
+// quick-reduce use. The IPC handles never cross: open_state gathers them over
 // the process group this boundary resolves by name.
 // =================================================================================
 
@@ -79,7 +79,7 @@ std::vector<std::string> all_gathered(const ProcessGroupPtr& pg,
   return got;
 }
 
-// THE HANDLE'S COLLECTIVE, over `pg`: what the IPC handles go round in.
+// THE OPEN'S COLLECTIVE, over `pg`: what the IPC handles go round in.
 hip_custom_communicator::Gather gather_over(const ProcessGroupPtr& pg) {
   return [pg](const std::string& mine) { return all_gathered(pg, mine); };
 }
@@ -88,7 +88,7 @@ hip_custom_communicator::Gather gather_over(const ProcessGroupPtr& pg) {
 // rank arrived within `timeout_seconds` (c10d's Work::wait raises past it) and
 // false when one did not or the group failed. Bounded, so a dead peer cannot
 // hang a close.
-hip_custom_communicator::Handle::Barrier barrier_over(const ProcessGroupPtr& pg,
+hip_custom_communicator::Barrier barrier_over(const ProcessGroupPtr& pg,
                                                       double timeout_seconds) {
   return [pg, timeout_seconds]() {
     try {
@@ -108,11 +108,11 @@ hip_custom_communicator::Handle::Barrier barrier_over(const ProcessGroupPtr& pg,
 }  // namespace
 
 namespace {
-// THE HANDLE CROSSES TORCH AS AN INT (a schema has no object type), as vLLM's
+// THE STATE CROSSES TORCH AS AN INT (a schema has no object type), as vLLM's
 // custom all-reduce passes its own: hip_custom_communicator_init returns it,
 // every op takes it first.
-hip_custom_communicator::Handle& handle_of(fptr_t handle_ptr) {
-  return *reinterpret_cast<hip_custom_communicator::Handle*>(handle_ptr);
+hip_custom_communicator::communicator_state& handle_of(fptr_t handle_ptr) {
+  return *reinterpret_cast<hip_custom_communicator::communicator_state*>(handle_ptr);
 }
 
 hip_custom_communicator::DType dtype_of(const torch::Tensor& t) {
@@ -240,11 +240,19 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
     return refused(*e);
   const auto sizes =
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
-  auto* handle = new hip_custom_communicator::Handle(
+  // AN OPEN THAT THROWS frees what it made (borrowed mappings first) and the state with it.
+  auto* handle = new hip_custom_communicator::communicator_state;
+  try {
+    hip_custom_communicator::open_state(*handle,
       (*pg)->getRank(), world, static_cast<int>(device), gather_over(*pg),
       timeout_seconds, max_rows, max_cols, sizes.staging_bytes,
       sizes.partials_bytes, static_cast<hip_custom_communicator::LogMode>(log_mode),
       static_cast<int>(rccl_ready));
+  } catch (...) {
+    hip_custom_communicator::destroy_state(*handle);
+    delete handle;
+    throw;
+  }
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -341,7 +349,7 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
   return out;
 }
 
-// THE COLLECTIVE CLOSE (Handle::close), its handshakes over the process group
+// THE COLLECTIVE CLOSE (close_state), its handshakes over the process group
 // named `cpu_group`, each bounded by `timeout_seconds`: 0, or the ClosePhase
 // that failed (the teardown carried on alone past it). A group that no longer
 // resolves fails both handshakes.
@@ -349,11 +357,11 @@ int64_t hip_custom_communicator_close(fptr_t handle_ptr,
                                       const std::string& cpu_group,
                                       double timeout_seconds) {
   const auto pg = resolved(cpu_group);
-  const hip_custom_communicator::Handle::Barrier none = [] { return false; };
-  return handle_of(handle_ptr).close(pg ? barrier_over(*pg, timeout_seconds)
+  const hip_custom_communicator::Barrier none = [] { return false; };
+  return close_state(handle_of(handle_ptr), pg ? barrier_over(*pg, timeout_seconds)
                                         : none);
 }
-// THE INPUTS A CAPTURE RECORDED REGISTERED (Handle::register_captured), a
+// THE INPUTS A CAPTURE RECORDED REGISTERED (register_captured), a
 // collective over the process group named `cpu_group`: every rank calls it
 // when its capture exits. 0, or 1 when the ranks recorded different counts
 // (nothing registered), or 2 when the group no longer resolves.
@@ -361,18 +369,20 @@ int64_t hip_custom_communicator_register_captured(fptr_t handle_ptr,
                                                   const std::string& cpu_group) {
   const auto pg = resolved(cpu_group);
   if (!pg) return 2;
-  return handle_of(handle_ptr).register_captured(gather_over(*pg)) ? 0 : 1;
+  return register_captured(handle_of(handle_ptr), gather_over(*pg)) ? 0 : 1;
 }
 
-// EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS ABANDONED (Handle::abandon):
+// EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS ABANDONED (abandon_state):
 // for an exit, a signal, an error path. Never waits on a peer; waits at most
-// `wait_seconds` a handle for its device.
+// `wait_seconds` a communicator for its device.
 void hip_custom_communicator_abandon_all(double wait_seconds) {
-  hip_custom_communicator::Handle::abandon_all(wait_seconds);
+  hip_custom_communicator::abandon_all(wait_seconds);
 }
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr) {
-  delete &handle_of(handle_ptr);
+  auto* handle = &handle_of(handle_ptr);
+  hip_custom_communicator::destroy_state(*handle);
+  delete handle;
 }
 
 // THE STATUS AS PYTHON READS IT, every field in StatusField's order, `elapsed`
@@ -380,7 +390,7 @@ void hip_custom_communicator_dispose(fptr_t handle_ptr) {
 // waits on the device.
 std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr) {
   using hip_custom_communicator::StatusField;
-  const auto words = handle_of(handle_ptr).status();
+  const auto words = read_status(handle_of(handle_ptr));
   const auto word = [&](StatusField s) { return words[static_cast<int>(s)]; };
   const auto as_int = [](uint32_t w) {
     return static_cast<int64_t>(static_cast<int32_t>(w));
@@ -401,25 +411,25 @@ std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr) {
 // finished.
 std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr) {
   std::vector<int64_t> flat;
-  for (const auto& f : handle_of(handle_ptr).signals())
+  for (const auto& f : read_signals(handle_of(handle_ptr)))
     flat.insert(flat.end(), f.begin(), f.end());
   return flat;
 }
 std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr) {
   std::vector<uint32_t> words;
   if (handle_ptr != 0) {
-    words = handle_of(handle_ptr).log_words();
+    words = handle_of(handle_ptr).log->words();
   } else if (const auto log = hip_custom_communicator::last_log()) {
     words = log->words();
   }
   return std::vector<int64_t>(words.begin(), words.end());
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) {
-  handle_of(handle_ptr).abort();
+  abort_waits(handle_of(handle_ptr));
 }
 std::string hip_custom_communicator_guards_broken(fptr_t handle_ptr) {
   HIP_CHECK(hipDeviceSynchronize());
-  return handle_of(handle_ptr).guards_broken();
+  return guards_broken(handle_of(handle_ptr));
 }
 
 // The device clock's rate, kHz: what its ticks are per ms.
