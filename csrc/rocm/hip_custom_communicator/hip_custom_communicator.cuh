@@ -4019,7 +4019,7 @@ inline std::variant<Config, Error> all_reduce(
         h.status_size_field(), h.rank(), h.timeout_ticks());
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4033,11 +4033,9 @@ inline std::variant<Config, Error> all_reduce(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4142,7 +4140,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4156,11 +4154,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4277,7 +4273,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_add_rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4291,11 +4287,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4459,7 +4453,7 @@ all_reduce_add_attn_res_rms_norm(
         output_eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_add_attn_res_rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4473,11 +4467,9 @@ all_reduce_add_attn_res_rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4543,7 +4535,7 @@ inline std::variant<Config, Error> rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4557,11 +4549,9 @@ inline std::variant<Config, Error> rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4632,7 +4622,7 @@ inline std::variant<Config, Error> add_rms_norm(
         static_cast<int>(residual_output_size_m), static_cast<int>(residual_output_size_n), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of add_rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4646,11 +4636,9 @@ inline std::variant<Config, Error> add_rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -4750,7 +4738,7 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
         eps, output_eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of add_attn_res_rms_norm after it: no write past a region (the guards), no
-    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    // fault, every output finite where the input is.
     if (h.checked()) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
@@ -4764,11 +4752,9 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
             status[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: a fault or an "
                                    "abort in the status");
-        for (const auto& flag : h.signals())
-          if (flag[3] != static_cast<int64_t>(FlagState::clear))
-            throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: a signal left "
-                                     "set (parity " + std::to_string(flag[0]) + ", block " +
-                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
+        // launch sets its first barrier's flags here before this rank looks): the caller's, between
+        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),

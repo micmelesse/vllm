@@ -2928,7 +2928,8 @@ class HipCustomCommunicator:
         (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1), for launches it could not check itself: a
         CUDA graph's replays (`what` names them). Every launch on the device finished, then no
         write past a region of this rank's arena (its guards), no fault or abort in its status,
-        every signal clear. Raises RuntimeError naming the first that fails."""
+        every signal clear (read between two barriers of every rank: a collective, every rank
+        calls it). Raises RuntimeError naming the first that fails."""
         if self._handle is None:
             return
         broken = torch.ops._rocm_C.hip_custom_communicator_guards_broken(self._handle)
@@ -2937,7 +2938,12 @@ class HipCustomCommunicator:
         status = self.status()
         if status.abort or status.fault is not None:
             raise RuntimeError(f"hip_custom_communicator after {what}: {status}")
+        # EVERY SIGNAL CLEAR once every rank finished and none started its next launch: read
+        # between two barriers of every rank (a faster peer's next launch would set its first
+        # barrier's flags here: the tests' _assert_clean).
+        torch.distributed.barrier(group=self.cpu_group)
         left = [f for f in self.signals() if f.state is not FlagState.clear]
+        torch.distributed.barrier(group=self.cpu_group)
         if left:
             raise RuntimeError(
                 f"hip_custom_communicator after {what}: {len(left)} signals left set, "
