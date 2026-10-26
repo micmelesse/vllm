@@ -1080,7 +1080,10 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
 # came timing the fused add-RMSNorm's large-size candidates (2026-10-26T00-10-51Z, 00-29-16Z,
 # 00-45-50Z), sizes no correctness test had run. Run it on a build with the device's bounds checks
 # compiled in (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEVICE_CHECKS=1) to trap a stray access where it is.
-AT_SIZE = ((2048, HIDDEN), (4096, HIDDEN), (8192, LATENT))
+# 4096 x LATENT: the pair two crashes came at (the pushed two-shot, 1024 threads, 2 waves a EU,
+# 2026-10-26T00-45-50Z and 01-08-58Z: an uncorrectable ATHUB error on one GPU, then the driver's
+# metrics read oopsing the host); first, so a run that stops stops there.
+AT_SIZE = ((4096, LATENT), (2048, HIDDEN), (4096, HIDDEN), (8192, LATENT))
 
 
 def _table_configs(kernel: str) -> list[Config]:
