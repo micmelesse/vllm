@@ -191,7 +191,7 @@ DINLINE void all_reduce_two_shot_pull(
   // PULL TWO-SHOT: reduce-scatter (barrier; this rank's share of every rank's input, exact read in
   // place through the input table, INT4 quantized by its owner into its staging, summed into this
   // rank's partials; barrier), then all-gather.
-  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, Algorithm::two_shot_pull, TAIL>(
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, ReduceScatterAlgorithm::flat_pull, TAIL>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -199,7 +199,7 @@ DINLINE void all_reduce_two_shot_pull(
       partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, TAIL>(
+  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, AllGatherAlgorithm::flat, TAIL>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
       input_size_m, input_size_n, 0, 0, 0, rank);
@@ -437,7 +437,7 @@ DINLINE void all_reduce_two_shot_push(
   // PUSH TWO-SHOT: reduce-scatter (each rank's share pushed into that rank's inbox at slot [rank],
   // barrier, the inbox summed into this rank's partials, barrier), then all-gather. The next
   // call's first barrier keeps a rank from overwriting its partials while a peer still reads them.
-  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, Algorithm::two_shot_push, TAIL>(
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, ReduceScatterAlgorithm::flat_push, TAIL>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -445,7 +445,7 @@ DINLINE void all_reduce_two_shot_push(
       partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, Walk::flat, TAIL>(
+  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, AllGatherAlgorithm::flat, TAIL>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
       input_size_m, input_size_n, 0, 0, 0, rank);

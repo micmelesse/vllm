@@ -3,7 +3,7 @@
 //
 // THE REDUCE-SCATTER: every rank's input summed into its share, in its partials, visible to its
 // peers. Written once and called by every two-shot (all_gather.cuh walks the same walk back): a
-// function a (walk, algorithm), the walk the op's, the algorithm the caller's.
+// function a ReduceScatterAlgorithm.
 
 #pragma once
 
@@ -24,9 +24,11 @@ namespace hip_custom_communicator {
 // CONTIGUOUS (the input's rows back to back, so a share is one run) is a template parameter
 // chosen on the host: a strided buffer divides each pack's row and column out (element_at).
 
-// HOW THE COLLECTIVES WALK: flat (above), or rows, a rank's columns of every row (the fused ops:
-// a norm needs a whole row on one rank).
-enum class Walk : int { flat = 0, rows = 1 };
+// WHICH REDUCE-SCATTER: how it cuts the work and which way its sum goes. flat, each rank a
+// contiguous range of the flattened tensor (the plain all-reduce); columns, each rank a column slice
+// of every row (the fused ops). pull, this rank reads its share from every peer; push, every rank's
+// share is sent into its owner's inbox, summed there.
+enum class ReduceScatterAlgorithm { flat_pull, flat_push, columns_pull, columns_push };
 
 namespace internal {
 
@@ -36,10 +38,10 @@ DINLINE int flat_share_len(int r, int slice, int64_t total) {
   return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
 }
 
-// THE ROWS WALK'S ROW OF THREADS: the narrowest whole waves at least a slice's (SLICE_WAVES) that
+// THE COLUMNS WALK'S ROW OF THREADS: the narrowest whole waves at least a slice's (SLICE_WAVES) that
 // divide the block.
 template <int THREADS_PER_BLOCK, int WAVE_SIZE, int SLICE_WAVES>
-constexpr int rows_threads_n() {
+constexpr int columns_threads_n() {
   for (int t = SLICE_WAVES < THREADS_PER_BLOCK ? SLICE_WAVES : THREADS_PER_BLOCK;
        t < THREADS_PER_BLOCK; t += WAVE_SIZE)
     if (THREADS_PER_BLOCK % t == 0) return t;
@@ -378,11 +380,11 @@ DINLINE void reduce_scatter_flat_push(
   }
 }
 
-// THE ROWS WALK, PULLED (the fused ops' pull): a chunk of a row at a time, rank w's copy a
+// THE COLUMNS WALK, PULLED (the fused ops' pull): a chunk of a row at a time, rank w's copy a
 // row of threads, summed through LDS into this rank's partials.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
-DINLINE void reduce_scatter_rows_pull(
+DINLINE void reduce_scatter_columns_pull(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
     int64_t input_stride_n,
@@ -485,11 +487,11 @@ DINLINE void reduce_scatter_rows_pull(
                  status_stride_field, status_size_field, rank, timeout_ticks, Until::visible, 1);
 }
 
-// THE ROWS WALK, PUSHED (the fused ops' push): a row of threads as wide as a rank's slice of
+// THE COLUMNS WALK, PUSHED (the fused ops' push): a row of threads as wide as a rank's slice of
 // a row, every rank's pack summed in registers, the sum sent to every rank's partials.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
-DINLINE void reduce_scatter_rows_push(
+DINLINE void reduce_scatter_columns_push(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
     int64_t input_stride_n,
@@ -568,7 +570,7 @@ DINLINE void reduce_scatter_rows_push(
                  status_stride_field, status_size_field, rank, timeout_ticks, kFirst, 0);
     constexpr int kSliceWaves = (TILE_N / WORLD / kPackElems + WAVE_SIZE - 1) / WAVE_SIZE * WAVE_SIZE;
     // A row of threads: the narrowest whole waves at least the slice's that divide the block.
-    constexpr int kThreadsN = rows_threads_n<THREADS_PER_BLOCK, WAVE_SIZE, kSliceWaves>();
+    constexpr int kThreadsN = columns_threads_n<THREADS_PER_BLOCK, WAVE_SIZE, kSliceWaves>();
     constexpr int kThreadsM = THREADS_PER_BLOCK / kThreadsN;  // rows of threads at once
     using Summed = std::conditional_t<QUANTIZE_INT4, float, DTYPE>;
     const int offs_n = col0 * kPackElems;
@@ -662,10 +664,9 @@ DINLINE void reduce_scatter_rows_push(
 }  // namespace internal
 
 // THE REDUCE-SCATTER: [push or stage] barrier, the sum, barrier. After the second barrier every
-// rank's sums are in the partials and every peer is done reading. ALGORITHM the caller's two-shot
-// (two_shot_pull, two_shot_push), WALK the op's.
+// rank's sums are in the partials and every peer is done reading.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, Walk WALK, int ALGORITHM, bool TAIL,
+          bool QUANTIZE_INT4, bool CONTIGUOUS, ReduceScatterAlgorithm ALGORITHM, bool TAIL,
           typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr,
@@ -702,7 +703,7 @@ DINLINE void reduce_scatter(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
-  if constexpr (WALK == Walk::flat && ALGORITHM == Algorithm::two_shot_pull)
+  if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_pull)
     internal::reduce_scatter_flat_pull<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -712,7 +713,7 @@ DINLINE void reduce_scatter(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (WALK == Walk::flat && ALGORITHM == Algorithm::two_shot_push)
+  else if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_push)
     internal::reduce_scatter_flat_push<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -721,8 +722,8 @@ DINLINE void reduce_scatter(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (WALK == Walk::rows && ALGORITHM == Algorithm::two_shot_pull)
-    internal::reduce_scatter_rows_pull<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+  else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_pull)
+    internal::reduce_scatter_columns_pull<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -731,8 +732,8 @@ DINLINE void reduce_scatter(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (WALK == Walk::rows && ALGORITHM == Algorithm::two_shot_push)
-    internal::reduce_scatter_rows_push<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+  else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_push)
+    internal::reduce_scatter_columns_push<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,

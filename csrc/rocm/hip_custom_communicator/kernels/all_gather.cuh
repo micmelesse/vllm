@@ -14,19 +14,23 @@
 
 namespace hip_custom_communicator {
 
-// WALK::flat (the plain two-shot): `output` a buffer, DTYPE*, of output_size_m x output_size_n at its
+// WHICH ALL-GATHER, the reduce-scatter's cut walked back: flat, each rank's contiguous range of the
+// flattened tensor; columns, each pack from the rank owning its columns.
+enum class AllGatherAlgorithm { flat, columns };
+
+// flat (the plain two-shot): `output` a buffer, DTYPE*, of output_size_m x output_size_n at its
 // strides; every rank's share (reduce_scatter's flat walk: rows numbered row-major, a rank's share
 // one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy kLanes = THREADS_PER_BLOCK /
 // WORLD threads (rotated, rank + w). int4: a group a thread, each block the contiguous range of
 // groups reduce_scatter's same block summed, a rank a row of threads, decoded and stored.
 //
-// WALK::rows (the fused ops' pull): `output` a thread's tile, ROWS x K packs from row offs_m and
+// columns (the fused ops' pull): `output` a thread's tile, ROWS x K packs from row offs_m and
 // column offs_n of the output_size_m x output_size_n tensor (output's strides unused): each pack
 // from the rank owning its columns, slice_n columns a rank (the last rank's to the end), the
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool QUANTIZE_INT4, bool CONTIGUOUS, Walk WALK, bool TAIL, typename OUTPUT>
+          int PACK_BYTES, bool QUANTIZE_INT4, bool CONTIGUOUS, AllGatherAlgorithm ALGORITHM, bool TAIL, typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
                         int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
@@ -34,7 +38,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
                         int offs_n, int slice_n, int rank) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
-  if constexpr (WALK == Walk::flat) {
+  if constexpr (ALGORITHM == AllGatherAlgorithm::flat) {
     // A rank's share is slot r of the output viewed flat (stride `slice` elements: common.cuh's
     // Layout run / flat), as reduce_scatter's.
     DTYPE* const output_ptr = output;
