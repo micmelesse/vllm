@@ -515,49 +515,36 @@ DINLINE void all_reduce_two_shot_push(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
-  // PUSH TWO-SHOT. Exact runs a band of partials_size_m rows a pass, so any size fits.
-  if constexpr (QUANTIZE_INT4) {
-    // The INT4 payloads live inside the staging and the partials (common.cuh's INT4 layout).
-    // 1-3. Quantize each rank's share into that rank's inbox at slot [rank], barrier, sum this
-    //      rank's inbox into its partials, barrier.
-    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::int4, CONTIGUOUS, Walk::flat, Accumulate::registers, Direction::push, Until::launched, TAIL>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+  // PUSH TWO-SHOT, a pass over a band of rows: INT4 one pass (its payloads are sized to the whole
+  // call), exact a band of partials_size_m rows a pass, so any size fits. INT4 sums in registers
+  // after an ordered first barrier; exact through LDS after a visible one.
+  constexpr int kQuantization = QUANTIZE_INT4 ? Quantization::int4 : Quantization::exact;
+  constexpr Accumulate kAccumulate = QUANTIZE_INT4 ? Accumulate::registers : Accumulate::lds;
+  constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::visible;
+  const auto pass = [&](const int r0, const int band) {
+    // 1-3. Push each rank's share of the band into that rank's inbox at slot [rank] (INT4:
+    //      quantized), barrier, sum this rank's inbox into its partials, barrier.
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, kQuantization, CONTIGUOUS, Walk::flat, kAccumulate, Direction::push, kFirst, TAIL>(
+        input_ptr, input_stride_m, input_stride_n, band, input_size_n,
         static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
         staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
         partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-          signals_stride_writer, signals_size_parity, signals_size_block,
-          signals_size_writer, status_ptr, status_stride_field, status_size_field, 0, rank,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank,
         timeout_ticks);
-
-    // 4. All-gather. The next call's first barrier keeps a rank from overwriting its partials
-    //    while a peer still reads them.
-    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::int4, CONTIGUOUS, Walk::flat, TAIL>(
+    // 4. All-gather: every rank's share out of its partials into the output. The next call's
+    //    first barrier keeps a rank from overwriting its partials while a peer still reads them.
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, kQuantization, CONTIGUOUS, Walk::flat, TAIL>(
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
-        input_size_m, input_size_n, 0, 0, 0, rank);
+        partials_size_m, partials_size_n, output_ptr + r0 * output_stride_m, output_stride_m,
+        output_stride_n, band, input_size_n, 0, 0, 0, rank);
+  };
+  if constexpr (QUANTIZE_INT4) {
+    pass(0, input_size_m);
   } else {
-    for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
-      const int band =
-          min(partials_size_m, input_size_m - r0);  // this pass's rows
-      DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-      // 1-3. Push this band's shares into each rank's inbox, barrier, sum this rank's inbox
-      //      into its partials, barrier (the next band's push may then overwrite the inbox).
-      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::push, Until::visible, false>(
-          input_ptr, input_stride_m, input_stride_n, band, input_size_n,
-          static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
-          staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-          staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
-          partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-          signals_stride_writer, signals_size_parity, signals_size_block,
-          signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank,
-          timeout_ticks);
-
-      // 4. All-gather: every rank's share out of its partials into the output.
-      all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, false>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-                        partials_stride_n, partials_size_m, partials_size_n, band_output,
-                        output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
-    }
+    for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m)
+      pass(r0, min(partials_size_m, input_size_m - r0));
   }
 }
 
