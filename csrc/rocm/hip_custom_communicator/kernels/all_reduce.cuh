@@ -40,6 +40,16 @@
 
 namespace hip_custom_communicator {
 
+// THE ALL-REDUCE'S ALGORITHMS (its ALGORITHM):
+// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
+// reads numbers.
+namespace AllReduceAlgorithm {
+constexpr int one_shot_pull = 0;
+constexpr int one_shot_push = 1;
+constexpr int two_shot_pull = 2;
+constexpr int two_shot_push = 3;
+}  // namespace AllReduceAlgorithm
+
 // THE PULLED ONE-SHOT: every rank reads every rank's input through the input table and sums (aiter's
 // cross_device_reduce_1stage).
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
@@ -479,7 +489,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks) {
   // THE DISPATCH, an algorithm a function; QUANTIZE_INT4 (the host's, from the config's quantization
   // and quantize_from_bytes) whether this launch moves INT4.
-  if constexpr (ALGORITHM == Algorithm::one_shot_pull)
+  if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
     all_reduce_one_shot_pull<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, output_ptr,
@@ -487,7 +497,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (ALGORITHM == Algorithm::two_shot_pull)
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_pull)
     all_reduce_two_shot_pull<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, output_ptr,
@@ -497,7 +507,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (ALGORITHM == Algorithm::one_shot_push)
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
     all_reduce_one_shot_push<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, output_ptr,
         output_stride_m, output_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -508,7 +518,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_ptr_array_size, signals_stride_parity, signals_stride_block, signals_stride_writer,
         signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
         status_stride_field, status_size_field, rank, timeout_ticks);
-  else if constexpr (ALGORITHM == Algorithm::two_shot_push)
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_push)
     all_reduce_two_shot_push<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, output_ptr,
         output_stride_m, output_stride_n, partials_ptr_array, partials_ptr_array_size,

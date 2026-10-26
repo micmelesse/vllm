@@ -84,22 +84,6 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // 2026-10-16T03-10-32Z).
 // =================================================================================================
 
-// =================================================================================================
-// THE ALGORITHM: what an op's one kernel is built to do, its ALGORITHM template parameter (each op
-// file's `if constexpr` over it), the host's config field of the same name; exactly the variants
-// that exist. A one-shot reads every peer's whole input; a two-shot reduce-scatters, then gathers;
-// each pulled (a rank reads what it needs from its peers) or pushed (its peers store it in); rows
-// reads this rank's rows alone, no peer (a norm op's kernel, which Python runs after our
-// all-reduce). A template int, as QUANTIZE_INT4 is (a kernel's demangled name reads numbers).
-// =================================================================================================
-namespace Algorithm {
-constexpr int one_shot_pull = 0;
-constexpr int one_shot_push = 1;
-constexpr int two_shot_pull = 2;
-constexpr int two_shot_push = 3;
-constexpr int rows = 4;
-}  // namespace Algorithm
-
 constexpr int kInt4Group = 32;           // elements a group
 constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's values
 constexpr int kInt4WordBytes = 4;        // a pack's values

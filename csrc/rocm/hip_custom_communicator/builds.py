@@ -49,7 +49,7 @@ FIELDS = (
     "pack_bytes",
 )
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
-# THE ALGORITHMS, as common.cuh names them and numbers them (its template ints).
+# THE ALGORITHMS, as the host names them and numbers them (Algorithm: a kernel's ALGORITHM int).
 ALGORITHM_VALUES = {"one_shot_pull": 0, "one_shot_push": 1, "two_shot_pull": 2,
                     "two_shot_push": 3, "rows": 4}
 
@@ -136,7 +136,7 @@ def algorithms(host: str) -> dict[str, list[str]]:
     op file has), by kernel."""
     out = {}
     for m in re.finditer(r"constexpr int kAlgorithms_(\w+)\[\] = \{(.*?)\};", host, re.S):
-        out[m.group(1)] = re.findall(r"Algorithm::(\w+)", m.group(2))
+        out[m.group(1)] = re.findall(r"\w*Algorithm::(\w+)", m.group(2))
     return out
 
 
@@ -245,7 +245,7 @@ def main() -> None:
         + "}, \"builds.py's dtypes are not the host's\");",
         "static_assert("
         + " && ".join(f"Algorithm::{a} == {v}" for a, v in ALGORITHM_VALUES.items())
-        + ", \"builds.py's algorithms are not common.cuh's\");",
+        + ", \"builds.py's algorithms are not the host's\");",
         "",
     ]
     files = []

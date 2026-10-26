@@ -75,6 +75,19 @@ constexpr int exact = 0;
 constexpr int int4 = 1;
 }  // namespace Quantization
 
+// WHAT A KERNEL IS BUILT TO DO, the host's names for it: a config's `algorithm` field. A one-shot
+// reads every peer's whole input; a two-shot reduce-scatters, then gathers; each pulled (a rank
+// reads what it needs from its peers) or pushed (its peers store it in); rows reads this rank's
+// rows alone, no peer (a norm op's kernel, run after our all-reduce). The host passes it as is to
+// a kernel's ALGORITHM, which each op file names for itself (AllReduceAlgorithm, ...).
+namespace Algorithm {
+constexpr int one_shot_pull = 0;
+constexpr int one_shot_push = 1;
+constexpr int two_shot_pull = 2;
+constexpr int two_shot_push = 3;
+constexpr int rows = 4;
+}  // namespace Algorithm
+
 // =================================================================================================
 // HARDWARE
 //
@@ -300,7 +313,7 @@ constexpr const char* to_string(Where w) {
 
 // THE VOCABULARY, every type the tables and the handle name: why a call
 // cannot run (`Error`), what is tuned and forced (`Template`, and each family's
-// build, `KernelConfig`, its algorithm common.cuh's `Algorithm`), and what a caller
+// build, `KernelConfig`, its algorithm an `Algorithm`), and what a caller
 // asks for (`OpType`). `DType` is common.cuh's; what
 // runs (`Config`) is config.cuh's.
 
@@ -422,7 +435,7 @@ constexpr const char* to_string(Error e) {
 }
 
 // EVERY `__global__` TEMPLATE THERE IS, ONE AN OP, named for what it computes: each op's one
-// kernel, a family of instances, one per set of template arguments. Its ALGORITHM (common.cuh's
+// kernel, a family of instances, one per set of template arguments. Its ALGORITHM (an
 // `Algorithm`: a one-shot or a two-shot, pulled or pushed, or rows) is a template parameter and a
 // build's field, as its tile is: the algorithms a kernel has a body for are listed beside it
 // (kAlgorithms_<kernel>, below).
@@ -970,17 +983,37 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 
 // EACH KERNEL'S ALGORITHMS, in its op file's order: the bodies its template compiles, and what
 // builds.py builds every shape of the tuned table at (it reads these lists, so they are one list).
-constexpr int kAlgorithms_all_reduce[] = {Algorithm::one_shot_pull, Algorithm::two_shot_pull,
-                                          Algorithm::one_shot_push, Algorithm::two_shot_push};
-constexpr int kAlgorithms_all_reduce_rms_norm[] = {
-    Algorithm::one_shot_pull, Algorithm::two_shot_pull, Algorithm::two_shot_push};
+constexpr int kAlgorithms_all_reduce[] = {
+    AllReduceAlgorithm::one_shot_pull, AllReduceAlgorithm::two_shot_pull,
+    AllReduceAlgorithm::one_shot_push, AllReduceAlgorithm::two_shot_push};
+constexpr int kAlgorithms_all_reduce_rms_norm[] = {AllReduceRmsNormAlgorithm::one_shot_pull,
+                                                   AllReduceRmsNormAlgorithm::two_shot_pull,
+                                                   AllReduceRmsNormAlgorithm::two_shot_push};
 constexpr int kAlgorithms_all_reduce_add_rms_norm[] = {
-    Algorithm::one_shot_pull, Algorithm::two_shot_pull, Algorithm::two_shot_push};
+    AllReduceAddRmsNormAlgorithm::one_shot_pull, AllReduceAddRmsNormAlgorithm::two_shot_pull,
+    AllReduceAddRmsNormAlgorithm::two_shot_push};
 constexpr int kAlgorithms_all_reduce_add_attn_res_rms_norm[] = {
-    Algorithm::one_shot_pull, Algorithm::two_shot_pull, Algorithm::two_shot_push};
+    AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull,
+    AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull,
+    AllReduceAddAttnResRmsNormAlgorithm::two_shot_push};
 constexpr int kAlgorithms_rms_norm_rows[] = {Algorithm::rows};
 constexpr int kAlgorithms_add_rms_norm_rows[] = {Algorithm::rows};
 constexpr int kAlgorithms_add_attn_res_rms_norm_rows[] = {Algorithm::rows};
+
+// A KERNEL'S ALGORITHM IS THE HOST'S, PASSED AS IS: each op file's names number as Algorithm's.
+static_assert(AllReduceAlgorithm::one_shot_pull == Algorithm::one_shot_pull &&
+              AllReduceAlgorithm::one_shot_push == Algorithm::one_shot_push &&
+              AllReduceAlgorithm::two_shot_pull == Algorithm::two_shot_pull &&
+              AllReduceAlgorithm::two_shot_push == Algorithm::two_shot_push);
+static_assert(AllReduceRmsNormAlgorithm::one_shot_pull == Algorithm::one_shot_pull &&
+              AllReduceRmsNormAlgorithm::two_shot_pull == Algorithm::two_shot_pull &&
+              AllReduceRmsNormAlgorithm::two_shot_push == Algorithm::two_shot_push);
+static_assert(AllReduceAddRmsNormAlgorithm::one_shot_pull == Algorithm::one_shot_pull &&
+              AllReduceAddRmsNormAlgorithm::two_shot_pull == Algorithm::two_shot_pull &&
+              AllReduceAddRmsNormAlgorithm::two_shot_push == Algorithm::two_shot_push);
+static_assert(AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull == Algorithm::one_shot_pull &&
+              AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull == Algorithm::two_shot_pull &&
+              AllReduceAddAttnResRmsNormAlgorithm::two_shot_push == Algorithm::two_shot_push);
 
 // What each template is, in Template's order: its op, its algorithms, and its builds.
 struct TemplateInfo {

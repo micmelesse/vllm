@@ -16,6 +16,15 @@
 
 namespace hip_custom_communicator {
 
+// THE ALL-REDUCE-ADD-ATTNRES-RMSNORM'S ALGORITHMS (its ALGORITHM):
+// numbered as the host's Algorithm, which the host passes as is. Ints: a kernel's demangled name
+// reads numbers.
+namespace AllReduceAddAttnResRmsNormAlgorithm {
+constexpr int one_shot_pull = 0;
+constexpr int two_shot_pull = 2;
+constexpr int two_shot_push = 3;
+}  // namespace AllReduceAddAttnResRmsNormAlgorithm
+
 // =============================================================================
 // all_reduce_pull_one_shot_add_attn_res_rms_norm
 //
@@ -98,10 +107,8 @@ namespace hip_custom_communicator {
 // partials' INT4 payload.
 
 // =============================================================================
-// all_reduce_add_attn_res_rms_norm: THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM, ONE KERNEL: its ALGORITHM (common.cuh's Algorithm) is a
-// template parameter, and each algorithm it is built for (pull one-shot, pull two-shot, push two-shot) is its own
-// body under `if constexpr`, as its section above says. An algorithm it has no body for does not
-// compile.
+// all_reduce_add_attn_res_rms_norm: THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM, ONE KERNEL: its ALGORITHM (AllReduceAddAttnResRmsNormAlgorithm) is a
+// template parameter, each algorithm its own body under `if constexpr`.
 // =============================================================================
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool QUANTIZE_INT4, int ALGORITHM,
@@ -142,7 +149,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
-  if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
+  if constexpr (ALGORITHM == AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_attn_res_rms_norm, above).
     // EXACT ALONE: an INT4 build of it compiles this exact body, which never runs (the host refuses
     // an INT4 call of it by name, quantization_not_supported).
@@ -228,7 +235,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks, Until::read, 1);
-  } else if constexpr (ALGORITHM == Algorithm::two_shot_pull) {
+  } else if constexpr (ALGORITHM == AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot_add_attn_res_rms_norm, above).
     if constexpr (QUANTIZE_INT4) {
       static_assert(TILE_M == 1, "the INT4 build is a row a block");
@@ -485,7 +492,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_add_attn_res_rms_norm, above).
-    static_assert(ALGORITHM == Algorithm::two_shot_push,
+    static_assert(ALGORITHM == AllReduceAddAttnResRmsNormAlgorithm::two_shot_push,
                   "all_reduce_add_attn_res_rms_norm: no body for this algorithm");
     // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
     // INT4 payload layout): found from each region's own sizes where read or
