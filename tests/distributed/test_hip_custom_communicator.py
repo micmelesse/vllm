@@ -41,8 +41,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Error,
     FlagState,
     HipCustomCommunicator,
-    LogKind,
-    LogMode,
     Op,
     Open,
     Quantization,
@@ -53,8 +51,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     build_info,
     check_table,
     get_nearest_pick,
-    last_log,
-    open_handle,
     picked_configs,
     supported,
 )
@@ -163,20 +159,16 @@ def _tolerance(dtype: torch.dtype, normed: bool) -> Tolerance:
 # --------------------------------------------------------------------------------
 
 
-# This rank's communicator once open, for the state log a failure or a hang prints.
+# This rank's communicator once open, for the status a failure or a hang prints.
 _COMM: HipCustomCommunicator | None = None
 
 
 def _state_log(rank: int) -> str:
-    """This rank's state log as text: its communicator's, or, before one is open,
-    the last log this process made (an open that failed or still runs)."""
+    """This rank's communicator's status as text (its abort and its fault), or that none
+    is open yet."""
     if _COMM is not None:
-        return f"rank {rank}: {_COMM._log_text()}"
-    try:
-        got = last_log()
-    except RuntimeError as e:
-        return f"rank {rank}: no state log: {e}"
-    return f"rank {rank}: {got if got is not None else 'no state log made yet'}"
+        return f"rank {rank}: {_COMM.status()}"
+    return f"rank {rank}: no communicator open yet"
 
 
 def _dump_on_signal(rank: int) -> None:
@@ -218,7 +210,6 @@ def _rank_main(
     target: Callable[[HipCustomCommunicator, int], None],
     failures: "Queue[str]",
     kernel_timeout_s: float,
-    log_mode: LogMode,
     tables: TunedTables | None,
     debug: bool,
 ) -> None:
@@ -249,7 +240,6 @@ def _rank_main(
                 timeout_seconds=kernel_timeout_s,
                 max_rows=MAX_TOKENS,
                 max_cols=HIDDEN,
-                log_mode=log_mode,
                 # EXACT, whatever the image bakes: the hip image sets
                 # VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION=INT4, and a call past
                 # the crossover would then be checked, lossy, against the exact
@@ -276,13 +266,12 @@ def _on_every_rank(
     target: Callable[[HipCustomCommunicator, int], None],
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
-    log_mode: LogMode = "errors",
     tables: TunedTables | None = None,
     debug: bool = False,
 ) -> None:
     """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
     by name first, `partial`), each holding a
-    communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
+    communicator sized for Kimi-K3's largest call, its
     tuned tables `tables` (None: the file's), in debug mode where `debug` (its calls
     under vLLM's cache root). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
@@ -300,7 +289,6 @@ def _on_every_rank(
                 target=target,
                 failures=failures,
                 kernel_timeout_s=kernel_timeout_s,
-                log_mode=log_mode,
                 tables=tables,
                 debug=debug,
             )
@@ -852,16 +840,13 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         for c in _built_configs("all_reduce")
         if c.algorithm == "one_shot_pull" and c.quantization == "exact"
     )
+    before = comm._next_slot
     with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay, {pulled}"):
         _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, pulled, None)
-    with _step(rank, "the capture's inputs registered, the eager inputs copied"):
-        log = comm.log()
-        assert log is not None
-        registered = [
-            r for r in log.records if r.kind is LogKind.registration and r.barrier == 1
-        ]
-        assert registered and registered[-1].seen == GRAPH_LAYERS, registered
-        assert any(r.kind is LogKind.copy_in_issued for r in log.records)
+    with _step(rank, "the capture's inputs registered"):
+        assert comm._next_slot - before == GRAPH_LAYERS, (before, comm._next_slot)
+        assert not comm._pending, comm._pending
+        assert comm._opened_inputs, "no peer's captured input was opened"
 
 
 @on_eight_gpus
@@ -873,7 +858,6 @@ def test_basic_correctness() -> None:
         _smoke_on_rank,
         process_timeout_s=SMOKE_PROCESS_TIMEOUT_S,
         kernel_timeout_s=SMOKE_KERNEL_TIMEOUT_S,
-        log_mode="everything",
     )
 
 
@@ -1827,13 +1811,6 @@ def test_debug_mode_writes_every_call_as_launched(
     assert all(x["configs"] == want for x in lines), "the forced one is the pick's"
 
 
-def test_open_refuses_a_group_no_one_registered() -> None:
-    import vllm._rocm_C  # noqa: F401
-
-    got = open_handle("no-such", "no-such", 0, KERNEL_TIMEOUT_S, MAX_TOKENS, HIDDEN)
-    assert got is Error.no_such_group
-
-
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])
 def test_supported_is_the_builds_answer(size: int) -> None:
     """This device runs exactly the worlds `build_info` says are built."""
@@ -1871,11 +1848,11 @@ def test_quantization_is_the_given_else_the_environments(
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
     opened: list[bool] = []
 
-    def fake_open_handle(*args: str | int | float) -> Error:
+    def fake_supported(*args: object) -> Error:
         opened.append(True)
-        return Error.no_such_group
+        return Error.device_not_built
 
-    monkeypatch.setattr(module, "open_handle", fake_open_handle)
+    monkeypatch.setattr(module, "supported", fake_supported)
     monkeypatch.setattr(module, "capacity_of", lambda rows, cols, world: None)
 
     class Group:
