@@ -1046,7 +1046,7 @@ constexpr bool int4_groups_a_thread(Template k, int algorithm) {
 // two-shot) where the band is not whole groups; a groups-a-thread pulled norm where a row is not;
 // a column two-shot where a row is not whole groups for every rank.
 constexpr bool int4_tail(Template k, int algorithm, int64_t m, int64_t n, int world) {
-  if (k == Template::all_reduce && algorithm == Algorithm::two_shot_push)
+  if (k == Template::all_reduce && is_two_shot(algorithm))
     return m * n % kInt4Group != 0;
   if (k == Template::all_reduce) return n % kInt4Group != 0;
   if (int4_groups_a_thread(k, algorithm)) return n % kInt4Group != 0;
@@ -1564,19 +1564,13 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
        int64_t{c.launch.grid.x} * tile_m_of(c.build) > kUnfencedBlocks))
     return Error::unfenced_too_small;
   if (!collective) return std::nullopt;
-  // THE PLAIN ALL-REDUCE'S INT4 ONE-SHOTS AND PULLED TWO-SHOT (kernels/all_reduce.cuh): the
-  // input's [m, n] INT4 payload in the staging (the pushed one-shot's, WORLD slots of it, whole
-  // kInt4ScalesAlign); the pulled two-shot's sums an [owned, n] one in the partials, a rank's rows
-  // whole tiles.
-  if (int4 && fn == Template::all_reduce && algorithm != Algorithm::two_shot_push) {
+  // THE PLAIN ALL-REDUCE'S INT4 ONE-SHOTS (kernels/all_reduce.cuh): the input's [m, n] INT4
+  // payload in the staging (the pushed one-shot's, WORLD slots of it, whole kInt4ScalesAlign).
+  if (int4 && fn == Template::all_reduce && !is_two_shot(algorithm)) {
     const int64_t payload = int4_payload_bytes(m, n);
     const int64_t slot = (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-    const int64_t tile_m = tile_m_of(c.build);
-    const int64_t owned = ((m + world - 1) / world + tile_m - 1) / tile_m * tile_m;
     if ((algorithm == Algorithm::one_shot_push ? world * slot : payload) > staging_bytes)
       return Error::staging_too_small;
-    if (algorithm == Algorithm::two_shot_pull && int4_payload_bytes(owned, n) > partials_bytes)
-      return Error::partials_too_small;
     return std::nullopt;
   }
   const int64_t packs = packs_of(n, dtype, pack);
@@ -1584,7 +1578,7 @@ inline std::optional<Error> refused(bool collective, int world, int64_t staging_
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
   // most one row of the partials's elements (its every view's bound); the flat walk's
   // on its shares' own views (int4_flat_share).
-  const bool flat = fn == Template::all_reduce && algorithm == Algorithm::two_shot_push;
+  const bool flat = fn == Template::all_reduce && is_two_shot(algorithm);
   const int64_t share = int4_flat_share(m, n, world);
   const int64_t row = payload_row(fn, algorithm, Quantization::int4, n);
   if (int4 && (flat ? int4_payload_bytes(1, world * share)
@@ -1965,8 +1959,8 @@ inline std::variant<Config, Error> all_reduce_config(
   config.quantization = a.quantization;
   config.quantize_int4 = quantize_int4;
   config.pack_bytes = a.pack_bytes;  // the build's: the instance dispatch finds
-  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): the pushed two-shot's.
-  const bool int4_flat = quantize_int4 && algorithm == Algorithm::two_shot_push;
+  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): both two-shots'.
+  const bool int4_flat = quantize_int4 && is_two_shot(algorithm);
   const int64_t share = int4_flat_share(m, n, world);
   config.partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.partials_stride_n = 1;
@@ -1990,24 +1984,21 @@ inline std::variant<Config, Error> all_reduce_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = in_place;
-  // THE INT4 ONE-SHOTS' AND PULLED TWO-SHOT'S PAYLOADS (kernels/all_reduce.cuh), as bytes over the
-  // dtype's elements (what the launch's region checks read): the staging's [m, n] payload (the
-  // pushed one-shot's WORLD slots of it), and the pulled two-shot's [owned, n] sums in the
-  // partials. The kernels find them from the input's sizes.
-  if (quantize_int4 && algorithm != Algorithm::two_shot_push) {
+  // THE INT4 ONE-SHOTS' PAYLOADS (kernels/all_reduce.cuh), as bytes over the dtype's elements
+  // (what the launch's region checks read): the staging's [m, n] payload (the pushed one-shot's
+  // WORLD slots of it); no partials. The kernels find them from the input's sizes.
+  if (quantize_int4 && !is_two_shot(algorithm)) {
     const int64_t payload = int4_payload_bytes(m, n);
     const int64_t slot = (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-    const int64_t owned = ((m + world - 1) / world + a.tile_m - 1) / a.tile_m * a.tile_m;
     const int64_t staged = algorithm == Algorithm::one_shot_push ? world * slot : payload;
-    const int64_t summed = algorithm == Algorithm::two_shot_pull ? int4_payload_bytes(owned, n) : 0;
     config.staging_stride_m = 0;
     config.staging_stride_n = 1;
     config.staging_size_m = 1;
     config.staging_size_n = (staged + elem_bytes(dtype) - 1) / elem_bytes(dtype);
     config.partials_stride_m = 0;
     config.partials_stride_n = 1;
-    config.partials_size_m = summed > 0 ? 1 : 0;
-    config.partials_size_n = (summed + elem_bytes(dtype) - 1) / elem_bytes(dtype);
+    config.partials_size_m = 0;
+    config.partials_size_n = 0;
   }
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   config.tail = quantize_int4 && int4_tail(fn, algorithm, m, n, world);
