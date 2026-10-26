@@ -105,11 +105,12 @@ DINLINE void all_reduce_one_shot_pull(
   }
   // 2. Every rank's data ready and visible: INT4's written in this launch (ordered), the exact
   //    inputs before it (the launch boundaries order them).
+  constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::started;
   barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks, QUANTIZE_INT4 ? Until::launched : Until::started, 0);
+      rank, timeout_ticks, kFirst, 0);
   // 3. Every rank's tile (INT4: dequantized), summed in rank order in fp32, rounded once: every
   //    rank's sums agree bitwise.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
