@@ -1716,7 +1716,7 @@ class Handle {
   Handle& operator=(const Handle&) = delete;
 
   int rank() const { return rank_; }
-  bool checked() const { return checked_; }
+  bool checked() const { return checked_after_launch_; }
   // THIS RANK'S GUARDS, read back after a launch (the caller synchronized): "" where every word is
   // kGuardWord, else the first region whose guard changed and where.
   std::string guards_broken() const {
@@ -2090,7 +2090,7 @@ class Handle {
     // launch outside a capture synchronizes and checks what it promises after the kernel.
     {
       const char* checked = std::getenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED");
-      checked_ = checked != nullptr && std::string(checked) == "1";
+      checked_after_launch_ = checked != nullptr && std::string(checked) == "1";
     }
     {
       // THIS RANK'S SIGNALS READ ZERO after the memset, before any peer can
@@ -2414,7 +2414,7 @@ class Handle {
   std::shared_ptr<Log> log_;
   // THE ARENA'S REGIONS (`arena_layout`), fixed at construction.
   ArenaLayout layout_;
-  bool checked_ = false;  // VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED: each launch checked after
+  bool checked_after_launch_ = false;  // VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED: each launch checked after
   // KERNELS AND STREAMS BY INDEX, as the log names them (kernel_seen,
   // stream_seen): first seen, first numbered.
   std::vector<const void*> kernels_seen_;
@@ -4527,18 +4527,6 @@ inline std::variant<Config, Error> rms_norm(
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
     if (volume(config.grid) > h.signals_size_block())
       throw std::runtime_error("hip_custom_communicator rms_norm before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
@@ -4624,18 +4612,6 @@ inline std::variant<Config, Error> add_rms_norm(
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator add_rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
     if (volume(config.grid) > h.signals_size_block())
       throw std::runtime_error("hip_custom_communicator add_rms_norm before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
@@ -4746,18 +4722,6 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator add_attn_res_rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
     if (volume(config.grid) > h.signals_size_block())
       throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
