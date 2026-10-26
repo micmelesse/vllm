@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE HOST SIDE, one file: the state log, the types, the handle (the communicator's state and
-// its open), the configs (the build catalog, each op's config from a whole config point), and the
+// THE HOST SIDE, one file: the fault sites, the types, the communicator's memory (its layout;
+// Python owns the buffers), the configs (the build catalog, each op's config from a whole config point), and the
 // API (each op checks its call and its config, and launches its kernel). No table and no pick:
 // Python's (the tuned table and its lookup), handing C++ every field. The device
 // side is kernels/. Each section below was a file of its own, in this order (their includes).
@@ -706,7 +706,7 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 //     per call) cacheable (hipMalloc or torch's allocator).
 // So signals and the data peers exchange share one uncached allocation by
 // convention; aiter's one cacheable buffer is an input pool, which our inline
-// copy-in into the inputs region replaces. ONE ARENA OF EITHER KIND IS CORRECT
+// copy-in into the staging replaces. ONE ARENA OF EITHER KIND IS CORRECT
 // under our kernels' memory model, LLVM's AMDGPUUsage for memory shared across
 // agents ("Memory Model GFX942"): every flag store a system-scope atomic,
 // released (buffer_wbl2 sc0 sc1) when it publishes data; every flag wait a
@@ -726,7 +726,7 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 
 // THE ARENA'S LAYOUT, the same offsets on every rank (bytes from the arena's
-// base; `arena_layout` computes it from the sizes open is given, config.cuh's
+// base; `arena_layout` computes it from the sizes Python opens it at, config.cuh's
 // `exchange_sizes`). A signal pad, then ONE PUBLISHED REGION PER PHASE, whose
 // data peers may still read while this rank writes the next phase's:
 //
@@ -891,14 +891,15 @@ constexpr int64_t kInputTableSlots = int64_t{1} << 18;
 // 400 heavy spillers are refused.
 constexpr int64_t kScratchShares = 16;
 
-// The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
-// allocation: the signals, the inputs, the partials.
+// THE REGIONS' DEVICE ARRAYS in the private buffer, kRegionPtrArrays of kMaxRanks addresses, in
+// this order (Python's `_REGION_ARRAYS`): the signals, the staging, the partials, the scales, the
+// unfenced region.
 constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
           kUnfencedArray = 4, kRegionPtrArrays = 5;
 
 // THE PRIVATE BUFFER'S LAYOUT (byte offsets): the regions' device arrays, the pushed one-shot's
-// epochs, the input tables. 256-byte aligned each. Python allocates it (hcc_alloc), writes the
-// arrays and the tables (hcc_write_words), and frees it.
+// epochs, the input tables. 256-byte aligned each. Python allocates it
+// (hip_custom_communicator_alloc), writes the arrays and the tables (_write_words), and frees it.
 constexpr int64_t kPrivateRegionPtrArrays = 0;
 constexpr int64_t kPrivateUnfencedEpochs =
     (int64_t{kRegionPtrArrays} * kMaxRanks * int64_t{sizeof(char*)} + 255) / 256 * 256;
@@ -1916,7 +1917,7 @@ const void* kernel_pointer() {
 }
 
 inline std::variant<Config, Error> all_reduce_config(
-    int world, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
+    int world, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
     int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k, hipStream_t stream) {
@@ -1939,7 +1940,7 @@ inline std::variant<Config, Error> all_reduce_config(
   // the whole input). INT4 pushes its input's shares quantized, whole,
   // instead.
   const bool in_passes = a.quantization == Quantization::exact;
-  // THE BAND: the rows a pass, what the inbox (the inputs region) holds in
+  // THE BAND: the rows a pass, what the inbox (the staging) holds in
   // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
   // the two-shot's is one rank's share of the band (the flat walk's, whole
   // packs, rounded up), [WORLD, slot], whose band the partials also hold (a
@@ -1975,7 +1976,7 @@ inline std::variant<Config, Error> all_reduce_config(
   if (in_place && is_two_shot(algorithm) && band < 1)
     return Error::partials_too_small;
   if (in_passes && band < 1) return Error::staging_too_small;
-  // AN EAGER IN-PLACE CALL'S INPUT IS COPIED WHOLE into the inputs region
+  // AN EAGER IN-PLACE CALL'S INPUT IS COPIED WHOLE into the staging
   // (its table, INPUT TABLES); a captured one is read where it
   // is, registered at capture exit.
   if (in_place) {
@@ -2048,7 +2049,7 @@ inline std::variant<Config, Error> all_reduce_config(
 // roundings exactly. inp [rows, hidden]; the weight `weight_dtype`, dtype or
 // f32.
 inline std::variant<Config, Error> all_reduce_rms_norm_config(
-    int world, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
+    int world, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
@@ -2211,7 +2212,7 @@ all_reduce_add_rms_norm_config(
 // push's (a row a tile) have neither.
 inline std::variant<Config, Error>
 all_reduce_add_attn_res_rms_norm_config(
-    int world, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
+    int world, int64_t staging_bytes, int64_t partials_bytes, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
     int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks,
@@ -2522,7 +2523,7 @@ inline std::variant<Config, Error> all_reduce(
           layout_refused(dtype, pack_bytes_of(k.config.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
-  std::variant<Config, Error> checked = all_reduce_config(world, max_rows, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+  std::variant<Config, Error> checked = all_reduce_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
       dtype, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
@@ -2668,7 +2669,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
   if (const std::optional<Error> e =
           layout_refused(weight_dtype, pack_bytes_of(k.config.build), {{0, weight_stride_n}}))
     return *e;
-  std::variant<Config, Error> checked = all_reduce_rms_norm_config(world, max_rows, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+  std::variant<Config, Error> checked = all_reduce_rms_norm_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       weight, weight_stride_n, weight_size_n, output, output_stride_m,
       output_stride_n, output_size_m, output_size_n, dtype, weight_dtype, eps,
       k, stream);
@@ -2997,7 +2998,7 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
             dtype, pack_bytes_of(k.config.build), {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<Config, Error> checked =
-      all_reduce_add_attn_res_rms_norm_config(world, max_rows, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      all_reduce_add_attn_res_rms_norm_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
           prefix, prefix_stride_m, prefix_stride_n, prefix_size_m,
           prefix_size_n, blocks, blocks_stride_m, blocks_stride_r,
           blocks_stride_n, blocks_size_m, blocks_size_r, blocks_size_n,
@@ -3169,17 +3170,14 @@ inline std::variant<Config, Error> rms_norm(
         static_cast<T*>(output), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
+    // kernel done, every expectation of rms_norm after it: (a norm on rows
+    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
     if (checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -3247,17 +3245,14 @@ inline std::variant<Config, Error> add_rms_norm(
         static_cast<T*>(residual_output), residual_output_stride_m, residual_output_stride_n,
         static_cast<int>(residual_output_size_m), static_cast<int>(residual_output_size_n), eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of add_rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
+    // kernel done, every expectation of add_rms_norm after it: (a norm on rows
+    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
     if (checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
@@ -3354,17 +3349,14 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
         static_cast<int>(block_output_size_m), static_cast<int>(block_output_size_n), num_blocks,
         eps, output_eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of add_attn_res_rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
+    // kernel done, every expectation of add_attn_res_rms_norm after it: (a norm on rows
+    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
     if (checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
         const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
           std::vector<T> host(static_cast<size_t>(rows * cols));
           HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),

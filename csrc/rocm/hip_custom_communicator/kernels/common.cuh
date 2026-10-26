@@ -153,7 +153,7 @@ constexpr int kLineBytes = 16;
 constexpr int kLinePayloadBytes = 8;
 
 // =================================================================================================
-// THE STATUS: barrier's fault protocol, which the host reads (the handle and the state log)
+// THE STATUS: barrier's fault protocol, which the host reads (the communicator's watchdog)
 // =================================================================================================
 
 // WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's
@@ -163,7 +163,7 @@ enum class Where : uint32_t {
   peer_barrier,  // a later barrier
 };
 
-// A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it
+// A RANK'S STATUS, in HOST-MAPPED memory (the communicator's status words), so the host reads it
 // and sets `abort` while a kernel still runs, and a graph replay, which runs
 // none of our host code, still reports: a buffer of 32-bit words, one a field,
 // `status[field]` at its stride (`status_stride_field`), the field a
@@ -1345,7 +1345,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
 //
 // THE MEMORY ORDERING: the textbook one for cacheable memory shared across
 // GPUs, nothing that depends on the signals bypassing a cache, so it is correct
-// for whichever way the signals are backed (handle.cuh's kArenaMallocFlags), cached
+// for whichever way the signals are backed (hip_custom_communicator.cuh's kArenaMallocFlags), cached
 // in the owner's L2 (MTYPE RW) and, through a peer's IPC mapping, in the peer's
 // L2 (MTYPE NC), or uncached. The rules are LLVM's AMDGPU memory model (AMDGPUUsage, "Memory
 // Model GFX942" and its code-sequence table; gfx950 takes the same scope bits):

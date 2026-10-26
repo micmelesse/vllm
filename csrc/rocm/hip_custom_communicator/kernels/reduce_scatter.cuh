@@ -19,7 +19,7 @@ namespace hip_custom_communicator {
 // Accumulate) is theirs, here; types.cuh's forcing names Direction too.
 
 // THE LOADS ARE THE COMMUNICATION: a rank's pointer points into its memory,
-// opened in this process over IPC (handle.cuh), so loading reads it over the links; the sum
+// opened in this process over IPC (Python opens it), so loading reads it over the links; the sum
 // and the store are local. The kernel syncs around these calls (the barriers):
 // before, every peer's data is ready; between the reduce-scatter and the
 // all-gather, every rank's sums are visible. RANKS ARE READ ROTATED, rank + w's

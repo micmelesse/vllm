@@ -224,7 +224,7 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
 }
 
 // =================================================================================
-// THE MEMORY, Python's (pure_plan.md): allocated, exchanged, read, written and freed here, every
+// THE MEMORY, Python's: allocated, exchanged, read, written and freed here, every
 // address an int Python holds. Nothing here keeps one.
 // =================================================================================
 

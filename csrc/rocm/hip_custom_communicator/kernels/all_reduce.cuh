@@ -6,7 +6,7 @@
 // aiter's gfx950 cross_device_reduce_1stage / 2stage): ONE kernel a shape
 // reads every rank's input where the INPUT TABLE says (common.cuh's INTERFACE:
 // a captured call's registered tensors, or an eager call's copies in every
-// rank's inputs region, handle.cuh's INPUT TABLES), no copy inside the kernel.
+// rank's staging, hip_custom_communicator.cuh's INPUT TABLES), no copy inside the kernel.
 // Its inputs are never written while it runs: the one-shot ends with a `read`
 // barrier and the two-shot's second barrier follows its every read of them, so
 // when a rank's launch ends every peer is done reading its input, and the next
