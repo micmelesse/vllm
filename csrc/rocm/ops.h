@@ -53,52 +53,29 @@ void paged_attention(
     const std::string& mfma_type);
 
 // ROCm TP collectives
-// (vllm/distributed/device_communicators/hip_custom_communicator). The context
-// is a stateful object, so it crosses as an opaque handle the way custom
-// all-reduce's does.
-using fptr_t = int64_t;
-
-// Opened on `device` over the process groups named `cpu_group` and
-// `device_group`, a collective: the handle or the Error's number. The IPC
-// handles go round in C++.
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_open(const std::string& cpu_group,
-                             const std::string& device_group, int64_t device,
-                             double timeout_seconds, int64_t max_rows,
-                             int64_t max_cols, int64_t log_mode,
-                             int64_t rccl_ready);
+// (vllm/distributed/device_communicators/hip_custom_communicator). No state crosses: Python owns
+// the communicator's memory as addresses, through these, and hands every op what it reads.
+std::vector<int64_t> hip_custom_communicator_layout(int64_t max_rows, int64_t max_cols,
+                                                    int64_t world);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // partials_bytes, inputs_bytes].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t max_cols,
                                                       int64_t world);
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
-
-// The collective close, its handshakes over `cpu_group` bounded by
-// `timeout_seconds`: 0, or the ClosePhase that failed. Then dispose.
-int64_t hip_custom_communicator_close(fptr_t handle_ptr,
-                                      const std::string& cpu_group,
-                                      double timeout_seconds);
-// The inputs a capture recorded, registered over `cpu_group` (a collective,
-// at capture exit): 0, 1 the ranks' counts differ, 2 no such group.
-int64_t hip_custom_communicator_register_captured(fptr_t handle_ptr,
-                                                  const std::string& cpu_group);
-// Every open communicator torn down alone (exit, a signal): never waits on a
-// peer.
-void hip_custom_communicator_abandon_all(double wait_seconds);
-void hip_custom_communicator_dispose(fptr_t handle_ptr);
-// The rank's fault record, [where, rank, block, peer, count, want,
-// elapsed_ticks], or empty while no wait has given up; and the abort every wait
-// on the rank then leaves at.
-std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr);
-std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr);
-// The state log's every word (log.cuh): the handle's, or with 0 the last log
-// this process made (an open that failed or is still running).
-std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr);
-void hip_custom_communicator_abort(fptr_t handle_ptr);
-// THIS RANK'S GUARDS after its launches finished (every one, the caller's synchronize): "" where
-// intact, else the region a write went past and where.
-std::string hip_custom_communicator_guards_broken(fptr_t handle_ptr);
+int64_t hip_custom_communicator_alloc(int64_t bytes, bool shared);
+int64_t hip_custom_communicator_free(int64_t ptr);
+std::vector<int64_t> hip_custom_communicator_alloc_host(int64_t bytes);
+int64_t hip_custom_communicator_free_host(int64_t host);
+std::vector<int64_t> hip_custom_communicator_ipc_handle(int64_t ptr);
+int64_t hip_custom_communicator_ipc_open(const std::vector<int64_t>& handle);
+int64_t hip_custom_communicator_ipc_close(int64_t base);
+int64_t hip_custom_communicator_pointer_device(int64_t ptr);
+void hip_custom_communicator_write_words(int64_t ptr, const std::vector<int64_t>& words);
+void hip_custom_communicator_fill_words(int64_t ptr, int64_t word, int64_t count);
+std::vector<int64_t> hip_custom_communicator_read_words(int64_t ptr, int64_t count);
+std::vector<int64_t> hip_custom_communicator_read_host(int64_t host, int64_t count);
+void hip_custom_communicator_write_host(int64_t host, int64_t index, int64_t word);
 
 // A variant at the torch boundary: the arch or the Error's number, exactly one
 // set.
@@ -127,7 +104,9 @@ hip_custom_communicator_build_info();
 // number it was refused for, or -1 when it ran (hip_custom_communicator.cu's Answer).
 
 int64_t hip_custom_communicator_all_reduce(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
+    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
+    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& output,
     const std::string& kernel,
     const std::string& algorithm,
@@ -143,7 +122,9 @@ int64_t hip_custom_communicator_all_reduce(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
+    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
+    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& weight,
     torch::Tensor& output,
     double eps,
@@ -161,7 +142,9 @@ int64_t hip_custom_communicator_all_reduce_rms_norm(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
+    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
+    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& residual,
     torch::Tensor& weight,
     torch::Tensor& output,
@@ -181,7 +164,9 @@ int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
+    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
+    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
     torch::Tensor& blocks,
     torch::Tensor& norm_weight,
@@ -207,7 +192,7 @@ int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t world, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& weight,
     torch::Tensor& output,
     double eps,
@@ -225,7 +210,7 @@ int64_t hip_custom_communicator_rms_norm(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t world, bool checked_after_launch, torch::Tensor& input,
     torch::Tensor& residual,
     torch::Tensor& weight,
     torch::Tensor& output,
@@ -245,7 +230,7 @@ int64_t hip_custom_communicator_add_rms_norm(
     int64_t tile_k,
     const std::string& quantization, int64_t pack_bytes);
 int64_t hip_custom_communicator_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input,
+    int64_t world, bool checked_after_launch, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
     torch::Tensor& blocks,
     torch::Tensor& norm_weight,
