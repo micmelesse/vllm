@@ -206,9 +206,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, bool quantize) {
   // AN INT4 BUILD QUANTIZES THE CALL where its launch says (`quantize`, the tune's pick: below where
-  // quantizing pays, the call moves exact through the same kernel's exact body, below).
+  // quantizing pays, the call moves exact through the same kernel's exact body, below). THE EXACT
+  // PATH THE EXPECTED ONE: the compiler places the INT4 body's spills and hoisted loads on its own
+  // side, not at the kernel's entry, which the exact path paid (+0.15-0.2 us a call, ISA and bench
+  // 2026-10-26T12-39-35Z).
   if constexpr (ALGORITHM == Algorithm::one_shot_pull && QUANTIZATION == Quantization::int4) {
-   if (quantize) {
+   if (__builtin_expect(quantize, false)) {
     // INT4 PULL ONE-SHOT (all_reduce_pull_one_shot_int4, above): each rank quantizes its own input
     // into its staging (an [m, n] INT4 payload: an input moved INT4 is encoded by its owner, never
     // read in place), sync (ordered: every rank's payload visible), every rank's payload pulled and
@@ -335,7 +338,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks, Until::read, 1);
   } else if constexpr (ALGORITHM == Algorithm::two_shot_pull && QUANTIZATION == Quantization::int4) {
-   if (quantize) {
+   if (__builtin_expect(quantize, false)) {
     // INT4 PULL TWO-SHOT (all_reduce_pull_two_shot_int4, above): each rank quantizes its own input
     // into its staging (an [m, n] INT4 payload), sync (ordered), each rank pulls ITS ROWS of every
     // rank's payload (rank r's rows [r * kOwned, (r + 1) * kOwned), kOwned the rows a rank owns,
@@ -446,7 +449,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                         output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
     }
   } else if constexpr (ALGORITHM == Algorithm::one_shot_push && QUANTIZATION == Quantization::int4) {
-   if (quantize) {
+   if (__builtin_expect(quantize, false)) {
     // INT4 PUSH ONE-SHOT (all_reduce_push_one_shot_int4, above): each rank quantizes its own tile
     // and pushes it into slot [rank] of every rank's inbox in the staging (WORLD slots of an [m, n]
     // INT4 payload, kSlotBytes apart), sync (ordered: every rank's push visible), each rank
@@ -625,7 +628,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
     if constexpr (QUANTIZATION == Quantization::int4) {
-     if (quantize) {
+     if (__builtin_expect(quantize, false)) {
       // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
       // INT4 payload layout): the collectives find them from each region's sizes.
       // 1-3. Every rank's share of this rank's input, quantized here, into that rank's inbox payload
