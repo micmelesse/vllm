@@ -35,6 +35,8 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <cmath>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1186,6 +1188,13 @@ constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
 }
+// THE GUARDS: after each region's last used byte, up to the next region, kGuardBytes at least,
+// every word kGuardWord, written at open and never by a kernel: a write past a region (this rank's
+// or a peer's into it) changes one, and a checked launch (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED)
+// reads them after the kernel (October 26: n11 rebooted seven times timing the fused two-shots at
+// large sizes, every result right and every index inside the sizes the host passed).
+constexpr int64_t kGuardBytes = 4096;
+constexpr uint32_t kGuardWord = 0xdeadbeefu;
 struct ArenaLayout {
   int64_t signals = 0;
   int64_t staging = 0;
@@ -1193,16 +1202,27 @@ struct ArenaLayout {
   int64_t scales = 0;  // inside the partials, at their end
   int64_t unfenced = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
+  // Each region's guard, [begin, end) bytes: after the staging, after the partials and their
+  // scales, after the unfenced region.
+  int64_t staging_guard = 0, staging_guard_end = 0;
+  int64_t partials_guard = 0, partials_guard_end = 0;
+  int64_t unfenced_guard = 0, unfenced_guard_end = 0;
 };
 inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
                                 int64_t scales_bytes, int64_t unfenced_bytes) {
   ArenaLayout l;
   l.signals = 0;
   l.staging = l.signals + kSignalsRegionBytes;
-  l.partials = l.staging + region_aligned(staging_bytes);
+  l.staging_guard = l.staging + staging_bytes;
+  l.partials = region_aligned(l.staging_guard + kGuardBytes);
+  l.staging_guard_end = l.partials;
   l.scales = l.partials + partials_bytes;  // whole packs: the floats aligned
-  l.unfenced = l.partials + region_aligned(partials_bytes + scales_bytes);
-  l.end = l.unfenced + region_aligned(unfenced_bytes);
+  l.partials_guard = l.scales + scales_bytes;
+  l.unfenced = region_aligned(l.partials_guard + kGuardBytes);
+  l.partials_guard_end = l.unfenced;
+  l.unfenced_guard = l.unfenced + unfenced_bytes;
+  l.end = region_aligned(l.unfenced_guard + kGuardBytes);
+  l.unfenced_guard_end = l.end;
   return l;
 }
 
@@ -1696,6 +1716,27 @@ class Handle {
   Handle& operator=(const Handle&) = delete;
 
   int rank() const { return rank_; }
+  bool checked() const { return checked_; }
+  // THIS RANK'S GUARDS, read back after a launch (the caller synchronized): "" where every word is
+  // kGuardWord, else the first region whose guard changed and where.
+  std::string guards_broken() const {
+    for (const auto& [name, b, e] :
+         {std::tuple{"staging", layout_.staging_guard, layout_.staging_guard_end},
+          std::tuple{"partials", layout_.partials_guard, layout_.partials_guard_end},
+          std::tuple{"unfenced", layout_.unfenced_guard, layout_.unfenced_guard_end}}) {
+      std::vector<uint32_t> words(static_cast<size_t>((e - b) / 4));
+      HIP_CHECK(hipMemcpy(words.data(), arena_->base(rank_) + b, words.size() * 4,
+                          hipMemcpyDeviceToHost));
+      for (size_t i = 0; i < words.size(); ++i)
+        if (words[i] != kGuardWord)
+          return std::string("the ") + name + " guard's word " + std::to_string(i) + " of " +
+                 std::to_string(words.size()) + " is " + std::to_string(words[i]) +
+                 " (a write past the " + name + " region)";
+    }
+    return "";
+  }
+  int64_t unfenced_region_bytes() const { return layout_.unfenced_guard - layout_.unfenced; }
+  int64_t scales_region_bytes() const { return layout_.partials_guard - layout_.scales; }
   int world_size() const { return world_size_; }
   int64_t max_rows() const { return max_rows_; }
   int64_t max_cols() const { return max_cols_; }
@@ -2035,6 +2076,22 @@ class Handle {
     arena_.emplace(rank_, world_size_, layout_.end);
     log.phase(OpenPhase::arena_allocated,
               static_cast<uint32_t>(arena_->bytes() >> 10));
+    // THE GUARDS, every word kGuardWord (`kGuardBytes`): before any peer opens the arena.
+    for (const auto& [b, e] : {std::pair{layout_.staging_guard, layout_.staging_guard_end},
+                               std::pair{layout_.partials_guard, layout_.partials_guard_end},
+                               std::pair{layout_.unfenced_guard, layout_.unfenced_guard_end}}) {
+      if (b % 4 != 0 || e % 4 != 0 || e - b < kGuardBytes)
+        throw std::runtime_error("hip_custom_communicator: a guard is not whole words or too short");
+      HIP_CHECK(hipMemsetD32(reinterpret_cast<hipDeviceptr_t>(arena_->base(rank_) + b),
+                             static_cast<int>(kGuardWord), static_cast<size_t>((e - b) / 4)));
+    }
+    HIP_CHECK(hipDeviceSynchronize());
+    // A CHECKED COMMUNICATOR (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1, read here once): every
+    // launch outside a capture synchronizes and checks what it promises after the kernel.
+    {
+      const char* checked = std::getenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED");
+      checked_ = checked != nullptr && std::string(checked) == "1";
+    }
     {
       // THIS RANK'S SIGNALS READ ZERO after the memset, before any peer can
       // write them: a few words, host-side.
@@ -2357,6 +2414,7 @@ class Handle {
   std::shared_ptr<Log> log_;
   // THE ARENA'S REGIONS (`arena_layout`), fixed at construction.
   ArenaLayout layout_;
+  bool checked_ = false;  // VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED: each launch checked after
   // KERNELS AND STREAMS BY INDEX, as the log names them (kernel_seen,
   // stream_seen): first seen, first numbered.
   std::vector<const void*> kernels_seen_;
@@ -3900,6 +3958,35 @@ inline std::variant<Config, Error> all_reduce(
   with_config<OpType::all_reduce>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what all_reduce is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator all_reduce before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
+         config.partials_stride_n, elem_bytes(dtype), h.partials_bytes());
+    fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
+         config.staging_stride_n, elem_bytes(dtype), h.staging_bytes());
+    fits("unfenced", config.unfenced_size_slot, config.unfenced_stride_slot, config.unfenced_size_m,
+         config.unfenced_stride_m, config.unfenced_size_n, config.unfenced_stride_n,
+         elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), h.unfenced_region_bytes());
+    fits("unfenced epochs", 1, 0, h.unfenced_epochs_size_block(), h.unfenced_epochs_stride_block(),
+         h.unfenced_epochs_size_n(), h.unfenced_epochs_stride_n(), 4, kUnfencedEpochsBytes);
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator all_reduce before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::all_reduce, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
         stream);
     const InputTable t = config.in_place
@@ -3930,6 +4017,42 @@ inline std::variant<Config, Error> all_reduce(
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks());
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator all_reduce after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator all_reduce after its launch: output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -3965,6 +4088,30 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
   with_config<OpType::all_reduce_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what all_reduce_rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
+         config.partials_stride_n, elem_bytes(dtype), h.partials_bytes());
+    fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
+         config.staging_stride_n, elem_bytes(dtype), h.staging_bytes());
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
         dtype, stream);
     const InputTable t = config.quantization != Quantization::exact
@@ -3993,6 +4140,42 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         h.signals_size_parity(), h.signals_size_block(),
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of all_reduce_rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -4032,6 +4215,31 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
   with_config<OpType::all_reduce_add_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what all_reduce_add_rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_add_rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
+         config.partials_stride_n, elem_bytes(dtype), h.partials_bytes());
+    fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
+         config.staging_stride_n, elem_bytes(dtype), h.staging_bytes());
+    fits("scales", 1, 0, config.scales_size_m, config.scales_stride_m, 1, 1, 4, h.scales_region_bytes());
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
     const InputTable t = config.quantization != Quantization::exact
@@ -4067,6 +4275,45 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         h.signals_size_parity(), h.signals_size_block(),
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of all_reduce_add_rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: output not "
+                                     "finite where the input is");
+          if (!finite(residual_output, residual_output_stride_m, residual_output_size_m, residual_output_size_n))
+            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: residual_output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -4143,6 +4390,30 @@ all_reduce_add_attn_res_rms_norm(
   with_config<OpType::all_reduce_add_attn_res_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what all_reduce_add_attn_res_rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
+         config.partials_stride_n, elem_bytes(dtype), h.partials_bytes());
+    fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
+         config.staging_stride_n, elem_bytes(dtype), h.staging_bytes());
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
     const InputTable t = config.quantization != Quantization::exact
@@ -4186,6 +4457,42 @@ all_reduce_add_attn_res_rms_norm(
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks(), num_blocks, eps,
         output_eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of all_reduce_add_attn_res_rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -4216,6 +4523,26 @@ inline std::variant<Config, Error> rms_norm(
   with_config<OpType::rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::rms_norm, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
         stream);
     rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes, C.waves_per_eu,
@@ -4226,6 +4553,42 @@ inline std::variant<Config, Error> rms_norm(
         static_cast<const W*>(weight), weight_stride_n, static_cast<int>(weight_size_n),
         static_cast<T*>(output), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n), eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator rms_norm after its launch: output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -4257,6 +4620,26 @@ inline std::variant<Config, Error> add_rms_norm(
   with_config<OpType::add_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what add_rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator add_rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator add_rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::add_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
         stream);
     add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
@@ -4271,6 +4654,45 @@ inline std::variant<Config, Error> add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output), residual_output_stride_m, residual_output_stride_n,
         static_cast<int>(residual_output_size_m), static_cast<int>(residual_output_size_n), eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of add_rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: output not "
+                                     "finite where the input is");
+          if (!finite(residual_output, residual_output_stride_m, residual_output_size_m, residual_output_size_n))
+            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: residual_output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
@@ -4320,6 +4742,26 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
   const Config config = std::get<Config>(checked);
   with_config<OpType::add_attn_res_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
+    // BEFORE THE LAUNCH, every expectation of what add_attn_res_rms_norm is handed (October 26: n11 rebooted
+    // seven times timing the fused two-shots at size; the kernels check their indices only
+    // against these sizes, so a size past its region was never caught): each view of a region
+    // inside the region, and the grid inside the signals' slots.
+    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
+                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
+                          int64_t region_bytes) {
+      if (slots <= 0 || rows <= 0 || cols <= 0) return;
+      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
+        throw std::runtime_error(std::string("hip_custom_communicator add_attn_res_rms_norm before its launch: the ") +
+            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
+            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
+            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
+            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
+    };
+    if (volume(config.grid) > h.signals_size_block())
+      throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm before its launch: a grid of " +
+          std::to_string(volume(config.grid)) + " blocks past the signals' " +
+          std::to_string(h.signals_size_block()));
     h.begin_launch(OpType::add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
     add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.block.x, C.wave_size,
@@ -4342,6 +4784,42 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
         static_cast<T*>(block_output), block_output_stride_m, block_output_stride_n,
         static_cast<int>(block_output_size_m), static_cast<int>(block_output_size_n), num_blocks,
         eps, output_eps);
+    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
+    // kernel done, every expectation of add_attn_res_rms_norm after it: no write past a region (the guards), no
+    // fault, every signal clear (nothing survives a launch), every output finite where the input is.
+    if (h.checked()) {
+      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+      if (capturing == hipStreamCaptureStatusNone) {
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(stream));
+        if (const std::string broken = h.guards_broken(); !broken.empty())
+          throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: " + broken);
+        const auto status = h.status();
+        if (status[static_cast<int>(StatusField::state)] != 0 ||
+            status[static_cast<int>(StatusField::abort)] != 0)
+          throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: a fault or an "
+                                   "abort in the status");
+        for (const auto& flag : h.signals())
+          if (flag[3] != static_cast<int64_t>(FlagState::clear))
+            throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: a signal left "
+                                     "set (parity " + std::to_string(flag[0]) + ", block " +
+                                     std::to_string(flag[1]) + ", writer " + std::to_string(flag[2]) + ")");
+        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
+          std::vector<T> host(static_cast<size_t>(rows * cols));
+          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
+                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
+          for (const T& x : host)
+            if (!std::isfinite(static_cast<float>(x))) return false;
+          return true;
+        };
+        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
+          if (!finite(output, output_stride_m, output_size_m, output_size_n))
+            throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: output not "
+                                     "finite where the input is");
+        }
+      }
+    }
   });
   HIP_CHECK(hipGetLastError());
   return config;
