@@ -2001,7 +2001,8 @@ inline std::variant<Config, Error> all_reduce_config(
   const int64_t share = int4_flat_share(m, n, world);
   config.partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.partials_stride_n = 1;
-  config.partials_size_m = int4_flat ? 1 : in_passes ? rows : m;
+  // THE ONE-SHOTS USE NO PARTIALS: an empty view.
+  config.partials_size_m = !is_two_shot(algorithm) ? 0 : int4_flat ? 1 : in_passes ? rows : m;
   config.partials_size_n = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.staging_stride_m = in_place || unfenced                ? 0
                          : int4_flat                       ? world * share
