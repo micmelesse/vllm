@@ -2034,7 +2034,6 @@ all_reduce_add_attn_res_rms_norm_config(
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
   const AllReduceAddAttnResRmsNormAlgorithm algorithm = a.algorithm;
-  const int tm = a.tile_m, tk = a.tile_k;
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(algorithm, m,
