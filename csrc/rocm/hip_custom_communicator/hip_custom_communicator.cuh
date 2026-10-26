@@ -646,112 +646,26 @@ constexpr int64_t kSignalsBytes =
     128 * 128;
 constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 
-// HOW THE ARENA IS BACKED: hipExtMallocWithFlags(hipDeviceMallocUncached),
-// exported with hipIpcGetMemHandle, opened by each peer with
-// hipIpcOpenMemHandle(hipIpcMemLazyEnablePeerAccess). The gfx950 convention,
-// which every IPC communicator on ROCm follows:
-//   - vLLM's custom all-reduce: allocate_shared_buffer_and_handle
-//     (csrc/libtorch_stable/custom_all_reduce.cu) backs EVERY shared buffer,
-//     the signals with the reduce's scratch (meta_size() + max_size) and the
-//     registered data buffer alike, with hipDeviceMallocUncached ("data
-//     buffers need to be uncached for signal on MI200").
-//   - vLLM's quick reduce (csrc/quickreduce/quick_reduce.h): ONE
-//     hipDeviceMallocUncached allocation per rank, its flags then its data at
-//     an offset: our arena's shape exactly.
-//   - aiter's custom all-reduce (csrc/kernels/custom_all_reduce.cu,
-//     allocate_meta_buffer; aiter/dist/.../custom_all_reduce.py): the meta
-//     buffer, its signals and the 2 * max_size it reduces through, uncached;
-//     only its input pool (what callers' tensors are copied into, read once
-//     per call) cacheable (hipMalloc or torch's allocator).
-// So signals and the data peers exchange share one uncached allocation by
-// convention; aiter's one cacheable buffer is an input pool, which our inline
-// copy-in into the staging replaces. ONE ARENA OF EITHER KIND IS CORRECT
-// under our kernels' memory model, LLVM's AMDGPUUsage for memory shared across
-// agents ("Memory Model GFX942"): every flag store a system-scope atomic,
-// released (buffer_wbl2 sc0 sc1) when it publishes data; every flag wait a
-// system-scope load, then a system-scope acquire (buffer_inv sc0 sc1) before
-// the data is read (common.cuh's BARRIER, the one place a kernel synchronizes
-// with a peer). Uncached is the convention, keeps peer reads off every L2 (no
-// stale line for an acquire to drop), and does not depend on how a runtime
-// backs the flag (hipDeviceMallocUncached was fine-grained under ROCm 7.2 and,
-// at 2 MiB and up, coarse-grained under HIP 7.15: aiter 0.1.24's
-// custom_all_reduce.py), since the model holds for cacheable memory too.
-// WHY NOT VMM (until 2026-10-16 the arena was hipMemCreate'd and mapped):
-// on ROCm 10.0 / amdgpu-dkms 6.16.6 (MI355X), exchanging VMM allocations
-// totalling more than ~256 MiB per process across 8 processes leaves the
-// driver in an eviction storm for every later process until a reboot (healthy
-// at 256 MiB, degraded at 288 MiB and at two 192 MiB allocations; legacy IPC
-// at 449 MiB healthy): hip.md's VMM section.
+// HOW THE ARENA IS BACKED: hipExtMallocWithFlags(hipDeviceMallocUncached), exported with
+// hipIpcGetMemHandle, opened by each peer with hipIpcOpenMemHandle: the convention of every IPC
+// communicator on ROCm (vLLM's custom all-reduce and quick reduce, aiter's). Correct cached or
+// not under the barrier's memory model (common.cuh); uncached keeps peer reads off every L2. Not
+// VMM: exchanging more than ~256 MiB of VMM allocations across 8 processes left the driver in an
+// eviction storm on ROCm 10.0.
 constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 
-// THE ARENA'S LAYOUT, the same offsets on every rank (bytes from the arena's
-// base; `arena_layout` computes it from the sizes Python opens it at, config.cuh's
-// `exchange_sizes`). A signal pad, then ONE PUBLISHED REGION PER PHASE, whose
-// data peers may still read while this rank writes the next phase's:
+// THE ARENA'S LAYOUT, the same offsets on every rank (`arena_layout`, from the sizes Python opens
+// it at): the signals (the barrier flags), the staging (what this rank publishes of its input: an
+// eager call's copy, an INT4 payload, or the pushed all-reduce's inbox), the partials (its share's
+// sums for the all-gather; the add-RMSNorm pull's INT4 row scales at their end), then the unfenced
+// region, a guard after each. A region holds either encoding, sized for the larger: a call
+// publishes exact or INT4, never both, and every reuse is ordered by a barrier the previous
+// call's readers passed.
 //
-//   region     offset                     bytes (each region kRegionAlign-aligned)
-//   signals    0                          kSignalsRegionBytes: the barrier
-//                                         flags (torch SymmetricMemory's
-//                                         "signal pad")
-//   staging    signals end                what this rank publishes of its
-//                                         input: an eager exact call's host
-//                                         copy (read through the eager input
-//                                         table), an INT4 call's payload, or
-//                                         the pushed all-reduce's inbox
-//   partials   staging end                what this rank publishes of its
-//                                         reduced slice for the all-gather
-//                                         (two-shot only), then, at its end, the
-//                                         add-RMS-norm pull two-shot's INT4 row
-//                                         scales, a float a row (max_rows): a
-//                                         view of the partials (`scales`), fenced
-//                                         as they are
-//
-// Rank r's region is at its arena's base (wherever its IPC opening put it)
-// plus the region's offset, written into the region's device array at open. INT4 IS AN ENCODING, NOT A
-// REGION: each region is sized for the largest encoding it may hold
-// (config.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
-// values plus scales at the largest problem), and the encoding lays out the
-// inside (common.cuh's INT4 payload layout: values, then scales at an offset from
-// the call's m and n, the same on every rank).
-//
-// WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
-// INT4, never both, and its sums exact or INT4, never both. Across calls: a rank writes inputs (its own,
-// or, the plain all-reduce, its slot of every peer's inbox) before its first
-// barrier, and any rank reads inputs (a peer's, or its own inbox) only before
-// its barrier that every peer's sums are visible (or, a one-shot, its last),
-// which this rank passed in the previous call only once every peer arrived,
-// done reading; partials are
-// written (by their rank, or a push kernel's peers) only after the writer's
-// first barrier, which every peer reaches only once it finished the previous
-// call, its all-gather's reads included. Not every launch ENDS with a barrier
-// (a two-shot ends with its all-gather): the next launch's first barrier is
-// the one that orders it. So the previous call's readers are done whichever
-// encoding either call used.
-// An INT4 kernel quantizes its input into its inputs' payload, and the pushed
-// all-reduce pushes it into its peers' inputs (each rank's inbox, a slot a
-// writer), before its first barrier, which is ordered, every rank's at its
-// base and the region's offset. An exact call's eager copy is the host's,
-// before its launch; its peers read it through the eager input table only
-// after its first barrier, and its launch ends only after every peer's last
-// read (INPUT TABLES).
-//
-// THE UNFENCED REGION AND ITS EPOCHS: memory no barrier fences, each write carrying its own
-// flag (the pushed one-shot's: kernels/all_reduce.cuh, the flag in the line), one more
-// region after the partials:
-//   unfenced   the INBOX peers push lines into: [writer, bank * row] rows of the blocks'
-//              tiles, kUnfencedSlotBytes of payload a row, each payload byte two in lines
-//              (common.cuh's Layout::line), two banks: world * 2 * kUnfencedBlocks rows.
-//              Its own region, never a fenced kernel's: a stale word a fenced kernel left
-//              could carry an epoch's value, and the reader would take it for data.
-// THE EPOCHS are not a region: each row of a bank's last epoch, a 16-byte pack a row (its
-// word at column 0), kUnfencedBlocks of them, read only by their own rank, so CACHED
-// rank-local memory (hipMalloc, zeroed at open; aiter's block_flags): from the
-// uncached arena each launch began with an uncached load (~2k cycles before any
-// send, ATT 2026-10-19T04-09-17Z). The lines start zeroed with the arena (no line
-// carries epoch 0, the first is 1); both are written only by that kernel. THE CAP: aiter's LL serves at most 128 KiB a call
-// (kLLPocSlotCapPk, 16384 packets) and refuses more; ours takes any size, a pass of a
-// tile a block, so its cap is the grid's, kUnfencedBlocks blocks (a grid past it is refused,
-// launch_out_of_range): 128 blocks of 1024 elements, 256 KiB in one pass. 8 MiB at eight ranks.
+// THE UNFENCED REGION: the pushed one-shot's inbox, written with the flag in the line and fenced by
+// no barrier, so its own region (a stale word a fenced kernel left could carry an epoch's value):
+// [writer, bank * row] rows of kUnfencedSlotBytes of payload, two banks of kUnfencedBlocks rows,
+// a grid past them refused. Its epochs are rank-local and cached, in the private buffer.
 constexpr int kUnfencedBlocks = 128;
 constexpr int64_t kUnfencedSlotBytes = 2048;  // a block's tile's payload, at most
 constexpr int64_t unfenced_bytes(int world) {
@@ -805,49 +719,18 @@ inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
   return l;
 }
 
-// INPUT TABLES: an exact call's view of every rank's input (every op's), a
-// TABLE of kMaxRanks addresses (rank r's input at [r], null past the world) in
-// this rank's device memory, one pointer its kernel takes (aiter's RankData*).
-// The tables live in the PRIVATE buffer (kPrivateTables), kInputTableSlots of them:
-//   - slot 0, THE EAGER TABLE, written at open: every rank's staging (its shared
-//     base, as this process opened it, plus the region's offset). An eager call
-//     copies its input there first (`input_table`: hipMemcpy2DAsync on the
-//     launch's stream, dense rows), so its kernel, stream-ordered after the
-//     copy, finds every rank's at the table, each rank having copied its own.
-//   - every later slot, A CAPTURED LAUNCH'S: reserved by Python at capture (the
-//     op takes it as `table_slot`; the kernel records its address, fixed for
-//     the graph's life) with the input's address remembered; filled by Python
-//     when the capture exits, before any replay: one batched exchange of every
-//     recorded input's IPC handle and offset over the CPU group, each peer's
-//     allocation opened once (cached by its handle: the caching allocator hands
-//     every graph the same few segments) and the slots written.
-// A slot is never reused: a graph's addresses die with it, and the count each
-// rank records must match for the exchange (a collective) to pair them.
-// THE ORDER THAT LETS AN INPUT BE OVERWRITTEN: every peer's last read of this
-// rank's input precedes a barrier this rank's launch waits on before it ends
-// (a one-shot's `read`, a two-shot's second, after its reduce-scatter), so the
-// next eager copy, or the caller's next write, comes after every read.
-// THE SLAB'S SIZE, fixed at open: a slot's address is baked into the graph that
-// captured it, and torch captures in global mode, where no allocation may
-// happen, so the slab cannot grow during a capture. 262144 slots of kMaxRanks
-// pointers is 16 MiB. 16384 was too few for Kimi-K3 at InferenceX's c48 point
-// (capture sizes to 48, a speculative drafter's layers too; run
-// 2026-10-17T03-18-18Z, hip-bench_inferencex_c48).
+// INPUT TABLES: an exact call's view of every rank's input, a table of kMaxRanks addresses in the
+// private buffer, one pointer its kernel takes (aiter's RankData*). Slot 0, the eager table, points
+// at every rank's staging (an eager call copies its input there first); every later slot is a
+// captured launch's, reserved at capture and filled by Python when the capture exits. A slot is
+// never reused (a graph keeps its address). An input may be overwritten once its launch ends:
+// every peer's last read of it precedes a barrier the launch waits on. The slots are fixed at open
+// (no allocation during a capture): 2^18, 16 MiB (2^14 was too few for Kimi-K3 at c48).
 constexpr int64_t kInputTableSlots = int64_t{1} << 18;
 
-// THE SCRATCH A KERNEL MAY ASK, as a share of the device's: the device's scratch
-// (hipExtLimitScratchMax) over its every lane, by this. A dispatch that asks too much fails only
-// when it runs, aborting its queue and the process with it (the tune's crashes, 2026-10-24); HIP
-// refuses nothing at the launch. ROCr gives a dispatch scratch for every wave slot of the device,
-// a hardware queue keeps the most it was ever given, and the process's queues share the budget
-// (measured on n11, one process: one queue ran 32 KiB a lane, not 64 -- the budget over every
-// lane; at 16 KiB a lane the fourth queue failed, at 24 KiB the third). How many queues a process
-// holds HIP does not say (a gd worker's held more than four: AttnRes at 14-16 KiB a lane still
-// crashed), so the share is a margin, not a count: 16 queues at a full dispatch each before the
-// budget runs out, past HIP's pools (four queues a stream priority, three priorities). At gfx950,
-// 4 KiB a lane: the crashes spilled 14-25 KiB; the tuned table's build spills at most 1.8 KiB
-// (all_reduce_rms_norm at 8192 a tile, 128 threads); of the coarse build's 6,974 kernels about
-// 400 heavy spillers are refused.
+// THE SCRATCH A KERNEL MAY ASK: the device's scratch over its every lane, by kScratchShares. A
+// dispatch that asks too much fails only when it runs, aborting the process; the share is a
+// margin for the queues a process holds (16 full dispatches; 4 KiB a lane at gfx950).
 constexpr int64_t kScratchShares = 16;
 
 // THE REGIONS' DEVICE ARRAYS in the private buffer, kRegionPtrArrays of kMaxRanks addresses, in
@@ -1003,10 +886,10 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   const hipError_t found = hipFuncGetAttributes(
       &attrs, reinterpret_cast<const void*>(
                   all_reduce<
-                      c10::BFloat16, 2, 1,
+                      Algorithm::one_shot_pull, false, c10::BFloat16, 2, 1,
                       kTarget.wave_size * traits<c10::BFloat16, kBuild.memory.pack_bytes>::N,
-                      kTarget.wave_size, kTarget.wave_size, kBuild.memory.pack_bytes, 1,
-                      Algorithm::one_shot_pull, false, false, false>));
+                      kTarget.wave_size, kTarget.wave_size, kBuild.memory.pack_bytes, 1, false,
+                      false>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;
@@ -1077,80 +960,9 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 
 // THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
 
-// THE BUILDS, GENERATED FROM THE TUNED TABLE (builds.py, at configure): each kernel's,
-// `kBuilds_<kernel>`, the build half of every config the table lists. A two-shot's INT4
-// build is a config moving int4, listed as any other. WHY THE TABLE HOLDS THESE BUILDS, the
-// sweeps that chose them (the lists they were, kept as their history):
-//
-// The norms: one-shot, the push two-shot (a column split), the pull two-shot (a
-// row split). Not swept: select cuts it to the rows, so it matters only past 16
-// rows. The plain one-shot: a tile a row high, a group a thread wide, at each
-// block size a launch may take. The grid is the size's (kAllReduceKernels,
-// which picks among these).
-//
-// THE PUSHED ONE-SHOT (the flag in the line): a tile a row high, a pack a
-// thread; aiter's ar_ll_gfx9 runs 256 threads of one 8-byte packet each, 1024
-// elements a block (7 blocks at 7168), which {128, 1, 1, 1024} matches block for
-// block at a 16-byte pack a thread. Every build's tile fits a lines slot
-// (the state's kUnfencedSlotBytes, checked below). Not swept yet.
-//
-// The plain two-shot: 512 threads divided into whole waves per peer. The
-// eight-rank tile is 512 elements; four and two ranks need 1024 and 2048
-// elements respectively so every lane owns a complete pack. Keep the tuned
-// eight-rank build first; fallback picks use the smallest valid tile below.
-//
-// 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55
-// and 18.11 at 128; 2026-10-01T03-26-44Z); a row a block below that.
-//
-// Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
-// against 81.0 and 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-// INT4 WHOLE GROUPS A THREAD (the kernel's INT4 body): a block a row's chunk of TILE_N columns,
-// TILE_N / (32 * THREADS) groups a thread (a multiple of 32 * THREADS, any block).
-//
-// Not swept: rms_norm's.
-//
-// 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128;
-// 2026-10-01T03-26-44Z).
-//
-// 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us
-// at 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-// INT4 whole groups a thread, as rms_norm's.
-//
-// AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got
-// slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096 tokens, with 100 ->
-// 166 VGPRs (stamps 2026-10-01T06-26-55Z against 04-15-48Z). The one-shot's
-// grid not swept: the norms'.
-//
-// 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98
-// against 39.93, 83.15, 159.33 at 128), a row a block below that
-// (2026-10-01T03-57-23Z). 256 threads a block: Triton's program for AttnRes,
-// and more blocks resident at once (AttnRes from local memory took 192.8 /
-// 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps 2026-10-02T20-36-56Z); its
-// grid not swept yet.
-//
-// The column split wants a wide grid (AttnRes is compute a row): at 7168, 192
-// is within about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at
-// 447.2 us against 1160.7 at the 36 it had (2026-10-01T22-56-58Z,
-// 2026-10-01T23-00-47Z). TILE_M 2 and 4 lost at every grid, best 480.0 us at
-// 128 blocks against 412.8 at 1 on 192 (4096 x 7168, 2026-10-02T21-19-22Z). Its
-// reduce-scatter once ran on the grid's first 32 blocks: its reads queue behind
-// the links past a few dozen blocks while AttnRes is compute a row and wants
-// every block. At 4096 tokens it took 146.6 us on 32 blocks against 218.9 on
-// 192, AttnRes 1110.5 against 199.4 (stamps, 2026-10-01T23-45-31Z and
-// 2026-10-01T23-50-54Z). The kernel no longer splits, and its knob
-// (reduce_scatter_blocks, read by nothing) is gone (2026-10-21): a split that
-// returns is a config field the kernel reads.
-// 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4
-// are no longer built: they lost at every grid, and 4 spilled 25-30 VGPRs.
-//
-// OUR SEPARATE NORM KERNELS (rms_norm_rows and add_rms_norm_rows, the second kernel of a norm op
-// Python composes after our all-reduce): a row a tile, Layout::tile, a block's threads along the
-// row. Exact: no peer, nothing crosses a link.
-//
-// OUR SEPARATE ATTNRES KERNEL (add_attn_res_rms_norm_rows, the second kernel of AttnRes as Python
-// composes it): a row a tile, the fused pull's exact tile (TILE_N a row's packs over the threads,
-// Layout::tile), at Triton's AttnRes program (256 threads, a source a step: the reference's prefill
-// config) and the neighbours a sweep picks among. Exact, as the norms'.
+// THE BUILDS, GENERATED FROM THE TUNED TABLE (builds.py, at configure): each kernel's
+// `kBuilds_<kernel>`, the build half of every config the table lists (an INT4 config a build as
+// any other). The tune chooses them.
 #include "hip_custom_communicator_builds.inc"
 // EVERY KERNEL INSTANCE IS COMPILED IN ITS BUILD'S OWN FILE (builds.py): declared here, so the
 // launches below instantiate none of them in this file.
@@ -1877,8 +1689,8 @@ const void* kernel_pointer() {
   using W = typename of_dtype<C.weight_dtype>::t;
   if constexpr (C.kernel == Template::all_reduce)
     return reinterpret_cast<const void*>(
-        all_reduce<T, C.world, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-            C.waves_per_eu, C.algorithm, C.contiguous, C.tail, C.quantize_int4>);
+        all_reduce<C.algorithm, C.quantize_int4, T, C.world, C.tile_m, C.tile_n, C.block.x,
+            C.wave_size, C.pack_bytes, C.waves_per_eu, C.contiguous, C.tail>);
   if constexpr (C.kernel == Template::all_reduce_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
@@ -2548,8 +2360,8 @@ inline std::variant<Config, Error> all_reduce(
     const int64_t table_stride_m =
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
-    all_reduce<T, C.world, C.tile_m, C.tile_n, C.block.x, C.wave_size, C.pack_bytes,
-        C.waves_per_eu, C.algorithm, C.contiguous, C.tail, C.quantize_int4>
+    all_reduce<C.algorithm, C.quantize_int4, T, C.world, C.tile_m, C.tile_n, C.block.x,
+        C.wave_size, C.pack_bytes, C.waves_per_eu, C.contiguous, C.tail>
         <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),

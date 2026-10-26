@@ -51,8 +51,8 @@ constexpr int columns_threads_n() {
 // THE FLAT WALK, PULLED (the plain pulled two-shot): exact, every rank's input read in place
 // through the input table; INT4, every rank's input quantized into its own staging, a share a
 // slot, and each rank reads its share's slot from every rank's.
-template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
+template <bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_flat_pull(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -218,8 +218,8 @@ DINLINE void reduce_scatter_flat_pull(
 
 // THE FLAT WALK, PUSHED (the plain pushed two-shot): each rank's share of this rank's input
 // sent into that rank's inbox at slot [rank] (INT4: quantized), then the inbox summed locally.
-template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
+template <bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_flat_push(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -382,8 +382,8 @@ DINLINE void reduce_scatter_flat_push(
 
 // THE COLUMNS WALK, PULLED (the fused ops' pull): a chunk of a row at a time, rank w's copy a
 // row of threads, summed through LDS into this rank's partials.
-template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
+template <bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_columns_pull(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -489,8 +489,8 @@ DINLINE void reduce_scatter_columns_pull(
 
 // THE COLUMNS WALK, PUSHED (the fused ops' push): a row of threads as wide as a rank's slice of
 // a row, every rank's pack summed in registers, the sum sent to every rank's partials.
-template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, bool TAIL, typename DTYPE>
+template <bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_columns_push(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -665,8 +665,8 @@ DINLINE void reduce_scatter_columns_push(
 
 // THE REDUCE-SCATTER: [push or stage] barrier, the sum, barrier. After the second barrier every
 // rank's sums are in the partials and every peer is done reading.
-template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool QUANTIZE_INT4, bool CONTIGUOUS, ReduceScatterAlgorithm ALGORITHM, bool TAIL,
+template <ReduceScatterAlgorithm ALGORITHM, bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS, bool TAIL,
           typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr,
@@ -704,7 +704,7 @@ DINLINE void reduce_scatter(
     int rank,
     uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_pull)
-    internal::reduce_scatter_flat_pull<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_flat_pull<QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -714,7 +714,7 @@ DINLINE void reduce_scatter(
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_push)
-    internal::reduce_scatter_flat_push<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_flat_push<QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
         staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
@@ -723,7 +723,7 @@ DINLINE void reduce_scatter(
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_pull)
-    internal::reduce_scatter_columns_pull<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_columns_pull<QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -733,7 +733,7 @@ DINLINE void reduce_scatter(
         signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_push)
-    internal::reduce_scatter_columns_push<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_columns_push<QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,

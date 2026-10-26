@@ -29,8 +29,9 @@ enum class AllGatherAlgorithm { flat, columns };
 // from the rank owning its columns, slice_n columns a rank (the last rank's to the end), the
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
-template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool QUANTIZE_INT4, bool CONTIGUOUS, AllGatherAlgorithm ALGORITHM, bool TAIL, typename OUTPUT>
+template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS, bool TAIL,
+          typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
                         int partials_size_n, OUTPUT&& output, int64_t output_stride_m,

@@ -427,7 +427,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
       // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
       //    same rows.
-      reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, true, ReduceScatterAlgorithm::columns_pull, false>(
+      reduce_scatter<ReduceScatterAlgorithm::columns_pull, false, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, true, false>(
           input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
           input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
           staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -450,7 +450,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         // chunk read once, in the first.
         if constexpr (CHUNKED) {
           const auto sum_chunk = [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
-            all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, true, AllGatherAlgorithm::columns, false>(
+            all_gather<AllGatherAlgorithm::columns, false, DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, true, false>(
                 partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
                 partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m,
                 col, slice_n, rank);
@@ -468,7 +468,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           continue;
         }
         DTYPE sum[TILE_M][kPacks][kPackElems];
-        all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, false, true, AllGatherAlgorithm::columns, false>(
+        all_gather<AllGatherAlgorithm::columns, false, DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, true, false>(
             partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
             partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
             slice_n, rank);
@@ -509,7 +509,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // every input read in place after it (written before the peers' launches), and the pushes into a
     // peer's partials after it land where that peer finished reading in its last launch, ended before
     // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
-    reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZE_INT4, true, ReduceScatterAlgorithm::columns_push, TAIL>(
+    reduce_scatter<ReduceScatterAlgorithm::columns_push, QUANTIZE_INT4, WORLD, 1, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, true, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
