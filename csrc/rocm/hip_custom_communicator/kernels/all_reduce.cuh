@@ -12,7 +12,7 @@
 //                  sums. No barrier. (NCCL's LL, aiter's ar_ll_gfx9)
 //   push two-shot  each rank writes every rank's share into that rank's inbox; each rank
 //                  sums its inbox into its partials; then every rank reads every partials.
-// An INT4 build's QUANTIZE instance moves INT4: each rank encodes its own input, so nothing
+// An ENABLE_INT4 instance moves INT4: each rank encodes its own input, so nothing
 // is read in place. The exact instance of an INT4 build is the exact body.
 //
 // THE WALKS. The one-shots walk [m, n] in TILE_M x TILE_N tiles, the grid striding over
@@ -43,7 +43,7 @@ namespace hip_custom_communicator {
 // THE PULLED ONE-SHOT: every rank reads every rank's input through the input table and sums (aiter's
 // cross_device_reduce_1stage).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int QUANTIZATION, bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, bool ENABLE_INT4>
 DINLINE void all_reduce_one_shot_pull(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -72,7 +72,7 @@ DINLINE void all_reduce_one_shot_pull(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
-  if constexpr (QUANTIZE) {
+  if constexpr (ENABLE_INT4) {
     // INT4 PULL ONE-SHOT: quantize into this rank's staging, barrier, dequantize and sum
     // every rank's payload, barrier.
     constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
@@ -195,7 +195,7 @@ DINLINE void all_reduce_one_shot_pull(
 // THE PULLED TWO-SHOT: each rank sums its share of every rank's input into its partials; then every rank
 // reads every rank's partials (aiter's cross_device_reduce_2stage).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int QUANTIZATION, bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, bool ENABLE_INT4>
 DINLINE void all_reduce_two_shot_pull(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -230,7 +230,7 @@ DINLINE void all_reduce_two_shot_pull(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
-  if constexpr (QUANTIZE) {
+  if constexpr (ENABLE_INT4) {
     // INT4 PULL TWO-SHOT: quantize into this rank's staging, barrier; each rank sums its own
     // rows (whole tiles) of every payload into its partials as INT4, barrier; every rank
     // reads every owner's rows. The next launch's first barrier protects the partials.
@@ -336,7 +336,7 @@ DINLINE void all_reduce_two_shot_pull(
 // THE PUSHED ONE-SHOT: each rank writes its input into every peer's inbox as lines carrying this call's
 // epoch; each rank waits for the epoch in its own inbox and sums (NCCL's LL, aiter's ar_ll_gfx9).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int QUANTIZATION, bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, bool ENABLE_INT4>
 DINLINE void all_reduce_one_shot_push(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -374,7 +374,7 @@ DINLINE void all_reduce_one_shot_push(
     int status_size_field,
     int rank,
     uint64_t timeout_ticks) {
-  if constexpr (QUANTIZE) {
+  if constexpr (ENABLE_INT4) {
     // INT4 PUSH ONE-SHOT: quantize this rank's tile into slot [rank] of every inbox in the
     // staging, barrier, dequantize and sum this rank's inbox, barrier. Not lines: a line's
     // 8 bytes hold no group's scale.
@@ -527,7 +527,7 @@ DINLINE void all_reduce_one_shot_push(
 // THE PUSHED TWO-SHOT: each rank writes every rank's share into that rank's inbox; each rank sums its
 // inbox into its partials; then every rank reads every rank's partials.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int QUANTIZATION, bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, bool ENABLE_INT4>
 DINLINE void all_reduce_two_shot_push(
     const DTYPE* input_ptr,
     int64_t input_stride_m,
@@ -563,11 +563,11 @@ DINLINE void all_reduce_two_shot_push(
     int rank,
     uint64_t timeout_ticks) {
   // PUSH TWO-SHOT. Exact runs a band of partials_size_m rows a pass, so any size fits.
-  if constexpr (QUANTIZE) {
+  if constexpr (ENABLE_INT4) {
     // The INT4 payloads live inside the staging and the partials (common.cuh's INT4 layout).
     // 1-3. Quantize each rank's share into that rank's inbox at slot [rank], barrier, sum this
     //      rank's inbox into its partials, barrier.
-    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZATION, CONTIGUOUS, Walk::flat, Accumulate::registers, Direction::push, Until::launched, TAIL>(
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::int4, CONTIGUOUS, Walk::flat, Accumulate::registers, Direction::push, Until::launched, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -579,7 +579,7 @@ DINLINE void all_reduce_two_shot_push(
 
     // 4. All-gather. The next call's first barrier keeps a rank from overwriting its partials
     //    while a peer still reads them.
-    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, QUANTIZATION, CONTIGUOUS, Walk::flat, TAIL>(
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::int4, CONTIGUOUS, Walk::flat, TAIL>(
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
         input_size_m, input_size_n, 0, 0, 0, rank);
@@ -609,8 +609,8 @@ DINLINE void all_reduce_two_shot_push(
 }
 
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION, int ALGORITHM,
-          bool CONTIGUOUS, bool TAIL, bool QUANTIZE>
+          int PACK_BYTES, int WAVES_PER_EU, int ALGORITHM,
+          bool CONTIGUOUS, bool TAIL, bool ENABLE_INT4>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -634,12 +634,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-  // THE DISPATCH, an algorithm a function. An INT4 build has two instances, QUANTIZE (the INT4
-  // body) and not (the exact body), the host launching the one quantize_from_bytes names.
-  static_assert(!QUANTIZE || QUANTIZATION == Quantization::int4, "only an INT4 build quantizes");
+  // THE DISPATCH, an algorithm a function; ENABLE_INT4 (the host's, from the config's quantization
+  // and quantize_from_bytes) whether this launch moves INT4.
   if constexpr (ALGORITHM == Algorithm::one_shot_pull)
     all_reduce_one_shot_pull<DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             QUANTIZATION, CONTIGUOUS, TAIL, QUANTIZE>(
+                             CONTIGUOUS, TAIL, ENABLE_INT4>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, output_ptr,
         output_stride_m, output_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -648,7 +647,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == Algorithm::two_shot_pull)
     all_reduce_two_shot_pull<DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             QUANTIZATION, CONTIGUOUS, TAIL, QUANTIZE>(
+                             CONTIGUOUS, TAIL, ENABLE_INT4>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, output_ptr,
         output_stride_m, output_stride_n, partials_ptr_array, partials_ptr_array_size,
@@ -658,7 +657,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_size_writer, status_ptr, status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == Algorithm::one_shot_push)
     all_reduce_one_shot_push<DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             QUANTIZATION, CONTIGUOUS, TAIL, QUANTIZE>(
+                             CONTIGUOUS, TAIL, ENABLE_INT4>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, output_ptr,
         output_stride_m, output_stride_n, staging_ptr_array, staging_ptr_array_size,
         unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
@@ -670,7 +669,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         status_stride_field, status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == Algorithm::two_shot_push)
     all_reduce_two_shot_push<DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             QUANTIZATION, CONTIGUOUS, TAIL, QUANTIZE>(
+                             CONTIGUOUS, TAIL, ENABLE_INT4>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, output_ptr,
         output_stride_m, output_stride_n, partials_ptr_array, partials_ptr_array_size,
         partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
