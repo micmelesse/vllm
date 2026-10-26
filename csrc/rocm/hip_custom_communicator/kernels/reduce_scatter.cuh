@@ -11,7 +11,7 @@
 namespace hip_custom_communicator {
 
 // THE LOADS ARE THE COMMUNICATION: a peer's pointer is its memory opened over IPC, so a load
-// reads over the links; the sum and the store are local. Ranks are read rotated (rank + w the
+// reads over the links; the sum and the store are local. The peers are read rotated (rank + w the
 // w-th), so at any moment the GPUs read different peers.
 //
 // THE FLAT WALK (the plain two-shots): the [m, n] elements numbered row-major, each rank's share
