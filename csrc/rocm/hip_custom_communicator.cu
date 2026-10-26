@@ -417,6 +417,10 @@ std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr) {
 void hip_custom_communicator_abort(fptr_t handle_ptr) {
   handle_of(handle_ptr).abort();
 }
+std::string hip_custom_communicator_guards_broken(fptr_t handle_ptr) {
+  HIP_CHECK(hipDeviceSynchronize());
+  return handle_of(handle_ptr).guards_broken();
+}
 
 // The device clock's rate, kHz: what its ticks are per ms.
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device) {

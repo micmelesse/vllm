@@ -2923,6 +2923,27 @@ class HipCustomCommunicator:
             for i in range(0, len(flat), 4)
         ]
 
+    def check_after(self, what: str) -> None:
+        """EVERY EXPECTATION AFTER LAUNCHES, as C++ checks after each launch in its checked mode
+        (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1), for launches it could not check itself: a
+        CUDA graph's replays (`what` names them). Every launch on the device finished, then no
+        write past a region of this rank's arena (its guards), no fault or abort in its status,
+        every signal clear. Raises RuntimeError naming the first that fails."""
+        if self._handle is None:
+            return
+        broken = torch.ops._rocm_C.hip_custom_communicator_guards_broken(self._handle)
+        if broken:
+            raise RuntimeError(f"hip_custom_communicator after {what}: {broken}")
+        status = self.status()
+        if status.abort or status.fault is not None:
+            raise RuntimeError(f"hip_custom_communicator after {what}: {status}")
+        left = [f for f in self.signals() if f.state is not FlagState.clear]
+        if left:
+            raise RuntimeError(
+                f"hip_custom_communicator after {what}: {len(left)} signals left set, "
+                f"{left[:4]}"
+            )
+
     def _fault(self) -> Fault | None:
         """The fault this rank's status records, for the watchdog."""
         return self.status().fault

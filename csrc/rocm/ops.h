@@ -96,6 +96,9 @@ std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr);
 // this process made (an open that failed or is still running).
 std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr);
 void hip_custom_communicator_abort(fptr_t handle_ptr);
+// THIS RANK'S GUARDS after its launches finished (every one, the caller's synchronize): "" where
+// intact, else the region a write went past and where.
+std::string hip_custom_communicator_guards_broken(fptr_t handle_ptr);
 
 // A variant at the torch boundary: the arch or the Error's number, exactly one
 // set.
