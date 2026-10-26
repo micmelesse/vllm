@@ -1590,6 +1590,14 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_options(_rocm_C_hcc PRIVATE
       "$<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:SHELL:-mllvm --amdgpu-kernarg-preload-count=32>")
     target_compile_definitions(_rocm_C_hcc PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    # THE DEVICE'S BOUNDS CHECKS (common.cuh's HIP_CUSTOM_COMMUNICATOR_DEBUG: an index outside its
+    # buffer traps where it is), compiled in where the configure's environment asks
+    # (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEVICE_CHECKS=1): a run that finds a stray access, never a
+    # build that is timed.
+    if("$ENV{VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEVICE_CHECKS}" STREQUAL "1")
+      message(STATUS "hip_custom_communicator: device bounds checks compiled in")
+      target_compile_definitions(_rocm_C_hcc PRIVATE "HIP_CUSTOM_COMMUNICATOR_DEBUG=1")
+    endif()
     target_link_libraries(_rocm_C_hcc PRIVATE torch)
   else()
     message(STATUS "No gfx950, skipping hip_custom_communicator")

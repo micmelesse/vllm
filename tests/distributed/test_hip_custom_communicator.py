@@ -1074,6 +1074,59 @@ def _every_build_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None
     assert not wrongs, f"{len(wrongs)} builds wrong:\n" + "\n".join(wrongs)
 
 
+# THE TABLE'S CONFIGS AT SIZE: each exact config of an op's kernel the table holds (its picks and a
+# tune's candidates), AT ITS OWN GRID, at row counts where the two-shots run in passes, against the
+# reference. The every-build sweep runs each build at grid 16 and 1 or 33 rows; three node crashes
+# came timing the fused add-RMSNorm's large-size candidates (2026-10-26T00-10-51Z, 00-29-16Z,
+# 00-45-50Z), sizes no correctness test had run. Run it on a build with the device's bounds checks
+# compiled in (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_DEVICE_CHECKS=1) to trap a stray access where it is.
+AT_SIZE = ((2048, HIDDEN), (4096, HIDDEN), (8192, LATENT))
+
+
+def _table_configs(kernel: str) -> list[Config]:
+    """Every exact config of `kernel` the table holds, at its own grid, deduplicated."""
+    table = json.loads(_TABLE.read_text())["gfx950"]
+    fields = Config.__dataclass_fields__
+    out: list[Config] = []
+    for c in table["configs"]:
+        if c["kernel"] == kernel and c["quantization"] == "exact":
+            config = Config(**{k: c[k] for k in fields})
+            if config not in out:
+                out.append(config)
+    return out
+
+
+def _table_configs_at_size_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
+    layer = ATTN_RES_LAYERS[0] if op == "all_reduce_add_attn_res_rms_norm" else None
+    (kernel,) = [n for n, t in build_info().templates.items() if t.op == op]
+    wrongs: list[str] = []
+    for config in _table_configs(kernel):
+        for rows, hidden in AT_SIZE:
+            if rank == 0:
+                print(f"AT SIZE {op} {rows}x{hidden}: {config}", flush=True)
+            try:
+                ran = _eager(comm, rank, op, rows, hidden, torch.bfloat16, config, layer, rows)
+            except AssertionError as wrong:
+                wrongs.append(str(wrong))
+                if rank == 0:
+                    print(f"WRONG {wrong}", flush=True)
+                continue
+            if not ran and rank == 0:
+                print(f"{op} {rows}x{hidden}: {config} refused by name", flush=True)
+    assert not wrongs, f"{len(wrongs)} configs wrong at size:\n" + "\n".join(wrongs)
+
+
+@on_eight_gpus
+@pytest.mark.parametrize("op", TUNED_OPS)
+def test_table_configs_match_the_reference_at_size(op: Op) -> None:
+    """Every exact config of each op's kernel in the table, at its own grid, at 2048-8192 rows,
+    against the reference (the sizes and grids a tune times)."""
+    _on_every_rank(
+        target=partial(_table_configs_at_size_on_rank, op=op),
+        process_timeout_s=EVERY_BUILD_TIMEOUT_S,
+    )
+
+
 @on_eight_gpus
 @pytest.mark.parametrize("op", TUNED_OPS)
 def test_every_build_matches_the_reference(op: Op) -> None:
