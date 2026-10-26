@@ -98,7 +98,11 @@ _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
 # gives them (C++'s `algorithms`, its op file's enum): a one-shot or a two-shot,
 # pulled or pushed. A norm on this rank's rows has one, which the table names "rows".
 AllReduceAlgorithm = Literal[
-    "one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push"
+    "one_shot_pull",
+    "one_shot_push",
+    "two_shot_pull",
+    "two_shot_push",
+    "one_shot_push_staged",
 ]
 AllReduceRmsNormAlgorithm = Literal["one_shot_pull", "two_shot_pull", "two_shot_push"]
 AllReduceAddRmsNormAlgorithm = Literal[
@@ -107,9 +111,17 @@ AllReduceAddRmsNormAlgorithm = Literal[
 AllReduceAddAttnResRmsNormAlgorithm = Literal[
     "one_shot_pull", "two_shot_pull", "two_shot_push"
 ]
-# Any op's, by name: what a lookup across ops (`get_kernel_config`) is asked for.
+# THE ALGORITHMS THAT PUSH (their peers store into this rank's buffers): no input of
+# theirs is read in place.
+_PUSHED = ("one_shot_push", "two_shot_push", "one_shot_push_staged")
+# Any op's, by name: what a lookup across ops (`TunedConfigs.kernel_config`) asks.
 Algorithm = Literal[
-    "one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push", "rows"
+    "one_shot_pull",
+    "one_shot_push",
+    "two_shot_pull",
+    "two_shot_push",
+    "one_shot_push_staged",
+    "rows",
 ]
 
 
@@ -2055,7 +2067,7 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         _moves_exact(config, input)
-                        and not config.algorithm.endswith("_push"),
+                        and config.algorithm not in _PUSHED,
                     ),
                     checked_after_launch=self._checked,
                     input=input,
@@ -2240,7 +2252,7 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         _moves_exact(reduce_config, input)
-                        and not reduce_config.algorithm.endswith("_push"),
+                        and reduce_config.algorithm not in _PUSHED,
                     ),
                     checked_after_launch=self._checked,
                     input=input,
@@ -2462,7 +2474,7 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         _moves_exact(reduce_config, input)
-                        and not reduce_config.algorithm.endswith("_push"),
+                        and reduce_config.algorithm not in _PUSHED,
                     ),
                     checked_after_launch=self._checked,
                     input=input,
@@ -2713,7 +2725,7 @@ class HipCustomCommunicator:
                     table_slot=self._table_slot(
                         input,
                         _moves_exact(reduce_config, input)
-                        and not reduce_config.algorithm.endswith("_push"),
+                        and reduce_config.algorithm not in _PUSHED,
                     ),
                     checked_after_launch=self._checked,
                     input=input,

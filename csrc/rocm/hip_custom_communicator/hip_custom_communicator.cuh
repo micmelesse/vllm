@@ -421,11 +421,12 @@ constexpr const char* to_string(Error e) {
 }
 
 // AN ALGORITHM'S PARTS, where a host decision needs only one: whether it is a one-shot or a
-// two-shot, and whether it pushes (only the plain all-reduce pushes a one-shot).
+// two-shot, and whether it pushes (only the plain all-reduce pushes a one-shot: as lines, or
+// staged).
 template <typename A>
 constexpr bool is_one_shot(A a) {
   if constexpr (std::is_same_v<A, AllReduceAlgorithm>)
-    return a == A::one_shot_pull || a == A::one_shot_push;
+    return a == A::one_shot_pull || a == A::one_shot_push || a == A::one_shot_push_staged;
   else return a == A::one_shot_pull;
 }
 template <typename A>
@@ -435,7 +436,7 @@ constexpr bool is_two_shot(A a) {
 template <typename A>
 constexpr bool is_push(A a) {
   if constexpr (std::is_same_v<A, AllReduceAlgorithm>)
-    return a == A::one_shot_push || a == A::two_shot_push;
+    return a == A::one_shot_push || a == A::one_shot_push_staged || a == A::two_shot_push;
   else return a == A::two_shot_push;
 }
 
@@ -502,7 +503,8 @@ struct AllReduceBuildConfig {
       {AllReduceAlgorithm::one_shot_pull, "one_shot_pull"},
       {AllReduceAlgorithm::one_shot_push, "one_shot_push"},
       {AllReduceAlgorithm::two_shot_pull, "two_shot_pull"},
-      {AllReduceAlgorithm::two_shot_push, "two_shot_push"}};
+      {AllReduceAlgorithm::two_shot_push, "two_shot_push"},
+      {AllReduceAlgorithm::one_shot_push_staged, "one_shot_push_staged"}};
   AllReduceAlgorithm algorithm;
   Dim3 block;
   int waves_per_eu;
@@ -1421,27 +1423,35 @@ std::optional<Error> refused_build(bool collective, int world, int64_t staging_b
     if constexpr (kPlain) {
       // A PUSHED ONE-SHOT IN THE UNFENCED REGION, its capacity (not a build's rule: any tile and
       // grid is built): a row of a block's tile in a slot's lines, a line a pack of at most
-      // kLinePayloadBytes (a narrower pack its line alone: kernels/all_reduce.cuh), a slot
-      // kUnfencedSlotBytes / kLinePayloadBytes lines; a block's TILE_M rows of a bank's
-      // kUnfencedBlocks.
+      // kLinePayloadBytes (a narrower pack its line alone: kernels/all_reduce.cuh), INT4 a line
+      // a word of its tile's whole groups, a slot kUnfencedSlotBytes / kLinePayloadBytes lines;
+      // a block's TILE_M rows of a bank's kUnfencedBlocks.
       const int64_t line_pack = pack < kLinePayloadBytes ? pack : kLinePayloadBytes;
-      if (b.algorithm == AllReduceAlgorithm::one_shot_push && !int4 &&
-          ((b.tile_n * elem_bytes(dtype) + line_pack - 1) / line_pack >
-               kUnfencedSlotBytes / kLinePayloadBytes ||
+      const int64_t row_lines =
+          int4 ? (b.tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
+               : (b.tile_n * elem_bytes(dtype) + line_pack - 1) / line_pack;
+      if (b.algorithm == AllReduceAlgorithm::one_shot_push &&
+          (row_lines > kUnfencedSlotBytes / kLinePayloadBytes ||
            int64_t{launch.grid.x} * b.tile_m > kUnfencedBlocks))
         return Error::unfenced_too_small;
     }
     if (!collective) return std::nullopt;
     if constexpr (kPlain) {
-      // THE PLAIN ALL-REDUCE'S INT4 ONE-SHOTS (kernels/all_reduce.cuh): the input's [m, n] INT4
-      // payload in the staging (the pushed one-shot's, WORLD slots of it, whole kInt4ScalesAlign).
-      if (int4 && is_one_shot(b.algorithm)) {
-        const int64_t payload = int4_payload_bytes(m, n);
+      // THE PLAIN ALL-REDUCE'S ONE-SHOTS IN THE STAGING (kernels/all_reduce.cuh): the INT4 pull's
+      // [m, n] payload; the staged push's inbox, WORLD slots of an input (INT4: its payload, whole
+      // kInt4ScalesAlign). The line push stages nothing (INT4 or exact; exact's eager input
+      // aside, below).
+      if (is_one_shot(b.algorithm) &&
+          (b.algorithm == AllReduceAlgorithm::one_shot_push_staged || int4)) {
+        const int64_t payload = int4 ? int4_payload_bytes(m, n) : m * n * elem_bytes(dtype);
         const int64_t slot =
-            (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-        if ((b.algorithm == AllReduceAlgorithm::one_shot_push ? world * slot : payload) >
-            staging_bytes)
-          return Error::staging_too_small;
+            int4 ? (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign
+                 : payload;
+        const int64_t staged = b.algorithm == AllReduceAlgorithm::one_shot_push_staged
+                                   ? world * slot
+                               : b.algorithm == AllReduceAlgorithm::one_shot_pull ? payload
+                                                                                 : 0;
+        if (staged > staging_bytes) return Error::staging_too_small;
         return std::nullopt;
       }
     }
@@ -1770,7 +1780,7 @@ inline std::variant<Config, Error> all_reduce_config(
   // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
   // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
   // epoch as it was.
-  const bool unfenced = algorithm == AllReduceAlgorithm::one_shot_push && q == Quantization::exact;
+  const bool unfenced = algorithm == AllReduceAlgorithm::one_shot_push;
   if (unfenced && volume(c.launch.grid) > kUnfencedBlocks) return Error::launch_out_of_range;
   // THE WHOLE CALL IN ONE PASS (the regions are sized from the largest call; refused() refuses a
   // call past them). The two-shots' exact share is the flat walk's, whole packs, rounded up: a
@@ -1818,13 +1828,18 @@ inline std::variant<Config, Error> all_reduce_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = in_place;
-  // THE INT4 ONE-SHOTS' PAYLOADS (kernels/all_reduce.cuh), as bytes over the dtype's elements
-  // (what the launch's region checks read): the staging's [m, n] payload (the pushed one-shot's
-  // WORLD slots of it); no partials. The kernels find them from the input's sizes.
-  if (quantize_int4 && !is_two_shot(algorithm)) {
-    const int64_t payload = int4_payload_bytes(m, n);
-    const int64_t slot = (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-    const int64_t staged = algorithm == AllReduceAlgorithm::one_shot_push ? world * slot : payload;
+  // THE ONE-SHOTS IN THE STAGING (kernels/all_reduce.cuh), as bytes over the dtype's elements
+  // (what the launch's region checks read): the INT4 pull's [m, n] payload; the staged push's
+  // WORLD slots of an input (INT4: its payload); no partials. The kernels find them from the
+  // input's sizes. (The line push's inbox is the unfenced region, above.)
+  if (is_one_shot(algorithm) && algorithm != AllReduceAlgorithm::one_shot_push &&
+      (quantize_int4 || algorithm == AllReduceAlgorithm::one_shot_push_staged)) {
+    const int64_t payload = quantize_int4 ? int4_payload_bytes(m, n) : m * n * elem_bytes(dtype);
+    const int64_t slot = quantize_int4 ? (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign *
+                                             kInt4ScalesAlign
+                                       : payload;
+    const int64_t staged =
+        algorithm == AllReduceAlgorithm::one_shot_push_staged ? world * slot : payload;
     config.staging_stride_m = 0;
     config.staging_stride_n = 1;
     config.staging_size_m = 1;

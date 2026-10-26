@@ -124,7 +124,8 @@ __host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 
 // A LINE: 16 bytes, one global_store_dwordx4 / global_load_dwordx4, carrying 8 bytes of payload
 // (two words) and the flag twice (the line's two halves each carry it: a reader trusts the line
-// only whole).
+// only whole). AN INT4 LINE is a pack's word (8 values) and its group's scale (fp32 bits): one
+// line a pack, half an exact line's bytes a value.
 constexpr int kLineBytes = 16;
 constexpr int kLinePayloadBytes = 8;
 
@@ -392,16 +393,17 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // THE LINE READ: every writer's lines of the tile at once (two a pack), then the check, again
     // until every line waited for carries the flag. A lane leaves the loop once its own are all
     // there; a lane past the clip waits for none.
-    static_assert(!QUANTIZE_INT4 && kSlots && kCopies == WORLD,
-                  "a line read is every writer's exact copy");
+    static_assert(kSlots && kCopies == WORLD, "a line read is every writer's copy");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
-    // first bytes.
-    constexpr int kLines = sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
-    static_assert((sizeof(V) <= kLinePayloadBytes || sizeof(V) % kLinePayloadBytes == 0) &&
-                      kLines >= 1 && kLines <= 2 &&
-                      sizeof(u32x4) == kLineBytes,
-                  "a pack is one or two lines");
+    // first bytes. INT4: one line, the pack's word and its group's scale, decoded.
+    constexpr int kLines =
+        QUANTIZE_INT4 || sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
+    static_assert((QUANTIZE_INT4 ? kRaw || kPackElems == kInt4Group / kInt4GroupPacks
+                                 : sizeof(V) <= kLinePayloadBytes ||
+                                       sizeof(V) % kLinePayloadBytes == 0) &&
+                      kLines >= 1 && kLines <= 2 && sizeof(u32x4) == kLineBytes,
+                  "a pack is one or two lines, an INT4 pack a word of 8 values");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (input_slot < 0 || input_slot + WORLD > input_size_slot || flags == nullptr))
@@ -433,7 +435,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
                             kLineScale +
                         static_cast<uint32_t>(pack_of(k)) * uint32_t{kLineBytes};
         waits[i][k] = row_at(i) < clip_m &&
-                      offs_n / kPackElems + tid % kThreadsN + k * kThreadsN < clip_n / kPackElems;
+                      offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
       }
     u32x4 got[WORLD][kRows][kPacks][kLines];
     const uint64_t t0 = wall_clock64();
@@ -501,13 +503,21 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
         for (int k = 0; k < kPacks; ++k) {
-          uint32_t words[2 * kLines];
+          if constexpr (QUANTIZE_INT4 && kRaw) {
+            output[c][i][k][0] = got[c][i][k][0][0];
+            output[c][i][k][1] = got[c][i][k][0][2];
+          } else if constexpr (QUANTIZE_INT4) {
+            dequantize(got[c][i][k][0][0], __builtin_bit_cast(float, got[c][i][k][0][2]),
+                       output[c][i][k]);
+          } else {
+            uint32_t words[2 * kLines];
 #pragma unroll
-          for (int h = 0; h < kLines; ++h) {
-            words[2 * h] = got[c][i][k][h][0];
-            words[2 * h + 1] = got[c][i][k][h][2];
+            for (int h = 0; h < kLines; ++h) {
+              words[2 * h] = got[c][i][k][h][0];
+              words[2 * h + 1] = got[c][i][k][h][2];
+            }
+            __builtin_memcpy(output[c][i][k], words, sizeof(V));
           }
-          __builtin_memcpy(output[c][i][k], words, sizeof(V));
         }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
@@ -915,17 +925,37 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // never loaded: written clamped, they overwrote the last row's lines with stale registers
     // under the owner's flag (TILE_M 2 at one row, 2026-10-25T17-23-56Z). One row a thread of one
     // row of threads has none, its loop unbranched as before.
-    static_assert(!QUANTIZE_INT4, "a line carries exact payload");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     // A PACK NARROWER THAN A LINE'S PAYLOAD (a build's narrow pack) is one line, its payload's
-    // first bytes.
-    constexpr int kLines = sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
-    static_assert((sizeof(V) <= kLinePayloadBytes || sizeof(V) % kLinePayloadBytes == 0) &&
-                      kLines >= 1 && kLines <= 2 &&
-                      sizeof(u32x4) == kLineBytes,
-                  "a pack is one or two lines");
+    // first bytes. INT4: one line, the pack's word and its group's scale.
+    constexpr int kLines =
+        QUANTIZE_INT4 || sizeof(V) <= kLinePayloadBytes ? 1 : sizeof(V) / kLinePayloadBytes;
+    static_assert((QUANTIZE_INT4 ? kRaw || kPackElems == kInt4Group / kInt4GroupPacks
+                                 : sizeof(V) <= kLinePayloadBytes ||
+                                       sizeof(V) % kLinePayloadBytes == 0) &&
+                      kLines >= 1 && kLines <= 2 && sizeof(u32x4) == kLineBytes,
+                  "a pack is one or two lines, an INT4 pack a word of 8 values");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
+    // INT4: every pack's word and its group's scale, quantized before any row is skipped (a
+    // group's scale is its quad's, every lane of it active).
+    [[maybe_unused]] uint32_t payload[kRows][kPacks][2];
+    if constexpr (QUANTIZE_INT4) {
+#pragma unroll
+      for (int i = 0; i < kRows; ++i)
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k) {
+          if constexpr (kRaw) {
+            payload[i][k][0] = input[i][k][0];
+            payload[i][k][1] = input[i][k][1];
+          } else {
+            float scale;
+            quantize(reinterpret_cast<const U(&)[1][kPackElems]>(input[i][k]),
+                     reinterpret_cast<uint32_t(&)[1]>(payload[i][k][0]), scale);
+            payload[i][k][1] = __builtin_bit_cast(uint32_t, scale);
+          }
+        }
+    }
     const int bank_rows = output_size_m / 2;
     char* const slot = reinterpret_cast<char*>(output) +
                        int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)} * kLineScale;
@@ -939,7 +969,12 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       for (int k = 0; k < kPacks; ++k) {
         const int col = min(col_at(k), clip_n / kPackElems - 1);
         uint32_t words[2 * kLines] = {};
-        __builtin_memcpy(words, input[i][k], sizeof(V));
+        if constexpr (QUANTIZE_INT4) {
+          words[0] = payload[i][k][0];
+          words[1] = payload[i][k][1];
+        } else {
+          __builtin_memcpy(words, input[i][k], sizeof(V));
+        }
         // A row's packs' first lines, then their second (the line read's layout).
         const uint32_t half = static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
         uint32_t at = static_cast<uint32_t>(row) * half * kLineScale +
