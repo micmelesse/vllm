@@ -655,7 +655,8 @@
    {"op":"hip_custom_communicator.all_reduce","mode":"quantized","world":8,"hidden":7168,"tokens":112,"dtype":"bf16"},
    {"op":"hip_custom_communicator.all_reduce","mode":"quantized","world":8,"hidden":7168,"tokens":120,"dtype":"bf16"},
    {"op":"hip_custom_communicator.all_reduce","mode":"quantized","world":8,"hidden":7168,"tokens":136,"dtype":"bf16"},
-   {"op":"hip_custom_communicator.all_reduce","mode":"quantized","world":8,"hidden":7168,"tokens":144,"dtype":"bf16"}
+   {"op":"hip_custom_communicator.all_reduce","mode":"quantized","world":8,"hidden":7168,"tokens":144,"dtype":"bf16"},
+   {"op":"hip_custom_communicator.all_reduce","mode":"exact","world":8,"hidden":3584,"tokens":448,"dtype":"bf16"}
   ],
   "configs": [
    {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_pull","grid_x":32,"grid_y":1,"grid_z":1,"block_x":128,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":1024,"tile_k":1,"quantization":"exact","pack_bytes":16,"quantize_from_bytes":null},
@@ -1699,7 +1700,8 @@
    {"input":651,"configs":[379]},
    {"input":652,"configs":[372]},
    {"input":653,"configs":[374]},
-   {"input":654,"configs":[380]}
+   {"input":654,"configs":[380]},
+   {"input":655,"configs":[8]}
   ]
  }
 }
