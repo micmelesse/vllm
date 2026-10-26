@@ -365,9 +365,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
       store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, input_size_n, 1, 1, input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
     }
-    char* staged[WORLD];
-  #pragma unroll
-    for (int r = 0; r < WORLD; ++r) staged[r] = load(staging_ptr_array, staging_ptr_array_size, r);
+    // NO RANK'S STAGING ENTRY HELD across the barrier (each recv reads its own): the kernel's exact
+    // path carries this body's scalar registers, and 16 more spilled kernel arguments into VGPR
+    // lanes that path then waited on (+0.2 us a call at 16-160 tokens, ISA 2026-10-26).
     // 2. Every rank's payload written and visible (ordered).
     barrier<WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
   #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::tile, TAIL>(&staged[r], 1, 0, 0, 0, input_size_n, 1, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], offs_m, offs_n, 1);
+        recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r, 0, 0, input_size_n, 1, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], offs_m, offs_n, 1);
       float sum[kRows][kPacks][kPackElems];
   #pragma unroll
       for (int i = 0; i < kRows; ++i)
