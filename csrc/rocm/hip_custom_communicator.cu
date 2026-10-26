@@ -455,7 +455,7 @@ Picked forced_config(hip_custom_communicator::OpType o, const std::string& kerne
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
   using namespace hip_custom_communicator;
   const std::optional<Template> fn = template_named(kernel);
-  if (!fn) return Error::no_such_template;
+  if (!fn) return Error::no_such_kernel;
   return forced(o, *fn, algorithm_from(algorithm),
                 Dim3{narrowed(grid_x), narrowed(grid_y), narrowed(grid_z)},
                 Dim3{narrowed(block_x), narrowed(block_y), narrowed(block_z)},

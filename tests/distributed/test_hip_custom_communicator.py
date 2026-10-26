@@ -1612,12 +1612,14 @@ def test_capture_warmup_launches_nothing() -> None:
 
 
 def test_python_names_match_the_build() -> None:
-    """`Error` and `Where` are C++'s, name for name in order, and `Op` names C++'s
-    ops."""
+    """`Error`'s codes below 100 and `Where` are C++'s, name for name in order, and
+    `Op` names C++'s ops."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
-    assert tuple(e.name for e in Error) == built.error_names
+    cpp = [e for e in Error if e < 100]
+    assert tuple(e.name for e in cpp) == built.error_names
+    assert [e.value for e in cpp] == list(range(len(built.error_names)))
     assert tuple(w.name for w in Where) == built.where_names
     assert [w.value for w in Where] == list(range(1, len(built.where_names) + 1))
     assert set(get_args(Op)) == set(built.op_names)

@@ -303,65 +303,41 @@ constexpr const char* to_string(Where w) {
 
 namespace hip_custom_communicator {
 
-// WHY A CALL CANNOT RUN, every reason there is. The numbers cross to Python
-// (hip_custom_communicator.Error), so a reason is only ever added at the end.
-// `disabled` and `no_such_op` are the communicator's own.
+// WHY C++ REFUSED A CALL. Python's `Error` mirrors it number for number.
 enum class Error : int {
-  disabled = 0,
-  no_such_op = 1,
-  not_contiguous = 2,
-  not_two_d = 3,
-  dtype_not_built = 4,
-  world_not_built = 5,
-  row_not_packs = 6,
-  template_not_this_ops = 7,
-  row_too_wide = 8,  // retired: every kernel takes a row wider than its tile, in chunks
-  block_not_a_wave_per_peer = 9,
-  partials_too_small = 10,
-  grid_not_resident = 11,
-  staging_too_small = 12,
-  device_not_built = 13,
-  device_not_tuned = 14,
-  weight_not_built = 15,
-  no_such_template = 16,
-  no_such_group = 17,
-  ranks_disagree = 18,
-  groups_disagree = 19,
-  threads_not_built = 20,
-  tile_not_built = 21,
-  launch_out_of_range = 22,
-  field_not_positive = 23,
-  field_not_this_templates = 24,  // a forced tile_k other than 1 where the kernel has no K
-  waves_not_built = 25,
-  inner_stride_not_one = 26,
-  row_stride_not_packs = 27,
-  row_narrower_than_world = 28,  // retired: every two-shot takes a row narrower than a
-                                // pack a rank (the late ranks' slices empty)
-  forced_incomplete = 29,
-  no_such_quantization = 30,
-  quantization_not_supported = 31,
-  row_not_int4_groups = 32,  // retired: every INT4 kernel takes a row of whole packs, its last
-                             // group short
-  quantized_too_small = 33,  // retired: INT4 is an encoding inside the
-                             // regions (staging_too_small, partials_too_small)
-  block_too_large = 34,
-  lds_too_large = 35,
-  scratch_too_large = 36,
-  unfenced_too_small = 37,
-  pack_out_of_range = 38,
+  not_contiguous = 0,
+  dtype_not_built = 1,
+  world_not_built = 2,
+  row_not_packs = 3,
+  partials_too_small = 4,
+  grid_not_resident = 5,
+  staging_too_small = 6,
+  device_not_built = 7,
+  device_not_tuned = 8,
+  weight_not_built = 9,
+  no_such_kernel = 10,
+  threads_not_built = 11,
+  tile_not_built = 12,
+  launch_out_of_range = 13,
+  field_not_positive = 14,
+  field_not_this_templates = 15,
+  waves_not_built = 16,
+  inner_stride_not_one = 17,
+  row_stride_not_packs = 18,
+  no_such_quantization = 19,
+  quantization_not_supported = 20,
+  block_too_large = 21,
+  lds_too_large = 22,
+  scratch_too_large = 23,
+  unfenced_too_small = 24,
+  pack_out_of_range = 25,
 };
-constexpr int kNumErrors = 39;
+constexpr int kNumErrors = 26;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
-    case Error::disabled:
-      return "disabled: the communicator is disabled";
-    case Error::no_such_op:
-      return "no_such_op: the backend has no such op";
     case Error::not_contiguous:
       return "not_contiguous: the input is not contiguous";
-    case Error::not_two_d:
-      return "not_two_d: an op takes a 2-D input, [rows, cols]";
     case Error::dtype_not_built:
       return "dtype_not_built: only float16 and bfloat16 are built";
     case Error::world_not_built:
@@ -369,14 +345,6 @@ constexpr const char* to_string(Error e) {
     case Error::row_not_packs:
       return "row_not_packs: the row is not whole packs of the config's pack_bytes (a "
              "build at a narrower pack takes it)";
-    case Error::template_not_this_ops:
-      return "template_not_this_ops: the forced template is not this op's";
-    case Error::row_too_wide:
-      return "row_too_wide: the row is wider than the template's widest build "
-             "holds";
-    case Error::block_not_a_wave_per_peer:
-      return "block_not_a_wave_per_peer: a two-shot block must be one wave per "
-             "peer";
     case Error::partials_too_small:
       return "partials_too_small: the two-shot's published sums, exact or INT4, "
              "exceed the partials";
@@ -393,15 +361,8 @@ constexpr const char* to_string(Error e) {
              "for";
     case Error::weight_not_built:
       return "weight_not_built: a norm's weight is in the call's dtype or fp32";
-    case Error::no_such_template:
-      return "no_such_template: the op has no kernel of the forced algorithm";
-    case Error::no_such_group:
-      return "no_such_group: no process group is registered by that name";
-    case Error::ranks_disagree:
-      return "ranks_disagree: the ranks captured different numbers of buffers";
-    case Error::groups_disagree:
-      return "groups_disagree: the CPU and device groups differ in size or in "
-             "this rank";
+    case Error::no_such_kernel:
+      return "no_such_kernel: the op has no kernel of that name and algorithm";
     case Error::threads_not_built:
       return "threads_not_built: no build of the template runs at that block "
              "size";
@@ -427,23 +388,11 @@ constexpr const char* to_string(Error e) {
     case Error::row_stride_not_packs:
       return "row_stride_not_packs: a buffer's row stride is not whole packs of the "
              "config's pack_bytes (a build at a narrower pack takes it)";
-    case Error::row_narrower_than_world:
-      return "row_narrower_than_world: a two-shot row has fewer packs than "
-             "ranks, so a rank's "
-             "slice is empty";
-    case Error::forced_incomplete:
-      return "forced_incomplete: a forced call gives every field of its config "
-             "or none (Python's refusal: C++ takes every field)";
     case Error::no_such_quantization:
       return "no_such_quantization: the quantization is exact or int4";
     case Error::quantization_not_supported:
       return "quantization_not_supported: INT4 is not supported for the selected "
              "kernel";
-    case Error::row_not_int4_groups:
-      return "row_not_int4_groups: an INT4 row is whole groups of 32 for every "
-             "rank";
-    case Error::quantized_too_small:
-      return "quantized_too_small: retired";
     case Error::block_too_large:
       return "block_too_large: the block has more threads than the compiled kernel "
              "takes (its launch bounds, hipFuncGetAttributes' maxThreadsPerBlock)";
@@ -1477,7 +1426,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, int algorithm, 
                                           Dim3 block, int waves_per_eu, int tile_m, int tile_n,
                                           int tile_k, int quantization, int pack_bytes,
                                           std::optional<int64_t> quantize_from_bytes) {
-  if (op_of(fn) != o || !has_algorithm(fn, algorithm)) return Error::no_such_template;
+  if (op_of(fn) != o || !has_algorithm(fn, algorithm)) return Error::no_such_kernel;
   if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
   if (!x_alone(block) || !x_alone(grid) || block.x < kTarget.wave_size ||
