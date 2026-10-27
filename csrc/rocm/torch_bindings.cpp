@@ -106,87 +106,55 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // from the C++ signature: one source, nothing to keep in step (a hand-written
   // schema that disagreed with its function failed the library load,
   // 2026-10-14).
-  rocm_ops.def("hip_custom_communicator_layout",
-               &hip_custom_communicator_layout);
-  rocm_ops.def("hip_custom_communicator_capacity",
-               &hip_custom_communicator_capacity);
-  rocm_ops.def("hip_custom_communicator_alloc",
-               &hip_custom_communicator_alloc);
-  rocm_ops.def("hip_custom_communicator_free",
-               &hip_custom_communicator_free);
-  rocm_ops.def("hip_custom_communicator_alloc_host",
-               &hip_custom_communicator_alloc_host);
-  rocm_ops.def("hip_custom_communicator_free_host",
-               &hip_custom_communicator_free_host);
-  rocm_ops.def("hip_custom_communicator_ipc_handle",
-               &hip_custom_communicator_ipc_handle);
-  rocm_ops.def("hip_custom_communicator_ipc_open",
-               &hip_custom_communicator_ipc_open);
-  rocm_ops.def("hip_custom_communicator_ipc_close",
-               &hip_custom_communicator_ipc_close);
-  rocm_ops.def("hip_custom_communicator_pointer_device",
-               &hip_custom_communicator_pointer_device);
-  rocm_ops.def("hip_custom_communicator_write_words",
-               &hip_custom_communicator_write_words);
-  rocm_ops.def("hip_custom_communicator_fill_words",
-               &hip_custom_communicator_fill_words);
-  rocm_ops.def("hip_custom_communicator_read_words",
-               &hip_custom_communicator_read_words);
-  rocm_ops.def("hip_custom_communicator_read_host",
-               &hip_custom_communicator_read_host);
-  rocm_ops.def("hip_custom_communicator_write_host",
-               &hip_custom_communicator_write_host);
-  rocm_ops.def("hip_custom_communicator_wall_clock_khz",
-               &hip_custom_communicator_wall_clock_khz);
-  rocm_ops.def("hip_custom_communicator_supported",
-               &hip_custom_communicator_supported);
   rocm_ops.def("hip_custom_communicator_build_info",
                &hip_custom_communicator_build_info);
-  // THE LAUNCH STATE, made and freed. Its maker's schema is written out, so Python passes its fields by
-  // name (an inferred schema names none); a schema that disagrees with its function fails the
-  // library load. The free takes its handle alone, inferred.
+  // THE STATE AND EACH OP, every schema written out so Python passes arguments by name (an inferred
+  // schema names none); a schema that disagrees with its function fails the library load. The ops
+  // that take tensors have a device impl; the state's take none, so they are bound whole.
   rocm_ops.def(
-      "hip_custom_communicator_launch_state(int rank, int world, int shared_buffer, int private_buffer, int status_device, int timeout_ticks, int max_rows, int staging_bytes, int partials_bytes, bool checked_after_launch) -> int",
-      &hip_custom_communicator_launch_state);
-  rocm_ops.def("hip_custom_communicator_free_launch_state",
-               &hip_custom_communicator_free_launch_state);
-
-  // EACH OP ONCE, on its communicator's state (a handle, above), its tensors and values, then its
-  // config's fields. `eps` is a float in the schema because torch has no `double` there; the kernel
-  // narrows it.
-
+      "hip_custom_communicator_open(int rank, int world, int device, int max_rows, int max_cols, float timeout_seconds) -> (int?, int, int[], str, int[])",
+      &hip_custom_communicator_open);
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce(int state, int table_slot, Tensor input, Tensor! output, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_connect(int state, int[] handles) -> int?",
+      &hip_custom_communicator_connect);
+  rocm_ops.def(
+      "hip_custom_communicator_graph_ipc_meta(int state) -> (int?, int[], int[])",
+      &hip_custom_communicator_graph_ipc_meta);
+  rocm_ops.def(
+      "hip_custom_communicator_register_graph_buffers(int state, int[] handles, int[] offsets) -> int?",
+      &hip_custom_communicator_register_graph_buffers);
+  rocm_ops.def(
+      "hip_custom_communicator_close_peers(int state) -> int?",
+      &hip_custom_communicator_close_peers);
+  rocm_ops.def(
+      "hip_custom_communicator_free(int state) -> int?",
+      &hip_custom_communicator_free);
+  rocm_ops.def(
+      "hip_custom_communicator_all_reduce(int state, Tensor input, Tensor! output, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA,
                 &hip_custom_communicator_all_reduce);
-
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_rms_norm(int state, int table_slot, Tensor input, Tensor weight, Tensor! output, float eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_all_reduce_rms_norm(int state, Tensor input, Tensor weight, Tensor! output, float eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_rms_norm);
-
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_add_rms_norm(int state, int table_slot, Tensor input, Tensor residual, Tensor weight, Tensor! output, Tensor! residual_output, float eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_all_reduce_add_rms_norm(int state, Tensor input, Tensor residual, Tensor weight, Tensor! output, Tensor! residual_output, float eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
-
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int state, int table_slot, Tensor input, Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, int num_blocks, float eps, float output_eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, int tile_k, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int state, Tensor input, Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, int num_blocks, float eps, float output_eps, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, int tile_k, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
-
   rocm_ops.def(
-      "hip_custom_communicator_rms_norm(int state, Tensor input, Tensor weight, Tensor! output, float eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_rms_norm(int state, Tensor input, Tensor weight, Tensor! output, float eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_rms_norm);
-
   rocm_ops.def(
-      "hip_custom_communicator_add_rms_norm(int state, Tensor input, Tensor residual, Tensor weight, Tensor! output, Tensor! residual_output, float eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_add_rms_norm(int state, Tensor input, Tensor residual, Tensor weight, Tensor! output, Tensor! residual_output, float eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_add_rms_norm);
-
   rocm_ops.def(
-      "hip_custom_communicator_add_attn_res_rms_norm(int state, Tensor input, Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, int num_blocks, float eps, float output_eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, int tile_k, str quantization, int pack_bytes, int? quantize_from_bytes) -> int");
+      "hip_custom_communicator_add_attn_res_rms_norm(int state, Tensor input, Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, int num_blocks, float eps, float output_eps, int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, int tile_k, str quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_add_attn_res_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_add_attn_res_rms_norm);
 #endif  // VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR

@@ -52,36 +52,11 @@ void paged_attention(
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
 
-// ROCm TP collectives
-// (vllm/distributed/device_communicators/hip_custom_communicator). Python owns the communicator's
-// memory as addresses and its launch state as a handle, through these, and hands every op its
-// launch state, its tensors and its config's values.
-std::vector<int64_t> hip_custom_communicator_layout(int64_t max_rows, int64_t max_cols,
-                                                    int64_t world);
-// What a communicator serving that box at `world` holds: [max_rows, max_cols,
-// partials_bytes, inputs_bytes].
-std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
-                                                      int64_t max_cols,
-                                                      int64_t world);
-int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
-int64_t hip_custom_communicator_alloc(int64_t bytes, bool shared);
-int64_t hip_custom_communicator_free(int64_t ptr);
-std::vector<int64_t> hip_custom_communicator_alloc_host(int64_t bytes);
-int64_t hip_custom_communicator_free_host(int64_t host);
-std::vector<int64_t> hip_custom_communicator_ipc_handle(int64_t ptr);
-int64_t hip_custom_communicator_ipc_open(const std::vector<int64_t>& handle);
-int64_t hip_custom_communicator_ipc_close(int64_t base);
-int64_t hip_custom_communicator_pointer_device(int64_t ptr);
-void hip_custom_communicator_write_words(int64_t ptr, const std::vector<int64_t>& words);
-void hip_custom_communicator_fill_words(int64_t ptr, int64_t word, int64_t count);
-std::vector<int64_t> hip_custom_communicator_read_words(int64_t ptr, int64_t count);
-std::vector<int64_t> hip_custom_communicator_read_host(int64_t host, int64_t count);
-void hip_custom_communicator_write_host(int64_t host, int64_t index, int64_t word);
-
-// A variant at the torch boundary: the arch or the Error's number, exactly one
-// set.
-std::tuple<std::optional<std::string>, std::optional<int64_t>>
-hip_custom_communicator_supported(int64_t device, int64_t world);
+// ROCm TP collectives (vllm/distributed/device_communicators/hip_custom_communicator): the
+// communicator's state (C++'s CommsState, a handle Python holds) opened, connected to its peers,
+// its captured inputs registered, closed and freed; and each op once, on the state, its tensors and
+// values, then its config's fields as plain values. EVERY ERROR IS A VALUE: each returns the Error's
+// number it was refused for, or none (hip_custom_communicator.cu); none raises.
 // The build's dtypes by name, its worlds, a pack's bytes, its
 // ops', errors' and fault places' names in their enums' order, and each
 // op's kernel's name, op and BuildConfigs (flat, a build's fields in the names'
@@ -97,39 +72,36 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>>
 hip_custom_communicator_build_info();
-
-// THE LAUNCH STATE, as a handle (the API's LaunchState, Python's to free), made once the buffers
-// are.
-int64_t hip_custom_communicator_launch_state(int64_t rank, int64_t world, int64_t shared_buffer,
-    int64_t private_buffer, int64_t status_device, int64_t timeout_ticks, int64_t max_rows,
-    int64_t staging_bytes, int64_t partials_bytes, bool checked_after_launch);
-void hip_custom_communicator_free_launch_state(int64_t state);
-
-// Each op once, on its launch state (a handle, above), its tensors and values, then its
-// config's fields as plain values, its op's own: an algorithm by name where its kernel has
-// several, the grid and the block, the waves a EU, the tile (tile_k where it has K), what it
-// moves ("exact" or "int4"), the pack, the bytes an INT4 build quantizes from. The norms on rows
-// are the second kernel of an op Python composes after our all-reduce. Each returns the Error's
-// number it was refused for, or -1 when it ran (hip_custom_communicator.cu's Answer).
-
-int64_t hip_custom_communicator_all_reduce(int64_t state, int64_t table_slot, torch::Tensor& input,
+std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,
+           std::vector<int64_t>>
+hip_custom_communicator_open(int64_t rank,
+    int64_t world, int64_t device, int64_t max_rows, int64_t max_cols, double timeout_seconds);
+std::optional<int64_t> hip_custom_communicator_connect(int64_t state,
+    const std::vector<int64_t>& handles);
+std::tuple<std::optional<int64_t>, std::vector<int64_t>, std::vector<int64_t>>
+hip_custom_communicator_graph_ipc_meta(int64_t state);
+std::optional<int64_t> hip_custom_communicator_register_graph_buffers(int64_t state,
+    const std::vector<int64_t>& handles, const std::vector<int64_t>& offsets);
+std::optional<int64_t> hip_custom_communicator_close_peers(int64_t state);
+std::optional<int64_t> hip_custom_communicator_free(int64_t state);
+std::optional<int64_t> hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input,
     torch::Tensor& output, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t table_slot,
+std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(int64_t state,
     torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output, double eps,
     const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t table_slot,
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps, const std::string& algorithm, int64_t grid_x,
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, int64_t table_slot,
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state,
     torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
@@ -138,23 +110,23 @@ int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, 
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
-    int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
+std::optional<int64_t> hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input,
+    torch::Tensor& weight, torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
+std::optional<int64_t> hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
     torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-int64_t hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks, torch::Tensor& norm_weight,
-    torch::Tensor& qk_weight, const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks, double eps,
-    double output_eps, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+std::optional<int64_t> hip_custom_communicator_add_attn_res_rms_norm(int64_t state,
+    torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
+    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);

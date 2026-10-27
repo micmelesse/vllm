@@ -309,7 +309,8 @@ constexpr const char* to_string(Where w) {
 
 namespace hip_custom_communicator {
 
-// WHY C++ REFUSED A CALL. Python's `Error` mirrors it number for number.
+// WHY C++ REFUSED. C++ never raises: every function returns its Error as a value (none: it ran),
+// and Python names it by number from its mirror of this enum.
 enum class Error : int {
   not_contiguous = 0,
   dtype_not_built = 1,
@@ -337,8 +338,19 @@ enum class Error : int {
   scratch_too_large = 23,
   unfenced_too_small = 24,
   pack_out_of_range = 25,
+  hip_failed = 26,
+  not_on_device = 27,
+  shape_mismatch = 28,
+  dtype_mismatch = 29,
+  not_aligned = 30,
+  inputs_overlap_outputs = 31,
+  field_out_of_range = 32,
+  view_past_region = 33,
+  tables_full = 34,
+  ranks_disagree = 35,
+  not_open = 36,
 };
-constexpr int kNumErrors = 26;
+constexpr int kNumErrors = 37;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -416,6 +428,33 @@ constexpr const char* to_string(Error e) {
     case Error::pack_out_of_range:
       return "pack_out_of_range: a config's pack_bytes is not 2, 4, 8 or 16 (a load the "
              "hardware has, up to its widest), or is less than an element of the dtype";
+    case Error::hip_failed:
+      return "hip_failed: a HIP runtime call failed (an allocation, an IPC handle, a copy, a "
+             "device query)";
+    case Error::not_on_device:
+      return "not_on_device: a tensor is not on the device";
+    case Error::shape_mismatch:
+      return "shape_mismatch: a tensor's shape is not the op's (an output or a residual not the "
+             "input's, a weight not 1-D of the row, blocks not [tokens, sources, hidden], "
+             "num_blocks past its sources)";
+    case Error::dtype_mismatch:
+      return "dtype_mismatch: the tensors' dtypes differ where the op takes one";
+    case Error::not_aligned:
+      return "not_aligned: a weight or the blocks do not start at a pack";
+    case Error::inputs_overlap_outputs:
+      return "inputs_overlap_outputs: an input and an output share memory (not as the same "
+             "tensor, where the op takes that)";
+    case Error::field_out_of_range:
+      return "field_out_of_range: a config field past an int";
+    case Error::view_past_region:
+      return "view_past_region: a view the launch would read or write ends past its region "
+             "(the regions are sized from the largest call; a bug, refused before it launches)";
+    case Error::tables_full:
+      return "tables_full: every input table slot is taken (a captured exact pull a slot)";
+    case Error::ranks_disagree:
+      return "ranks_disagree: the ranks captured different numbers of in-place launches";
+    case Error::not_open:
+      return "not_open: a call on no communicator state (closed, or never opened)";
   }
   return "unknown";
 }
@@ -702,13 +741,14 @@ constexpr int64_t packs_of(int64_t elems, DType dtype, int64_t pack) {
 // the launch's stream, and its table (slot 0, written at open) points at every rank's staging. An
 // INT4 call's kernel quantizes its input into the staging itself, before its first barrier.
 
-#define HIP_CHECK(expr)                                                   \
-  do {                                                                    \
-    hipError_t _e = (expr);                                               \
-    if (_e != hipSuccess) {                                               \
-      throw std::runtime_error(std::string("hip_custom_communicator: ") + \
-                               #expr + " -> " + hipGetErrorString(_e));   \
-    }                                                                     \
+// A HIP CALL'S FAILURE, returned as hip_failed by the function it is in (every caller of HIP here
+// returns an Error); the HIP error itself is cleared.
+#define HIP_CHECK(expr)                \
+  do {                                 \
+    if ((expr) != hipSuccess) {        \
+      (void)hipGetLastError();         \
+      return Error::hip_failed;        \
+    }                                  \
   } while (0)
 
 namespace hip_custom_communicator {
@@ -733,7 +773,7 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // it at): the signals (the barrier flags), the staging (what this rank publishes of its input: an
 // eager call's copy, an INT4 payload, or the pushed all-reduce's inbox), the partials (its share's
 // sums for the all-gather; the add-RMSNorm pull's INT4 row scales at their end), then the unfenced
-// region, a guard after each. A region holds either encoding, sized for the larger: a call
+// region. A region holds either encoding, sized for the larger: a call
 // publishes exact or INT4, never both, and every reuse is ordered by a barrier the previous
 // call's readers passed.
 //
@@ -756,13 +796,6 @@ constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
 }
-// THE GUARDS: after each region's last used byte, up to the next region, kGuardBytes at least,
-// every word kGuardWord, written at open and never by a kernel: a write past a region (this rank's
-// or a peer's into it) changes one, and a checked launch (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED)
-// reads them after the kernel (October 26: n11 rebooted seven times timing the fused two-shots at
-// large sizes, every result right and every index inside the sizes the host passed).
-constexpr int64_t kGuardBytes = 4096;
-constexpr uint32_t kGuardWord = 0xdeadbeefu;
 struct ArenaLayout {
   int64_t signals = 0;
   int64_t staging = 0;
@@ -770,34 +803,24 @@ struct ArenaLayout {
   int64_t scales = 0;  // inside the partials, at their end
   int64_t unfenced = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
-  // Each region's guard, [begin, end) bytes: after the staging, after the partials and their
-  // scales, after the unfenced region.
-  int64_t staging_guard = 0, staging_guard_end = 0;
-  int64_t partials_guard = 0, partials_guard_end = 0;
-  int64_t unfenced_guard = 0, unfenced_guard_end = 0;
 };
 inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
                                 int64_t scales_bytes, int64_t unfenced_bytes) {
   ArenaLayout l;
   l.signals = 0;
   l.staging = l.signals + kSignalsRegionBytes;
-  l.staging_guard = l.staging + staging_bytes;
-  l.partials = region_aligned(l.staging_guard + kGuardBytes);
-  l.staging_guard_end = l.partials;
+  l.partials = region_aligned(l.staging + staging_bytes);
   l.scales = l.partials + partials_bytes;  // whole packs: the floats aligned
-  l.partials_guard = l.scales + scales_bytes;
-  l.unfenced = region_aligned(l.partials_guard + kGuardBytes);
-  l.partials_guard_end = l.unfenced;
-  l.unfenced_guard = l.unfenced + unfenced_bytes;
-  l.end = region_aligned(l.unfenced_guard + kGuardBytes);
-  l.unfenced_guard_end = l.end;
+  l.unfenced = region_aligned(l.scales + scales_bytes);
+  l.end = region_aligned(l.unfenced + unfenced_bytes);
   return l;
 }
 
 // INPUT TABLES: an exact call's view of every rank's input, a table of kMaxRanks addresses in the
 // private buffer, one pointer its kernel takes (aiter's RankData*). Slot 0, the eager table, points
 // at every rank's staging (an eager call copies its input there first); every later slot is a
-// captured launch's, reserved at capture and filled by Python when the capture exits. A slot is
+// captured launch's, reserved by the launch (CommsState's next_slot) and filled when the capture
+// exits (`register_graph_buffers`). A slot is
 // never reused (a graph keeps its address). An input may be overwritten once its launch ends:
 // every peer's last read of it precedes a barrier the launch waits on. The slots are fixed at open
 // (no allocation during a capture): 2^18, 16 MiB (2^14 was too few for Kimi-K3 at c48).
@@ -815,8 +838,7 @@ constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesA
           kUnfencedArray = 4, kRegionPtrArrays = 5;
 
 // THE PRIVATE BUFFER'S LAYOUT (byte offsets): the regions' device arrays, the pushed one-shot's
-// epochs, the input tables. 256-byte aligned each. Python allocates it
-// (hip_custom_communicator_alloc), writes the arrays and the tables (_write_words), and frees it.
+// epochs, the input tables. 256-byte aligned each. CommsState's (open, connect, free).
 constexpr int64_t kPrivateRegionPtrArrays = 0;
 constexpr int64_t kPrivateUnfencedEpochs =
     (int64_t{kRegionPtrArrays} * kMaxRanks * int64_t{sizeof(char*)} + 255) / 256 * 256;
@@ -825,50 +847,7 @@ constexpr int64_t kPrivateTables =
 constexpr int64_t kPrivateBytes =
     kPrivateTables + kInputTableSlots * kMaxRanks * int64_t{sizeof(void*)};
 
-// A LAUNCH'S INPUT TABLE (INPUT TABLES) in `tables`: eager (`table_slot` 0), the input copied into
-// this rank's `staging` (`staging_bytes` of it) on `stream`, and the eager table, slot 0; captured
-// (`table_slot` > 0), the slot Python reserved for this launch, filled when the capture exits.
-inline void* const* input_table(void* const* tables, int64_t table_slot, char* staging,
-                                int64_t staging_bytes, const void* input, int64_t stride_m,
-                                int64_t m, int64_t n, int64_t elem_bytes, hipStream_t stream) {
-  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-  HIP_CHECK(hipStreamIsCapturing(stream, &capture));
-  const bool captured = capture == hipStreamCaptureStatusActive;
-  if (captured != (table_slot > 0) || table_slot < 0 || table_slot >= kInputTableSlots)
-    throw std::runtime_error(
-        "hip_custom_communicator: a captured call takes the table slot reserved for it (1 to " +
-        std::to_string(kInputTableSlots - 1) + "), an eager one 0; got " +
-        std::to_string(table_slot) + (captured ? " capturing" : " eager"));
-  if (captured) return tables + table_slot * kMaxRanks;
-  const int64_t row = n * elem_bytes;
-  if (m * row > staging_bytes)
-    throw std::runtime_error("hip_custom_communicator: an eager " + std::to_string(m * row) +
-                             "-byte input exceeds the " + std::to_string(staging_bytes) +
-                             "-byte staging");
-  HIP_CHECK(hipMemcpy2DAsync(staging, static_cast<size_t>(row), input,
-                             static_cast<size_t>(stride_m * elem_bytes), static_cast<size_t>(row),
-                             static_cast<size_t>(m), hipMemcpyDeviceToDevice, stream));
-  return tables;
-}
-
-// THIS RANK'S GUARDS in its shared buffer `shared` (`layout`), read back after a launch (the caller
-// synchronized): "" where every word is kGuardWord, else the first region whose guard changed and
-// where.
-inline std::string guards_broken(const char* shared, const ArenaLayout& layout) {
-  for (const auto& [name, b, e] :
-       {std::tuple{"staging", layout.staging_guard, layout.staging_guard_end},
-        std::tuple{"partials", layout.partials_guard, layout.partials_guard_end},
-        std::tuple{"unfenced", layout.unfenced_guard, layout.unfenced_guard_end}}) {
-    std::vector<uint32_t> words(static_cast<size_t>((e - b) / 4));
-    HIP_CHECK(hipMemcpy(words.data(), shared + b, words.size() * 4, hipMemcpyDeviceToHost));
-    for (size_t i = 0; i < words.size(); ++i)
-      if (words[i] != kGuardWord)
-        return std::string("the ") + name + " guard's word " + std::to_string(i) + " of " +
-               std::to_string(words.size()) + " is " + std::to_string(words[i]) +
-               " (a write past the " + name + " region)";
-  }
-  return "";
-}
+// (A launch's input table: `input_table`, below, after CommsState.)
 
 // WHY `kernel` CANNOT LAUNCH HERE, `grid` blocks of `block` threads and `shared_bytes` of dynamic
 // LDS (a wide AttnRes row's logits), if it cannot: every check of a launch, in one place, what
@@ -1426,9 +1405,6 @@ struct type {
 template <int INT_VALUE>
 using constant = std::integral_constant<int, INT_VALUE>;
 
-[[noreturn]] inline void not_built(const std::string& what) {
-  throw std::runtime_error("hip_custom_communicator: " + what + " not built");
-}
 
 // THE C++ TYPE OF A BUILT DTYPE.
 template <DType DTYPE_ID>
@@ -1444,39 +1420,41 @@ struct of_dtype<DType::bf16> {
 
 // OVER THE BUILT LISTS (kBuild.supports), so what is compiled is what they say.
 template <typename VISITOR, size_t... INDICES>
-void by_world_in(int world, VISITOR& f, std::index_sequence<INDICES...>) {
+bool by_world_in(int world, VISITOR& f, std::index_sequence<INDICES...>) {
   constexpr auto& built = kBuild.supports.worlds;
-  if (!((world == built[INDICES] && (f(constant<built[INDICES]>{}), true)) ||
-        ...))
-    not_built("world size " + std::to_string(world));
+  return ((world == built[INDICES] && (f(constant<built[INDICES]>{}), true)) || ...);
 }
 
 template <typename VISITOR>
-void by_world(int world, VISITOR&& f) {
-  by_world_in(world, f,
+bool by_world(int world, VISITOR&& f) {
+  return by_world_in(world, f,
               std::make_index_sequence<kBuild.supports.worlds.size()>{});
 }
 
 template <typename VISITOR, size_t... INDICES>
-void by_dtype_in(DType d, VISITOR& f, std::index_sequence<INDICES...>) {
+bool by_dtype_in(DType d, VISITOR& f, std::index_sequence<INDICES...>) {
   constexpr auto& built = kBuild.supports.dtypes;
-  if (!((d == built[INDICES] &&
-         (f(type<typename of_dtype<built[INDICES]>::t>{}), true)) ||
-        ...))
-    not_built("dtype");
+  return ((d == built[INDICES] && (f(type<typename of_dtype<built[INDICES]>::t>{}), true)) ||
+          ...);
 }
 
 template <typename VISITOR>
-void by_dtype(DType d, VISITOR&& f) {
-  by_dtype_in(d, f, std::make_index_sequence<kBuild.supports.dtypes.size()>{});
+bool by_dtype(DType d, VISITOR&& f) {
+  return by_dtype_in(d, f, std::make_index_sequence<kBuild.supports.dtypes.size()>{});
 }
 
 // A norm's weight: T itself, or fp32.
 template <typename DTYPE, typename VISITOR>
-void by_weight(DType weight, DType dtype, VISITOR&& f) {
-  if (weight == dtype) return f(type<DTYPE>{});
-  if (weight == DType::f32) return f(type<float>{});
-  not_built("weight dtype");
+bool by_weight(DType weight, DType dtype, VISITOR&& f) {
+  if (weight == dtype) {
+    f(type<DTYPE>{});
+    return true;
+  }
+  if (weight == DType::f32) {
+    f(type<float>{});
+    return true;
+  }
+  return false;
 }
 
 // AN OP'S BUILD, compiled in: the one of op OP's builds (kOps) `b` is, and only those. f is
@@ -1489,15 +1467,14 @@ struct build_constant {
 };
 
 template <OpType OP, typename VISITOR, size_t... INDICES>
-void by_build_in(const BuildConfig& b, VISITOR& f, std::index_sequence<INDICES...>) {
-  if (!((b == builds_of(OP)[INDICES] && (f(build_constant<listed_build<OP, INDICES>>{}), true)) ||
-        ...))
-    not_built(std::string("kernel ") + op(OP).kernel + " at that build");
+bool by_build_in(const BuildConfig& b, VISITOR& f, std::index_sequence<INDICES...>) {
+  return ((b == builds_of(OP)[INDICES] && (f(build_constant<listed_build<OP, INDICES>>{}), true)) ||
+          ...);
 }
 
 template <OpType OP, typename VISITOR>
-void by_build(const BuildConfig& b, VISITOR&& f) {
-  by_build_in<OP>(b, f, std::make_index_sequence<builds_of(OP).size()>{});
+bool by_build(const BuildConfig& b, VISITOR&& f) {
+  return by_build_in<OP>(b, f, std::make_index_sequence<builds_of(OP).size()>{});
 }
 
 
@@ -1510,10 +1487,12 @@ constexpr DType dtype_of = std::is_same_v<T, c10::Half> ? DType::f16 : std::is_s
 
 // OP `OP`'S INSTANCE for a call, compiled in: its build, the world, the dtypes, and which of
 // the build's instances the call runs (contiguous, chunked, with a tail, quantizing). `f` is handed
-// the Instance as its template argument, every field a constant.
+// the Instance as its template argument, every field a constant. Whether the build compiled that
+// instance (a call validated first always finds it).
 template <OpType OP, typename F>
-void with_instance(const build_t<OP>& build, int world, DType dtype, DType weight_dtype,
+bool with_instance(const build_t<OP>& build, int world, DType dtype, DType weight_dtype,
                    bool contiguous, bool chunked, bool tail, bool quantize_int4, F&& f) {
+  bool found = false;
   by_world(world, [&](auto world_constant) {
     by_dtype(dtype, [&](auto dtype_constant) {
       using T = typename decltype(dtype_constant)::t;
@@ -1531,6 +1510,7 @@ void with_instance(const build_t<OP>& build, int world, DType dtype, DType weigh
                                            CONTIGUOUS, CHUNKED, TAIL, QUANTIZE_INT4};
             }();
             f.template operator()<I>();
+            found = true;
           };
           // THE INSTANCES a build has: contiguous or strided (the plain two-shots), chunked or not
           // (the norms and AttnRes), with a tail or not (the INT4 two-shots), and the plain
@@ -1563,6 +1543,7 @@ void with_instance(const build_t<OP>& build, int world, DType dtype, DType weigh
       else weight(type<T>{});
     });
   });
+  return found;
 }
 
 // AN INSTANCE'S KERNEL: every kernel's template arguments, the one list of them (builds.py reads
@@ -1713,22 +1694,232 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
 
 namespace hip_custom_communicator {
 
-// WHAT EVERY LAUNCH READS, and none changes: this rank and the world,
-// its buffers (Python's: allocated, exchanged and freed there) and their regions' sizes, how long a
-// kernel waits on a peer, and whether each launch is checked after it runs. Made once at open,
-// held by Python as a handle, freed at close.
-struct LaunchState {
-  int rank;
-  int world;
-  char* shared_buffer;
-  char* private_buffer;
-  uint32_t* status_device;
-  uint64_t timeout_ticks;
-  int64_t max_rows;
-  int64_t staging_bytes;
-  int64_t partials_bytes;
-  bool checked_after_launch;
+// THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (this rank, the world,
+// the device, the largest call, a wait's bound), what follows from it (the exchange's sizes, the
+// arena's layout), what it holds (its buffers, OWNED; each peer's shared buffer as this process
+// opened it, BORROWED), and the captured launches' input tables (the next free slot, those awaiting
+// registration, the peers' inputs opened for them). Made by `open_state`, completed by
+// `connect_state`, released by `close_peers` then `free_state`; Python holds it as a handle. A launch reads it, and a
+// captured in-place launch reserves its slot in it: its one mutation during a call.
+struct CommsState {
+  int rank = 0;
+  int world = 0;
+  int device = 0;
+  int64_t max_rows = 0;
+  uint64_t timeout_ticks = 0;
+  int64_t staging_bytes = 0;
+  int64_t partials_bytes = 0;
+  ArenaLayout layout;
+  char* shared_buffer = nullptr;   // OWNED: the arena, exported to the peers
+  char* private_buffer = nullptr;  // OWNED: the region arrays, the epochs, the input tables
+  uint32_t* status_device = nullptr;  // OWNED: a kernel's fault record, written before it traps
+  std::vector<char*> peers;        // BORROWED: each rank's arena as opened here (its own: ours)
+  int64_t next_slot = 1;
+  std::vector<std::pair<int64_t, const void*>> pending;  // (slot, input), captured, unregistered
+  std::map<std::vector<char>, char*> opened_inputs;      // BORROWED: a peer allocation, by handle
 };
+
+// OPEN: the state of a communicator at `rank` of `world` on `device`, serving `max_rows` rows of
+// at most `max_cols` columns, a wait giving up after `timeout_seconds` (in the device clock's
+// ticks): the device supported (else its Error, nothing allocated: the caller does not run here),
+// the exchange sized, and the buffers allocated and zeroed (none is any peer's yet: `connect_state`).
+inline std::optional<Error> open_state(CommsState& s, int rank, int world, int device,
+                                 int64_t max_rows, int64_t max_cols, double timeout_seconds) {
+  if (rank < 0 || rank >= world) return Error::world_not_built;
+  const std::variant<Supported, Error> found = supported(device, world);
+  if (const Error* e = std::get_if<Error>(&found)) return *e;
+  if (max_rows < 1 || max_cols < 1) return Error::field_not_positive;
+  HIP_CHECK(hipSetDevice(device));
+  int khz = 0;
+  HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
+  const ExchangeSizes sizes = exchange_sizes(max_rows, max_cols, world);
+  s.rank = rank;
+  s.world = world;
+  s.device = device;
+  s.max_rows = max_rows;
+  s.timeout_ticks = static_cast<uint64_t>(timeout_seconds * khz * 1000);
+  s.staging_bytes = sizes.staging_bytes;
+  s.partials_bytes = sizes.partials_bytes;
+  s.layout = arena_layout(sizes.staging_bytes, sizes.partials_bytes,
+                          max_rows * int64_t{sizeof(float)}, unfenced_bytes(world));
+  void* shared = nullptr;
+  void* priv = nullptr;
+  void* status = nullptr;
+  HIP_CHECK(hipExtMallocWithFlags(&shared, static_cast<size_t>(s.layout.end), kArenaMallocFlags));
+  s.shared_buffer = static_cast<char*>(shared);
+  HIP_CHECK(hipMalloc(&priv, static_cast<size_t>(kPrivateBytes)));
+  s.private_buffer = static_cast<char*>(priv);
+  HIP_CHECK(hipMalloc(&status, kStatusFields * sizeof(uint32_t)));
+  s.status_device = static_cast<uint32_t*>(status);
+  HIP_CHECK(hipMemset(s.shared_buffer, 0, static_cast<size_t>(s.layout.end)));
+  HIP_CHECK(hipMemset(s.private_buffer, 0, static_cast<size_t>(kPrivateBytes)));
+  HIP_CHECK(hipMemset(s.status_device, 0, kStatusFields * sizeof(uint32_t)));
+  HIP_CHECK(hipDeviceSynchronize());
+  return std::nullopt;
+}
+
+// THIS RANK'S ARENA'S IPC HANDLE, for the peers (`open` allocated it: its own base).
+inline std::optional<Error> ipc_handle(const CommsState& s, hipIpcMemHandle_t& handle) {
+  HIP_CHECK(hipIpcGetMemHandle(&handle, s.shared_buffer));
+  return std::nullopt;
+}
+
+// CONNECT: every peer's arena opened from its handle (`handles`, by rank; this rank's ignored),
+// then the private buffer written: each region's array of every rank's address of it (0 past the
+// world), and the eager input table, slot 0: every rank's staging.
+inline std::optional<Error> connect_state(CommsState& s, const std::vector<hipIpcMemHandle_t>& handles) {
+  if (static_cast<int>(handles.size()) != s.world) return Error::world_not_built;
+  s.peers.assign(s.world, nullptr);
+  for (int r = 0; r < s.world; ++r) {
+    if (r == s.rank) {
+      s.peers[r] = s.shared_buffer;
+      continue;
+    }
+    void* base = nullptr;
+    HIP_CHECK(hipIpcOpenMemHandle(&base, handles[r], hipIpcMemLazyEnablePeerAccess));
+    s.peers[r] = static_cast<char*>(base);
+  }
+  const int64_t offsets[kRegionPtrArrays] = {s.layout.signals, s.layout.staging, s.layout.partials,
+                                             s.layout.scales, s.layout.unfenced};
+  std::vector<char*> arrays(kRegionPtrArrays * kMaxRanks, nullptr);
+  for (int a = 0; a < kRegionPtrArrays; ++a)
+    for (int r = 0; r < s.world; ++r) arrays[a * kMaxRanks + r] = s.peers[r] + offsets[a];
+  HIP_CHECK(hipMemcpy(s.private_buffer + kPrivateRegionPtrArrays, arrays.data(),
+                      arrays.size() * sizeof(char*), hipMemcpyHostToDevice));
+  std::vector<char*> eager(kMaxRanks, nullptr);
+  for (int r = 0; r < s.world; ++r) eager[r] = s.peers[r] + s.layout.staging;
+  HIP_CHECK(hipMemcpy(s.private_buffer + kPrivateTables, eager.data(),
+                      eager.size() * sizeof(char*), hipMemcpyHostToDevice));
+  return std::nullopt;
+}
+
+// A LAUNCH'S INPUT TABLE (INPUT TABLES): eager, the input copied into this rank's staging on
+// `stream` and the eager table, slot 0, rows `n` apart; captured, the next slot reserved for it
+// (filled by `register_graph_buffers` when the capture exits), rows at the input's own stride.
+inline std::optional<Error> input_table(CommsState& s, const void* input, int64_t stride_m,
+                                        int64_t m, int64_t n, int64_t elem_bytes,
+                                        hipStream_t stream, void* const*& table,
+                                        int64_t& table_stride_m) {
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
+  if (capture == hipStreamCaptureStatusActive) {
+    if (s.next_slot >= kInputTableSlots) return Error::tables_full;
+    s.pending.emplace_back(s.next_slot, input);
+    table = tables + s.next_slot * kMaxRanks;
+    table_stride_m = stride_m;
+    ++s.next_slot;
+    return std::nullopt;
+  }
+  const int64_t row = n * elem_bytes;
+  if (m * row > s.staging_bytes) return Error::staging_too_small;
+  HIP_CHECK(hipMemcpy2DAsync(s.shared_buffer + s.layout.staging, static_cast<size_t>(row), input,
+                             static_cast<size_t>(stride_m * elem_bytes), static_cast<size_t>(row),
+                             static_cast<size_t>(m), hipMemcpyDeviceToDevice, stream));
+  table = tables;
+  table_stride_m = n;
+  return std::nullopt;
+}
+
+// THE CAPTURED LAUNCHES' INPUTS FOR THE PEERS (vLLM's get_graph_buffer_ipc_meta): each pending
+// input's allocation's IPC handle and the input's offset in it, in the order reserved.
+inline std::optional<Error> graph_ipc_meta(const CommsState& s,
+                                           std::vector<hipIpcMemHandle_t>& handles,
+                                           std::vector<int64_t>& offsets) {
+  for (const auto& [slot, input] : s.pending) {
+    void* base = nullptr;
+    HIP_CHECK(hipPointerGetAttribute(&base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                     reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(input))));
+    hipIpcMemHandle_t h;
+    HIP_CHECK(hipIpcGetMemHandle(&h, base));
+    handles.push_back(h);
+    offsets.push_back(static_cast<const char*>(input) - static_cast<const char*>(base));
+  }
+  return std::nullopt;
+}
+
+// THE CAPTURED LAUNCHES' TABLES WRITTEN (vLLM's register_graph_buffers): every rank's pending
+// inputs (`handles` and `offsets`, a rank's after another's, each `s.pending.size()` long), each
+// peer allocation opened once (cached by its handle), every pending slot written, none pending
+// after. Ranks that captured different counts are refused (ranks_disagree).
+inline std::optional<Error> register_graph_buffers(CommsState& s,
+                                                   const std::vector<hipIpcMemHandle_t>& handles,
+                                                   const std::vector<int64_t>& offsets) {
+  const size_t count = s.pending.size();
+  if (handles.size() != count * s.world || offsets.size() != handles.size())
+    return Error::ranks_disagree;
+  const auto tables = reinterpret_cast<char*>(s.private_buffer + kPrivateTables);
+  for (size_t i = 0; i < count; ++i) {
+    const auto& [slot, input] = s.pending[i];
+    std::vector<const void*> table(kMaxRanks, nullptr);
+    for (int r = 0; r < s.world; ++r) {
+      if (r == s.rank) {
+        table[r] = input;
+        continue;
+      }
+      const hipIpcMemHandle_t& h = handles[r * count + i];
+      std::vector<char> key(reinterpret_cast<const char*>(&h),
+                            reinterpret_cast<const char*>(&h) + sizeof(h));
+      auto it = s.opened_inputs.find(key);
+      if (it == s.opened_inputs.end()) {
+        void* base = nullptr;
+        HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
+        it = s.opened_inputs.emplace(key, static_cast<char*>(base)).first;
+      }
+      table[r] = it->second + offsets[r * count + i];
+    }
+    HIP_CHECK(hipMemcpy(tables + slot * kMaxRanks * int64_t{sizeof(void*)}, table.data(),
+                        table.size() * sizeof(void*), hipMemcpyHostToDevice));
+  }
+  s.pending.clear();
+  return std::nullopt;
+}
+
+// CLOSE THE PEERS: every BORROWED mapping closed (the peers' arenas, their captured inputs), every
+// one tried: the first failure's Error. The caller has every launch finished first, and every
+// rank stopped (close is a collective).
+inline std::optional<Error> close_peers(CommsState& s) {
+  std::optional<Error> first;
+  for (int r = 0; r < static_cast<int>(s.peers.size()); ++r)
+    if (r != s.rank && s.peers[r] != nullptr && hipIpcCloseMemHandle(s.peers[r]) != hipSuccess) {
+      (void)hipGetLastError();
+      first = first.value_or(Error::hip_failed);
+    }
+  for (const auto& [key, base] : s.opened_inputs)
+    if (hipIpcCloseMemHandle(base) != hipSuccess) {
+      (void)hipGetLastError();
+      first = first.value_or(Error::hip_failed);
+    }
+  s.peers.clear();
+  s.opened_inputs.clear();
+  return first;
+}
+
+// FREE: this rank's OWNED buffers freed, every one tried: the first failure's Error. Once no peer
+// has them open (after every rank's close_peers).
+inline std::optional<Error> free_state(CommsState& s) {
+  std::optional<Error> first;
+  for (void* p : {static_cast<void*>(s.shared_buffer), static_cast<void*>(s.private_buffer),
+                  static_cast<void*>(s.status_device)})
+    if (p != nullptr && hipFree(p) != hipSuccess) {
+      (void)hipGetLastError();
+      first = first.value_or(Error::hip_failed);
+    }
+  s.shared_buffer = s.private_buffer = nullptr;
+  s.status_device = nullptr;
+  return first;
+}
+
+// A VIEW INSIDE ITS REGION: `slots` x `rows` x `cols` elements of `elem` bytes at their strides end
+// within `region_bytes` (an empty view is inside any). Every launch's views checked before it
+// launches (October 26: n11 rebooted seven times timing the fused two-shots at size; the kernels
+// check their indices only against the sizes they are handed).
+constexpr bool view_fits(int64_t slots, int64_t stride_slot, int64_t rows, int64_t stride_m,
+                         int64_t cols, int64_t stride_n, int64_t elem, int64_t region_bytes) {
+  if (slots <= 0 || rows <= 0 || cols <= 0) return true;
+  const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
+  return stride_slot >= 0 && stride_m >= 0 && stride_n >= 0 && (last + 1) * elem <= region_bytes;
+}
 
 // A LAUNCH DIMENSION AS HIP TAKES IT.
 inline dim3 dim3_of(const Dim3& d) {
@@ -1742,7 +1933,7 @@ inline dim3 dim3_of(const Dim3& d) {
 // =================================================================================================
 
 inline std::optional<Error> all_reduce(
-    const LaunchState& s, int64_t table_slot, const void* input,
+    CommsState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, DType dtype, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
@@ -1800,15 +1991,14 @@ inline std::optional<Error> all_reduce(
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
   const void* kernel = nullptr;
-  with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
     return *e;
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
-                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
       reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
@@ -1818,7 +2008,6 @@ inline std::optional<Error> all_reduce(
   char* const* const unfenced_ptr_array = region_ptr_arrays + kUnfencedArray * kMaxRanks;
   const auto unfenced_epochs =
       reinterpret_cast<int32_t*>(s.private_buffer + kPrivateUnfencedEpochs);
-  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, unfenced_stride_slot = 0, unfenced_stride_m = 0, unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0, unfenced_size_n = 0;
@@ -1864,62 +2053,27 @@ inline std::optional<Error> all_reduce(
     partials_size_m = 0;
     partials_size_n = 0;
   }
+  // EVERY VIEW INSIDE ITS REGION (view_fits).
+  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, elem_bytes(dtype), s.staging_bytes) ||
+      !view_fits(unfenced_size_slot, unfenced_stride_slot, unfenced_size_m, unfenced_stride_m, unfenced_size_n, unfenced_stride_n, elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), unfenced_bytes(s.world)) ||
+      !view_fits(1, 0, int64_t{kUnfencedBlocks}, kUnfencedEpochsStrideBlock, kUnfencedEpochsStrideBlock, int64_t{1}, 4, kUnfencedEpochsBytes))
+    return Error::view_past_region;
+  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
+  // pull), or none where it reads the staging.
+  void* const* table = nullptr;
+  int64_t table_stride_m = staging_stride_m;
+  if (in_place)
+    if (const std::optional<Error> e = input_table(s, input, input_stride_m, input_size_m,
+                                                   input_size_n, elem_bytes(dtype), stream, table,
+                                                   table_stride_m))
+      return *e;
+  const int table_size = in_place ? s.world : 0;
+  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what all_reduce is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator all_reduce before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
-    fits("partials", 1, 0, partials_size_m, partials_stride_m, partials_size_n,
-         partials_stride_n, elem_bytes(dtype), s.partials_bytes);
-    fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
-         staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    fits("unfenced", unfenced_size_slot, unfenced_stride_slot, unfenced_size_m,
-         unfenced_stride_m, unfenced_size_n, unfenced_stride_n,
-         elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), (layout.unfenced_guard - layout.unfenced));
-    fits("unfenced epochs", 1, 0, int64_t{kUnfencedBlocks}, kUnfencedEpochsStrideBlock,
-         kUnfencedEpochsStrideBlock, int64_t{1}, 4, kUnfencedEpochsBytes);
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator all_reduce before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
-    // THE INSTANCE THE CALL'S BYTES NAME: an INT4 build quantizing from its quantize_from_bytes
-    // on and passing the call exact below; an exact build never quantizing.
-    if (I.quantize_int4 != (B.quantization == Quantization::int4 &&
-                       input_size_m * input_size_n * elem_bytes(dtype) >=
-                           quantize_from))
-      throw std::runtime_error(
-          "hip_custom_communicator all_reduce before its launch: the instance (quantize_int4 " +
-          std::to_string(I.quantize_int4) + ") is not the one " +
-          std::to_string(input_size_m * input_size_n * elem_bytes(dtype)) +
-          " bytes name at quantize_from_bytes " +
-          std::to_string(quantize_from));
-    // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
-    // it reads the staging.
-    const bool in_table = in_place;
-    void* const* const table =
-        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
-                               input, input_stride_m, input_size_m, input_size_n,
-                               elem_bytes(dtype), stream)
-                 : nullptr;
-    const int table_size = in_table ? s.world : 0;
-    const int64_t table_stride_m =
-        !in_table ? staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
-    const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.contiguous, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -1944,41 +2098,6 @@ inline std::optional<Error> all_reduce(
         int64_t{1}, int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, s.status_device, int64_t{1},
         int64_t{kStatusFields}, s.rank, s.timeout_ticks);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
-          throw std::runtime_error("hip_custom_communicator all_reduce after its launch: " + broken);
-        std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
-        if (words[static_cast<int>(StatusField::state)] != 0 ||
-            words[static_cast<int>(StatusField::abort)] != 0)
-          throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a fault or an "
-                                   "abort in the status");
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator all_reduce after its launch: output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -1991,7 +2110,7 @@ inline std::optional<Error> all_reduce(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_rms_norm(
-    const LaunchState& s, int64_t table_slot, const void* input,
+    CommsState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
     int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n,
@@ -2038,22 +2157,20 @@ inline std::optional<Error> all_reduce_rms_norm(
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = build.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
   const void* kernel = nullptr;
-  with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
     return *e;
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
-                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
       reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
@@ -2069,46 +2186,25 @@ inline std::optional<Error> all_reduce_rms_norm(
   staging_size_n = row_n;
   in_place = !is_push(algorithm) &&
       build.quantization == Quantization::exact;
+  // EVERY VIEW INSIDE ITS REGION (view_fits).
+  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, elem_bytes(dtype), s.staging_bytes))
+    return Error::view_past_region;
+  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
+  // pull), or none where it reads the staging.
+  void* const* table = nullptr;
+  int64_t table_stride_m = staging_stride_m;
+  if (in_place)
+    if (const std::optional<Error> e = input_table(s, input, input_stride_m, input_size_m,
+                                                   input_size_n, elem_bytes(dtype), stream, table,
+                                                   table_stride_m))
+      return *e;
+  const int table_size = in_place ? s.world : 0;
+  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what all_reduce_rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
-    fits("partials", 1, 0, partials_size_m, partials_stride_m, partials_size_n,
-         partials_stride_n, elem_bytes(dtype), s.partials_bytes);
-    fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
-         staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
-    // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
-    // it reads the staging.
-    const bool in_table = quantization_of(build) == Quantization::exact;
-    void* const* const table =
-        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
-                               input, input_stride_m, input_size_m, input_size_n,
-                               elem_bytes(dtype), stream)
-                 : nullptr;
-    const int table_size = in_table ? s.world : 0;
-    const int64_t table_stride_m =
-        !in_table ? staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
-    const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2131,41 +2227,6 @@ inline std::optional<Error> all_reduce_rms_norm(
         int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, s.status_device, int64_t{1},
         int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of all_reduce_rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
-          throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: " + broken);
-        std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
-        if (words[static_cast<int>(StatusField::state)] != 0 ||
-            words[static_cast<int>(StatusField::abort)] != 0)
-          throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a fault or an "
-                                   "abort in the status");
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -2175,7 +2236,7 @@ inline std::optional<Error> all_reduce_rms_norm(
 // fused_add_rms_norm(all_reduce(inp), residual, weight), vLLM's roundings
 // exactly.
 inline std::optional<Error> all_reduce_add_rms_norm(
-    const LaunchState& s, int64_t table_slot, const void* input,
+    CommsState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* residual, int64_t residual_stride_m, int64_t residual_stride_n,
     int64_t residual_size_m, int64_t residual_size_n, const void* weight, int64_t weight_stride_n,
@@ -2241,15 +2302,14 @@ inline std::optional<Error> all_reduce_add_rms_norm(
       (m + s.world - 1) / s.world > s.max_rows)
     return Error::partials_too_small;
   const void* kernel = nullptr;
-  with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
     return *e;
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
-                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
       reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
@@ -2258,7 +2318,6 @@ inline std::optional<Error> all_reduce_add_rms_norm(
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   const auto scales_ptr_array =
       reinterpret_cast<float* const*>(region_ptr_arrays + kScalesArray * kMaxRanks);
-  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, scales_stride_m = 0, scales_size_m = 0;
@@ -2277,47 +2336,26 @@ inline std::optional<Error> all_reduce_add_rms_norm(
   staging_size_n = payload_row(algorithm, build.quantization, n);
   in_place = !is_push(algorithm) &&
       build.quantization == Quantization::exact;
+  // EVERY VIEW INSIDE ITS REGION (view_fits).
+  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, elem_bytes(dtype), s.staging_bytes) ||
+      !view_fits(1, 0, scales_size_m, scales_stride_m, 1, 1, 4, s.max_rows * int64_t{sizeof(float)}))
+    return Error::view_past_region;
+  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
+  // pull), or none where it reads the staging.
+  void* const* table = nullptr;
+  int64_t table_stride_m = staging_stride_m;
+  if (in_place)
+    if (const std::optional<Error> e = input_table(s, input, input_stride_m, input_size_m,
+                                                   input_size_n, elem_bytes(dtype), stream, table,
+                                                   table_stride_m))
+      return *e;
+  const int table_size = in_place ? s.world : 0;
+  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what all_reduce_add_rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_add_rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
-    fits("partials", 1, 0, partials_size_m, partials_stride_m, partials_size_n,
-         partials_stride_n, elem_bytes(dtype), s.partials_bytes);
-    fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
-         staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    fits("scales", 1, 0, scales_size_m, scales_stride_m, 1, 1, 4, (layout.partials_guard - layout.scales));
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
-    // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
-    // it reads the staging.
-    const bool in_table = quantization_of(build) == Quantization::exact;
-    void* const* const table =
-        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
-                               input, input_stride_m, input_size_m, input_size_n,
-                               elem_bytes(dtype), stream)
-                 : nullptr;
-    const int table_size = in_table ? s.world : 0;
-    const int64_t table_stride_m =
-        !in_table ? staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
-    const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_add_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2347,44 +2385,6 @@ inline std::optional<Error> all_reduce_add_rms_norm(
         int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, s.status_device, int64_t{1},
         int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of all_reduce_add_rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
-          throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: " + broken);
-        std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
-        if (words[static_cast<int>(StatusField::state)] != 0 ||
-            words[static_cast<int>(StatusField::abort)] != 0)
-          throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a fault or an "
-                                   "abort in the status");
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: output not "
-                                     "finite where the input is");
-          if (!finite(residual_output, residual_output_stride_m, residual_output_size_m, residual_output_size_n))
-            throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: residual_output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -2399,7 +2399,7 @@ inline std::optional<Error> all_reduce_add_rms_norm(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
-    const LaunchState& s, int64_t table_slot,
+    CommsState& s,
     const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
     int64_t input_size_n, const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
     int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m,
@@ -2474,22 +2474,20 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = build.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
   const void* kernel = nullptr;
-  with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
     return *e;
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
-                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
       reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
@@ -2505,46 +2503,25 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
   staging_size_n = row_n;
   in_place = !is_push(algorithm) &&
       build.quantization == Quantization::exact;
+  // EVERY VIEW INSIDE ITS REGION (view_fits).
+  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, elem_bytes(dtype), s.staging_bytes))
+    return Error::view_past_region;
+  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
+  // pull), or none where it reads the staging.
+  void* const* table = nullptr;
+  int64_t table_stride_m = staging_stride_m;
+  if (in_place)
+    if (const std::optional<Error> e = input_table(s, input, input_stride_m, input_size_m,
+                                                   input_size_n, elem_bytes(dtype), stream, table,
+                                                   table_stride_m))
+      return *e;
+  const int table_size = in_place ? s.world : 0;
+  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what all_reduce_add_attn_res_rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    const auto fits = [&](const char* region, int64_t slots, int64_t stride_slot, int64_t rows,
-                          int64_t stride_m, int64_t cols, int64_t stride_n, int64_t elem,
-                          int64_t region_bytes) {
-      if (slots <= 0 || rows <= 0 || cols <= 0) return;
-      const int64_t last = (slots - 1) * stride_slot + (rows - 1) * stride_m + (cols - 1) * stride_n;
-      if (stride_slot < 0 || stride_m < 0 || stride_n < 0 || (last + 1) * elem > region_bytes)
-        throw std::runtime_error(std::string("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: the ") +
-            region + " view (" + std::to_string(slots) + " slots of " + std::to_string(rows) +
-            " rows of " + std::to_string(cols) + ", strides " + std::to_string(stride_slot) + ", " +
-            std::to_string(stride_m) + ", " + std::to_string(stride_n) + ") ends at byte " +
-            std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
-    };
-    fits("partials", 1, 0, partials_size_m, partials_stride_m, partials_size_n,
-         partials_stride_n, elem_bytes(dtype), s.partials_bytes);
-    fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
-         staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
-    // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
-    // it reads the staging.
-    const bool in_table = quantization_of(build) == Quantization::exact;
-    void* const* const table =
-        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
-                               input, input_stride_m, input_size_m, input_size_n,
-                               elem_bytes(dtype), stream)
-                 : nullptr;
-    const int table_size = in_table ? s.world : 0;
-    const int64_t table_stride_m =
-        !in_table ? staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
-    const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_add_attn_res_rms_norm<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n,
         B.tile_k, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2581,41 +2558,6 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
         int64_t{kMaxRanks}, s.status_device, int64_t{1},
         int64_t{kStatusFields}, s.rank, s.timeout_ticks, num_blocks, eps,
         output_eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of all_reduce_add_attn_res_rms_norm after it: no write past a region (the guards), no
-    // fault, every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
-          throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: " + broken);
-        std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
-        if (words[static_cast<int>(StatusField::state)] != 0 ||
-            words[static_cast<int>(StatusField::abort)] != 0)
-          throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a fault or an "
-                                   "abort in the status");
-        // EVERY SIGNAL CLEAR is every rank's promise once every rank finished (a faster peer's next
-        // launch sets its first barrier's flags here before this rank looks): the caller's, between
-        // two barriers of every rank (the communicator's check_after, the tests' _assert_clean).
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -2629,7 +2571,7 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
 // rms_norm: out = rms_norm(inp, weight), vLLM's roundings exactly, on this rank's rows; the
 // weight `weight_dtype`, dtype or f32.
 inline std::optional<Error> rms_norm(
-    const LaunchState& s, const void* input, int64_t input_stride_m,
+    CommsState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* weight,
     int64_t weight_stride_n, int64_t weight_size_n, void* output, int64_t output_stride_m,
     int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n, DType dtype,
@@ -2661,7 +2603,8 @@ inline std::optional<Error> rms_norm(
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   const void* kernel = nullptr;
-  with_instance<OpType::rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
     return *e;
 
@@ -2670,14 +2613,6 @@ inline std::optional<Error> rms_norm(
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
     rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu,
         I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2686,30 +2621,6 @@ inline std::optional<Error> rms_norm(
         static_cast<const W*>(weight), weight_stride_n, static_cast<int>(weight_size_n),
         static_cast<T*>(output), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n), eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of rms_norm after it: (a norm on rows
-    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator rms_norm after its launch: output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -2718,7 +2629,7 @@ inline std::optional<Error> rms_norm(
 // add_rms_norm: out, residual_out = fused_add_rms_norm(inp, residual, weight), vLLM's roundings
 // exactly, on this rank's rows.
 inline std::optional<Error> add_rms_norm(
-    const LaunchState& s, const void* input, int64_t input_stride_m,
+    CommsState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* residual,
     int64_t residual_stride_m, int64_t residual_stride_n, int64_t residual_size_m,
     int64_t residual_size_n, const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
@@ -2756,7 +2667,8 @@ inline std::optional<Error> add_rms_norm(
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   const void* kernel = nullptr;
-  with_instance<OpType::add_rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::add_rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
     return *e;
 
@@ -2765,14 +2677,6 @@ inline std::optional<Error> add_rms_norm(
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what add_rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator add_rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
     add_rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
         B.waves_per_eu, I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2785,33 +2689,6 @@ inline std::optional<Error> add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output), residual_output_stride_m, residual_output_stride_n,
         static_cast<int>(residual_output_size_m), static_cast<int>(residual_output_size_n), eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of add_rms_norm after it: (a norm on rows
-    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: output not "
-                                     "finite where the input is");
-          if (!finite(residual_output, residual_output_stride_m, residual_output_size_m, residual_output_size_n))
-            throw std::runtime_error("hip_custom_communicator add_rms_norm after its launch: residual_output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
@@ -2820,7 +2697,7 @@ inline std::optional<Error> add_rms_norm(
 // add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each of this rank's rows
 // (all_reduce_add_attn_res_rms_norm's, its input the sum), `num_blocks` sources.
 inline std::optional<Error> add_attn_res_rms_norm(
-    const LaunchState& s, const void* input,
+    CommsState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, int64_t prefix_size_m,
     int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
@@ -2877,7 +2754,8 @@ inline std::optional<Error> add_attn_res_rms_norm(
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   const void* kernel = nullptr;
-  with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (!with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
+    return Error::tile_not_built;
   if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
     return *e;
 
@@ -2885,14 +2763,6 @@ inline std::optional<Error> add_attn_res_rms_norm(
   with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
-    // BEFORE THE LAUNCH, every expectation of what add_attn_res_rms_norm is handed (October 26: n11 rebooted
-    // seven times timing the fused two-shots at size; the kernels check their indices only
-    // against these sizes, so a size past its region was never caught): each view of a region
-    // inside the region, and the grid inside the signals' slots.
-    if (volume(grid) > int64_t{kMaxBlocks})
-      throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm before its launch: a grid of " +
-          std::to_string(volume(grid)) + " blocks past the signals' " +
-          std::to_string(int64_t{kMaxBlocks}));
     add_attn_res_rms_norm_rows<T, B.tile_m, B.tile_n, B.tile_k, B.block.x, I.wave_size,
         B.pack_bytes, B.waves_per_eu, I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2913,30 +2783,6 @@ inline std::optional<Error> add_attn_res_rms_norm(
         static_cast<T*>(block_output), block_output_stride_m, block_output_stride_n,
         static_cast<int>(block_output_size_m), static_cast<int>(block_output_size_n), num_blocks,
         eps, output_eps);
-    // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
-    // kernel done, every expectation of add_attn_res_rms_norm after it: (a norm on rows
-    // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (s.checked_after_launch) {
-      hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
-      HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
-      if (capturing == hipStreamCaptureStatusNone) {
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(stream));
-        const auto finite = [&](const void* ptr, int64_t stride_m, int64_t rows, int64_t cols) {
-          std::vector<T> host(static_cast<size_t>(rows * cols));
-          HIP_CHECK(hipMemcpy2D(host.data(), cols * sizeof(T), ptr, stride_m * sizeof(T),
-                                cols * sizeof(T), rows, hipMemcpyDeviceToHost));
-          for (const T& x : host)
-            if (!std::isfinite(static_cast<float>(x))) return false;
-          return true;
-        };
-        if (finite(input, input_stride_m, input_size_m, input_size_n)) {
-          if (!finite(output, output_stride_m, output_size_m, output_size_n))
-            throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm after its launch: output not "
-                                     "finite where the input is");
-        }
-      }
-    }
   });
   HIP_CHECK(hipGetLastError());
   return std::nullopt;

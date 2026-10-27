@@ -140,10 +140,8 @@ enum class Where : uint32_t {
   peer_barrier,  // a later barrier
 };
 
-// A RANK'S STATUS: 32-bit words in host-mapped memory, `status[field]` (a StatusField), so the host
-// reads it and sets `abort` while a kernel runs, and a graph replay still reports. A wait past its
-// timeout claims the fault once (the first block to claim `state`), writes it and sets `abort`;
-// every wait leaves once `abort` is set, so one fault ends the rank's kernel.
+// A RANK'S STATUS: 32-bit words in device memory, `status[field]` (a StatusField). A wait past its
+// timeout claims the fault once (the first block to claim `state`), writes it and traps.
 // A FLAG'S STATES, the only values a barrier writes: `arrived` into a peer's
 // slot for it, `clear` into its own once it has seen it. Between launches every
 // flag is `clear`; any other value is not a state the protocol has, so the
@@ -275,9 +273,9 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const*
 
 // THE FAULT, written once by the first wait on this rank to give up (the two waits on a peer:
 // barrier's flag and the line read's lines, read_buffer): `state` claimed 0 -> 1, the fields, then
-// 2 released, so the host reads them only whole. Then `abort`, so every other wait on this rank
-// leaves at its next check rather than spinning out its own timeout. The caller then ends its wave.
-// Its own reason: two waits writing the one record would drift.
+// 2 released (a debugger reads them whole). Then THE WAVE TRAPS: a peer that never arrived is a
+// device error the process sees at its next synchronization, never a hang and never a garbage
+// output. Its own reason: two waits writing the one record would drift.
 DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
                      Where where, int rank, uint32_t peer, uint32_t count, uint32_t want,
                      uint64_t waited) {
@@ -304,7 +302,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
     __scoped_atomic_store_n(word(StatusField::state), static_cast<uint32_t>(FaultState::written),
                             __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
   }
-  __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  __builtin_trap();
 }
 
 // A LOAD NEVER BRANCHES: a thread outside a narrow layout loads its clamped, in-bounds place and
@@ -1452,11 +1450,8 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     // 64 cycles late seeing each barrier's last peer (aiter's waits poll bare; the two-shot pull
     // lost 1-3% to its 2-stage at the same grid, 2026-10-25T03-37-04Z). EVERY 256 POLLS, the
     // slow path: the clock, and the
-    // status's `abort` (host-mapped, so only here, never in the fast path). Past the timeout
-    // the wait records the fault; timed out or aborted, the WAVE ENDS (s_endpgm): an ended wave
-    // no longer counts at the block's s_barrier, so the block's other waves run on to their own
-    // next wait, see `abort`, and end too. The kernel's output is then garbage and the
-    // communicator broken (the host's watchdog).
+    // status's `abort`, only here, never in the fast path. Past the timeout the wait records the
+    // fault and traps (give_up); aborted, the WAVE ENDS (s_endpgm).
     const uint32_t want = static_cast<uint32_t>(FlagState::arrived);
     // One word of this rank's status, by its field, at the buffer's stride.
     const auto word = [&](StatusField f) {

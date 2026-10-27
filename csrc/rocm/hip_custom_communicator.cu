@@ -32,57 +32,46 @@
 #include "hip_custom_communicator/hip_custom_communicator.cuh"
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. Nothing crosses but values and handles: Python owns the communicator's
-// memory (three buffers a rank: shared, private, host) as addresses and its launch state (a plain
-// struct) as a handle, makes and frees each through the functions below, and hands each op its
-// launch state, its tensors and its config's values. C++ keeps nothing between calls Python holds
-// no handle to.
+// THE TORCH OP BOUNDARY. Nothing crosses but values and one handle: the communicator's state
+// (CommsState, C++'s: its memory, its peers, its captured inputs), made, connected and freed through
+// the functions below; Python does only the exchange over its CPU group. EVERY ERROR IS A VALUE:
+// no function here raises; each returns the Error's number it was refused for (none: it ran), and
+// Python names it.
 // =================================================================================
 
-// EACH OP TAKES ITS LAUNCH STATE (a handle, below), its tensors and values, then its
-// config's fields as plain values, its op's own (an algorithm where its kernel has several, tile_k
+// EACH OP TAKES ITS STATE (a handle, below), its tensors and values, then its config's fields as
+// plain values, its op's own (an algorithm where its kernel has several, tile_k
 // where it has K). Nothing is picked here: Python fills what a caller leaves out and hands its
 // table's pick the same way; the API checks it.
 
 namespace {
-hip_custom_communicator::DType dtype_of(const torch::Tensor& t) {
+using hip_custom_communicator::DType;
+using hip_custom_communicator::Error;
+
+// A TENSOR'S DTYPE, where the build has it.
+std::optional<DType> dtype_of(const torch::Tensor& t) {
   const at::ScalarType s = t.scalar_type();
-  if (s == at::ScalarType::Half) return hip_custom_communicator::DType::f16;
-  if (s == at::ScalarType::BFloat16)
-    return hip_custom_communicator::DType::bf16;
-  TORCH_CHECK(s == at::ScalarType::Float, "hip_custom_communicator: dtype ", s,
-              " not built");
-  return hip_custom_communicator::DType::f32;
+  if (s == at::ScalarType::Half) return DType::f16;
+  if (s == at::ScalarType::BFloat16) return DType::bf16;
+  if (s == at::ScalarType::Float) return DType::f32;
+  return std::nullopt;
 }
 
-// A CONFIG FIELD ACROSS THE BOUNDARY, narrowed to an int (one past it is the caller's mistake,
-// raised).
-int narrowed(int64_t v) {
-  TORCH_CHECK(v >= std::numeric_limits<int>::min() && v <= std::numeric_limits<int>::max(),
-              "hip_custom_communicator: a config field must fit an int");
-  return static_cast<int>(v);
+// EVERY CONFIG FIELD AN INT: the API takes ints.
+bool all_ints(std::initializer_list<int64_t> vs) {
+  for (const int64_t v : vs)
+    if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
+  return true;
 }
 
 hipStream_t current_stream() { return at::cuda::getCurrentCUDAStream(); }
 
-// AN ERROR RAISED, at the torch boundary: a torch op can only return or raise.
-[[noreturn]] void raise(hip_custom_communicator::Error e) {
-  TORCH_CHECK(false, "hip_custom_communicator: ",
-              hip_custom_communicator::to_string(e));
-  __builtin_unreachable();
-}
-
-void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
-  for (const torch::Tensor* t : ts) {
-    TORCH_CHECK(t->is_cuda(), "every tensor must be on device");
-    TORCH_CHECK(t->is_contiguous(), "every tensor must be contiguous");
-  }
-}
 // The ops' tensors: on device; their layouts are their strides, checked behind
 // the interface.
-void check_device(std::initializer_list<const torch::Tensor*> ts) {
+bool on_device(std::initializer_list<const torch::Tensor*> ts) {
   for (const torch::Tensor* t : ts)
-    TORCH_CHECK(t->is_cuda(), "every tensor must be on device");
+    if (!t->is_cuda()) return false;
+  return true;
 }
 // A COLLECTIVE'S TENSOR AS [rows, cols]: its last dimension a row, every
 // dimension before it the rows. A view, so its strides are the tensor's own;
@@ -99,28 +88,18 @@ std::optional<torch::Tensor> as_rows(const torch::Tensor& t) {
 
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names = std::vector<std::string>;
-using SupportedWire =
-    std::tuple<std::optional<std::string>, std::optional<int64_t>>;
+using OpenWire = std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,
+                            std::vector<int64_t>>;
+using GraphMetaWire = std::tuple<std::optional<int64_t>, std::vector<int64_t>, std::vector<int64_t>>;
 using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
                Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
                Names, std::vector<int64_t>, int64_t, Names>;
-// AN OP'S ANSWER: -1 when it ran, else the Error's number it was refused for. What
-// ran is what Python passed: C++ runs the config it is given, or refuses it.
-using Answer = int64_t;
-Answer refusal(hip_custom_communicator::Error e) { return static_cast<int64_t>(e); }
-Answer answer(std::optional<hip_custom_communicator::Error> refused) {
-  return refused ? refusal(*refused) : -1;
-}
-
-// SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is
-// two optionals and exactly one is set, the arch or the Error's number.
-SupportedWire hip_custom_communicator_supported(int64_t device, int64_t world) {
-  const auto got = hip_custom_communicator::supported(static_cast<int>(device),
-                                                      static_cast<int>(world));
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return {std::nullopt, static_cast<int64_t>(*e)};
-  return {std::get<hip_custom_communicator::Supported>(got).arch, std::nullopt};
+// A REFUSAL ACROSS THE BOUNDARY: none when it ran, else the Error's number (a torch op returns no
+// enum).
+using Refused = std::optional<int64_t>;
+Refused refused(std::optional<Error> e) {
+  return e ? Refused(static_cast<int64_t>(*e)) : std::nullopt;
 }
 
 // WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its
@@ -190,172 +169,6 @@ BuildInfoWire hip_custom_communicator_build_info() {
           algorithms};
 }
 
-// WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
-// `world` RANKS HOLDS, for Python's `should`: the box, its exchange's partials
-// and inputs bytes (`exchange_sizes`, what the opener allocates). A pure function of its
-// arguments, so a communicator that is not open can be asked.
-std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
-                                                      int64_t max_cols,
-                                                      int64_t world) {
-  const auto sizes = hip_custom_communicator::exchange_sizes(
-      max_rows, max_cols, static_cast<int>(world));
-  std::vector<int64_t> out{max_rows, max_cols, sizes.partials_bytes,
-                           sizes.staging_bytes};
-  for (const auto& o : hip_custom_communicator::kOps)
-    out.push_back(hip_custom_communicator::max_bytes(
-        o.type, sizes.partials_bytes, sizes.staging_bytes));
-  return out;
-}
-
-// =================================================================================
-// THE MEMORY, Python's: allocated, exchanged, read, written and freed here, every
-// address an int Python holds. Nothing here keeps one.
-// =================================================================================
-
-// THE LAYOUT of a communicator serving `max_rows` rows of at most `max_cols` columns at `world`
-// ranks, flat, in this order (Python's `Layout`): the staging and partials bytes
-// (`exchange_sizes`); the shared buffer's bytes and its regions' offsets (`arena_layout`): signals,
-// staging, partials, scales, unfenced, and each guard's [begin, end); the signals' bytes and the
-// guard word; the private buffer's bytes and its offsets (kPrivate*): the region arrays, the epochs,
-// the tables; the region arrays' count, kMaxRanks, kMaxBlocks, the table slots, the status words.
-std::vector<int64_t> hip_custom_communicator_layout(int64_t max_rows, int64_t max_cols,
-                                                    int64_t world) {
-  using namespace hip_custom_communicator;
-  TORCH_CHECK(max_rows > 0 && max_cols > 0,
-              "the largest call a communicator serves has rows and columns: max_rows=", max_rows,
-              " max_cols=", max_cols);
-  const auto sizes = exchange_sizes(max_rows, max_cols, static_cast<int>(world));
-  const ArenaLayout l = arena_layout(sizes.staging_bytes, sizes.partials_bytes,
-                                     max_rows * int64_t{sizeof(float)},
-                                     unfenced_bytes(static_cast<int>(world)));
-  return {sizes.staging_bytes, sizes.partials_bytes,
-          l.end, l.signals, l.staging, l.partials, l.scales, l.unfenced,
-          l.staging_guard, l.staging_guard_end, l.partials_guard, l.partials_guard_end,
-          l.unfenced_guard, l.unfenced_guard_end,
-          kSignalsBytes, int64_t{kGuardWord},
-          kPrivateBytes, kPrivateRegionPtrArrays, kPrivateUnfencedEpochs, kPrivateTables,
-          int64_t{kRegionPtrArrays}, int64_t{kMaxRanks}, int64_t{kMaxBlocks}, kInputTableSlots,
-          int64_t{kStatusFields}};
-}
-
-// A DEVICE BUFFER of `bytes` on the current device, zeroed before any stream can use it: SHARED
-// (`shared`: uncached, kArenaMallocFlags, for IPC) or PRIVATE (hipMalloc). Its address.
-int64_t hip_custom_communicator_alloc(int64_t bytes, bool shared) {
-  void* p = nullptr;
-  if (shared)
-    HIP_CHECK(hipExtMallocWithFlags(&p, static_cast<size_t>(bytes),
-                                    hip_custom_communicator::kArenaMallocFlags));
-  else
-    HIP_CHECK(hipMalloc(&p, static_cast<size_t>(bytes)));
-  HIP_CHECK(hipMemset(p, 0, static_cast<size_t>(bytes)));
-  HIP_CHECK(hipDeviceSynchronize());
-  return reinterpret_cast<int64_t>(p);
-}
-// A device buffer freed: 0, or the hipError_t (a teardown carries on past one).
-int64_t hip_custom_communicator_free(int64_t ptr) {
-  const hipError_t e = hipFree(reinterpret_cast<void*>(ptr));
-  if (e != hipSuccess) (void)hipGetLastError();
-  return static_cast<int64_t>(e);
-}
-// HOST MEMORY of `bytes`, mapped and coherent (the kernels write it with system-scope atomics while
-// the host polls it), zeroed: [its host address, its device address].
-std::vector<int64_t> hip_custom_communicator_alloc_host(int64_t bytes) {
-  void* host = nullptr;
-  HIP_CHECK(hipHostMalloc(&host, static_cast<size_t>(bytes),
-                          hipHostMallocMapped | hipHostMallocCoherent));
-  std::memset(host, 0, static_cast<size_t>(bytes));
-  void* device = nullptr;
-  HIP_CHECK(hipHostGetDevicePointer(&device, host, 0));
-  return {reinterpret_cast<int64_t>(host), reinterpret_cast<int64_t>(device)};
-}
-int64_t hip_custom_communicator_free_host(int64_t host) {
-  const hipError_t e = hipHostFree(reinterpret_cast<void*>(host));
-  if (e != hipSuccess) (void)hipGetLastError();
-  return static_cast<int64_t>(e);
-}
-
-// THE IPC HANDLE of the allocation `ptr` lies in, and `ptr`'s offset in it: the handle's bytes, one
-// an int, then the offset (hipIpcGetMemHandle takes an allocation's base; a torch tensor sits at an
-// offset in one).
-std::vector<int64_t> hip_custom_communicator_ipc_handle(int64_t ptr) {
-  void* base = nullptr;
-  HIP_CHECK(hipPointerGetAttribute(&base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
-                                   static_cast<hipDeviceptr_t>(reinterpret_cast<void*>(ptr))));
-  hipIpcMemHandle_t h;
-  HIP_CHECK(hipIpcGetMemHandle(&h, base));
-  std::vector<int64_t> out;
-  for (size_t i = 0; i < sizeof(h); ++i)
-    out.push_back(static_cast<uint8_t>(reinterpret_cast<const char*>(&h)[i]));
-  out.push_back(ptr - reinterpret_cast<int64_t>(base));
-  return out;
-}
-// A PEER'S ALLOCATION opened from its handle (`ipc_handle`'s bytes, its offset dropped): its base as
-// this process reaches it. BORROWED: closed by `ipc_close`, never freed.
-int64_t hip_custom_communicator_ipc_open(const std::vector<int64_t>& handle) {
-  hipIpcMemHandle_t h;
-  TORCH_CHECK(handle.size() >= sizeof(h), "an IPC handle is ", sizeof(h), " bytes");
-  for (size_t i = 0; i < sizeof(h); ++i)
-    reinterpret_cast<char*>(&h)[i] = static_cast<char>(handle[i]);
-  void* base = nullptr;
-  HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
-  return reinterpret_cast<int64_t>(base);
-}
-int64_t hip_custom_communicator_ipc_close(int64_t base) {
-  const hipError_t e = hipIpcCloseMemHandle(reinterpret_cast<void*>(base));
-  if (e != hipSuccess) (void)hipGetLastError();
-  return static_cast<int64_t>(e);
-}
-// The device `ptr` is memory of, where it is the base of its own device allocation; -1 otherwise.
-int64_t hip_custom_communicator_pointer_device(int64_t ptr) {
-  hipPointerAttribute_t a{};
-  const hipError_t e = hipPointerGetAttributes(&a, reinterpret_cast<void*>(ptr));
-  if (e != hipSuccess) {
-    (void)hipGetLastError();
-    return -1;
-  }
-  if (a.type != hipMemoryTypeDevice || a.devicePointer != reinterpret_cast<void*>(ptr)) return -1;
-  return a.device;
-}
-
-// DEVICE WORDS: 64-bit `words` written at `ptr` (the region arrays, a table); `count` 32-bit words
-// at `ptr` set to `word` (the guards); `count` 32-bit words read back (the guards, the signals).
-// Each synchronous: the caller has every launch that touches them finished, or none started.
-void hip_custom_communicator_write_words(int64_t ptr, const std::vector<int64_t>& words) {
-  HIP_CHECK(hipMemcpy(reinterpret_cast<void*>(ptr), words.data(), words.size() * sizeof(int64_t),
-                      hipMemcpyHostToDevice));
-}
-void hip_custom_communicator_fill_words(int64_t ptr, int64_t word, int64_t count) {
-  HIP_CHECK(hipMemsetD32(reinterpret_cast<hipDeviceptr_t>(ptr), static_cast<int>(word),
-                         static_cast<size_t>(count)));
-  HIP_CHECK(hipDeviceSynchronize());
-}
-std::vector<int64_t> hip_custom_communicator_read_words(int64_t ptr, int64_t count) {
-  std::vector<uint32_t> words(static_cast<size_t>(count));
-  HIP_CHECK(hipMemcpy(words.data(), reinterpret_cast<void*>(ptr), words.size() * sizeof(uint32_t),
-                      hipMemcpyDeviceToHost));
-  return std::vector<int64_t>(words.begin(), words.end());
-}
-// HOST WORDS, while kernels run: `count` 32-bit words at `host` read (acquire: the status, the fault
-// whole once `state` reads written), and one set (release: the abort every wait leaves at).
-std::vector<int64_t> hip_custom_communicator_read_host(int64_t host, int64_t count) {
-  const auto* words = reinterpret_cast<const uint32_t*>(host);
-  std::vector<int64_t> out;
-  for (int64_t i = 0; i < count; ++i) out.push_back(__atomic_load_n(&words[i], __ATOMIC_ACQUIRE));
-  return out;
-}
-void hip_custom_communicator_write_host(int64_t host, int64_t index, int64_t word) {
-  __atomic_store_n(&reinterpret_cast<uint32_t*>(host)[index], static_cast<uint32_t>(word),
-                   __ATOMIC_RELEASE);
-}
-
-// The device clock's rate, kHz: what its ticks are per ms.
-int64_t hip_custom_communicator_wall_clock_khz(int64_t device) {
-  int khz = 0;
-  HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
-                                  static_cast<int>(device)));
-  return khz;
-}
-
 namespace {
 // NO INPUT OVERLAPS AN OUTPUT (STANDARDS): the kernels take each as its own
 // `__restrict__` pointer, so two that share bytes would be undefined behavior.
@@ -411,168 +224,238 @@ bool same_tensor(const torch::Tensor& a, const torch::Tensor& b) {
 // AN OUTPUT MAY BE AN INPUT ITSELF (`in_place`) only where the kernel is correct with that exact
 // alias: the norms on rows, whose every element is written by the thread that read it, after it
 // read it (STANDARDS 3.5: in place is the caller's explicit choice). A partial overlap never is.
-void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
-                    std::initializer_list<const torch::Tensor*> outputs,
-                    bool in_place = false) {
+bool overlapping(std::initializer_list<const torch::Tensor*> inputs,
+                 std::initializer_list<const torch::Tensor*> outputs, bool in_place = false) {
   for (const torch::Tensor* i : inputs)
     for (const torch::Tensor* o : outputs) {
-      if (i == nullptr || o == nullptr || i->numel() == 0 || o->numel() == 0)
-        continue;
+      if (i == nullptr || o == nullptr || i->numel() == 0 || o->numel() == 0) continue;
       if (in_place && same_tensor(*i, *o)) continue;
-      TORCH_CHECK(
-          !overlap(span_of(*i), span_of(*o)),
-          in_place ? "an input and an output share memory, not as the same tensor; pass it "
-                     "whole or a separate output"
-                   : "an input and an output share memory; pass a separate output");
+      if (overlap(span_of(*i), span_of(*o))) return true;
     }
+  return false;
 }
 }  // namespace
 
 // =================================================================================================
-// THE LAUNCH STATE, AS A HANDLE: the API's LaunchState, made here and handed to Python as its address (an
-// int, as vLLM's custom all-reduce hands its own), passed back to every op's call, and freed here
-// when Python closes. C++ keeps nothing else between calls.
+// THE STATE, AS A HANDLE: the API's CommsState, made by `open` and handed to Python as its address
+// (an int, as vLLM's custom all-reduce hands its own), passed back to every call, and freed by
+// `free`. Each returns its Error's number, or none.
 // =================================================================================================
-
-// THE COMMUNICATOR'S STATE (the API's LaunchState), made once its buffers are: its handle.
-int64_t hip_custom_communicator_launch_state(int64_t rank, int64_t world, int64_t shared_buffer,
-                                      int64_t private_buffer, int64_t status_device,
-                                      int64_t timeout_ticks, int64_t max_rows,
-                                      int64_t staging_bytes, int64_t partials_bytes,
-                                      bool checked_after_launch) {
-  TORCH_CHECK(world >= 1 && rank >= 0 && rank < world,
-              "hip_custom_communicator: rank ", rank, " is not one of world ", world, "'s");
-  return reinterpret_cast<int64_t>(new hip_custom_communicator::LaunchState{
-      .rank = narrowed(rank),
-      .world = narrowed(world),
-      .shared_buffer = reinterpret_cast<char*>(shared_buffer),
-      .private_buffer = reinterpret_cast<char*>(private_buffer),
-      .status_device = reinterpret_cast<uint32_t*>(status_device),
-      .timeout_ticks = static_cast<uint64_t>(timeout_ticks),
-      .max_rows = max_rows,
-      .staging_bytes = staging_bytes,
-      .partials_bytes = partials_bytes,
-      .checked_after_launch = checked_after_launch});
-}
-void hip_custom_communicator_free_launch_state(int64_t state) {
-  delete reinterpret_cast<hip_custom_communicator::LaunchState*>(state);
-}
 
 namespace {
-hip_custom_communicator::Dim3 dim3_from(int64_t x, int64_t y, int64_t z) {
-  return {narrowed(x), narrowed(y), narrowed(z)};
+hip_custom_communicator::CommsState* state_at(int64_t state) {
+  return reinterpret_cast<hip_custom_communicator::CommsState*>(state);
+}
+hipIpcMemHandle_t ipc_from(const std::vector<int64_t>& bytes, size_t at) {
+  hipIpcMemHandle_t h;
+  for (size_t i = 0; i < sizeof(h); ++i)
+    reinterpret_cast<char*>(&h)[i] = static_cast<char>(bytes[at * sizeof(h) + i]);
+  return h;
+}
+void ipc_into(const hipIpcMemHandle_t& h, std::vector<int64_t>& bytes) {
+  for (size_t i = 0; i < sizeof(h); ++i)
+    bytes.push_back(static_cast<uint8_t>(reinterpret_cast<const char*>(&h)[i]));
 }
 }  // namespace
 
+// OPEN: the state of a communicator at `rank` of `world` on `device`, serving `max_rows` rows of
+// at most `max_cols` columns, a wait giving up after `timeout_seconds`: (the Error it is refused
+// for, or none; the handle, 0 where refused; this rank's arena's IPC handle, its bytes; the
+// device's arch; the capacity: max_rows, max_cols, the partials' and staging's bytes, then each
+// op's most bytes a call). A device the build does not run on is refused (nothing allocated): the
+// caller does not run here.
+OpenWire hip_custom_communicator_open(int64_t rank, int64_t world, int64_t device,
+                                      int64_t max_rows, int64_t max_cols,
+                                      double timeout_seconds) {
+  using namespace hip_custom_communicator;
+  if (!all_ints({rank, world, device}))
+    return {refused(Error::field_out_of_range), 0, {}, "", {}};
+  auto* s = new CommsState();
+  std::optional<Error> e = open_state(*s, static_cast<int>(rank), static_cast<int>(world),
+                                      static_cast<int>(device), max_rows, max_cols,
+                                      timeout_seconds);
+  hipIpcMemHandle_t h{};
+  if (!e) e = ipc_handle(*s, h);
+  if (e) {
+    (void)free_state(*s);
+    delete s;
+    return {refused(e), 0, {}, "", {}};
+  }
+  std::vector<int64_t> handle;
+  ipc_into(h, handle);
+  std::vector<int64_t> capacity{max_rows, max_cols, s->partials_bytes, s->staging_bytes};
+  for (const auto& o : kOps)
+    capacity.push_back(max_bytes(o.type, s->partials_bytes, s->staging_bytes));
+  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, kTargetArch, capacity};
+}
+
+// CONNECT: every rank's arena's IPC handle (`handles`, their bytes, rank after rank) opened.
+Refused hip_custom_communicator_connect(int64_t state, const std::vector<int64_t>& handles) {
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (handles.size() != s.world * sizeof(hipIpcMemHandle_t)) return refused(Error::world_not_built);
+  std::vector<hipIpcMemHandle_t> by_rank;
+  for (int r = 0; r < s.world; ++r) by_rank.push_back(ipc_from(handles, r));
+  return refused(hip_custom_communicator::connect_state(s, by_rank));
+}
+
+// THE CAPTURED LAUNCHES' INPUTS (vLLM's get_graph_buffer_ipc_meta): (the Error or none; their
+// allocations' IPC handles' bytes, an input after another; each input's offset in its own).
+GraphMetaWire hip_custom_communicator_graph_ipc_meta(int64_t state) {
+  if (state == 0) return {refused(Error::not_open), {}, {}};
+  std::vector<hipIpcMemHandle_t> handles;
+  std::vector<int64_t> offsets;
+  if (const std::optional<Error> e =
+          hip_custom_communicator::graph_ipc_meta(*state_at(state), handles, offsets))
+    return {refused(e), {}, {}};
+  std::vector<int64_t> bytes;
+  for (const hipIpcMemHandle_t& h : handles) ipc_into(h, bytes);
+  return {std::nullopt, bytes, offsets};
+}
+
+// THE CAPTURED LAUNCHES' TABLES (vLLM's register_graph_buffers): every rank's
+// `graph_ipc_meta`, rank after rank.
+Refused hip_custom_communicator_register_graph_buffers(int64_t state,
+                                                       const std::vector<int64_t>& handles,
+                                                       const std::vector<int64_t>& offsets) {
+  if (state == 0) return refused(Error::not_open);
+  if (handles.size() != offsets.size() * sizeof(hipIpcMemHandle_t))
+    return refused(Error::ranks_disagree);
+  std::vector<hipIpcMemHandle_t> by_input;
+  for (size_t i = 0; i < offsets.size(); ++i) by_input.push_back(ipc_from(handles, i));
+  return refused(
+      hip_custom_communicator::register_graph_buffers(*state_at(state), by_input, offsets));
+}
+
+// CLOSE THE PEERS: every borrowed mapping closed (every launch finished, every rank stopped).
+Refused hip_custom_communicator_close_peers(int64_t state) {
+  if (state == 0) return refused(Error::not_open);
+  return refused(hip_custom_communicator::close_peers(*state_at(state)));
+}
+
+// FREE: this rank's buffers freed and the state with them (no peer has them open).
+Refused hip_custom_communicator_free(int64_t state) {
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState* s = state_at(state);
+  const std::optional<Error> e = hip_custom_communicator::free_state(*s);
+  delete s;
+  return refused(e);
+}
+
 // all_reduce: at its config.
-Answer hip_custom_communicator_all_reduce(int64_t state, int64_t table_slot, torch::Tensor& input,
+Refused hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input,
     torch::Tensor& output, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  check_device({&input, &output});
-  TORCH_CHECK(output.sizes() == input.sizes(),
-              "output and input must have the same shape");
-  TORCH_CHECK(output.scalar_type() == input.scalar_type(),
-              "output and input must share a dtype");
-  refuse_overlap({&input}, {&output});
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (!on_device({&input, &output})) return refused(Error::not_on_device);
+  if (output.sizes() != input.sizes()) return refused(Error::shape_mismatch);
+  if (output.scalar_type() != input.scalar_type()) return refused(Error::dtype_mismatch);
+  if (overlapping({&input}, {&output})) return refused(Error::inputs_overlap_outputs);
   const std::optional<torch::Tensor> input_rows = as_rows(input),
                                      output_rows = as_rows(output);
   if (!input_rows || !output_rows)
-    return refusal(hip_custom_communicator::Error::not_contiguous);
+    return refused(Error::not_contiguous);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::all_reduce(
-      s, table_slot, input_rows->data_ptr(), input_rows->stride(0),
+      s, input_rows->data_ptr(), input_rows->stride(0),
       input_rows->stride(1), input_rows->size(0), input_rows->size(1),
       output_rows->data_ptr(), output_rows->stride(0), output_rows->stride(1),
-      output_rows->size(0), output_rows->size(1), dtype_of(input),
-      algorithm, dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      output_rows->size(0), output_rows->size(1), *dtype,
+      algorithm, {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 namespace {
-// A NORM CALL'S TENSORS: input [tokens, hidden], output (and with a residual,
-// residual and residual_output) its shape and dtype, the weight 1-D of hidden
-// (its dtype is select's to refuse).
-void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
-                  const torch::Tensor& weight, const torch::Tensor& output,
-                  const torch::Tensor* residual_output, bool in_place) {
-  check_device({&input, &weight, &output});
-  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]; got ",
-              input.dim(), "-D");
-  TORCH_CHECK(output.sizes() == input.sizes(),
-              "output must have input's shape");
-  TORCH_CHECK(output.scalar_type() == input.scalar_type(),
-              "output must share input's dtype");
-  TORCH_CHECK(weight.dim() == 1 && weight.numel() == input.size(1),
-              "weight must be 1-D of hidden=", input.size(1));
-  // The weight is read a pack at a time, a pack's worth of input's elements per
-  // load.
-  const int64_t weight_pack =
-      hip_custom_communicator::kBuild.memory.pack_bytes / input.element_size() *
-      weight.element_size();
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack == 0,
-              "weight must be aligned to ", weight_pack, " bytes");
+// A NORM CALL'S TENSORS, or the Error they are refused for: input [tokens, hidden], output (and
+// with a residual, residual and residual_output) its shape and dtype, the weight 1-D of hidden at
+// a pack (its dtype is the API's to refuse), no input sharing an output's memory.
+std::optional<Error> norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
+                                  const torch::Tensor& weight, const torch::Tensor& output,
+                                  const torch::Tensor* residual_output, bool in_place) {
+  if (!on_device({&input, &weight, &output})) return Error::not_on_device;
+  if (input.dim() != 2 || output.sizes() != input.sizes() || weight.dim() != 1 ||
+      weight.numel() != input.size(1))
+    return Error::shape_mismatch;
+  if (output.scalar_type() != input.scalar_type()) return Error::dtype_mismatch;
+  // The weight is read a pack at a time, a pack's worth of input's elements per load.
+  const int64_t weight_pack = hip_custom_communicator::kBuild.memory.pack_bytes /
+                              input.element_size() * weight.element_size();
+  if (reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack != 0) return Error::not_aligned;
   if (residual != nullptr) {
-    check_device({residual, residual_output});
-    TORCH_CHECK(residual->sizes() == input.sizes() &&
-                    residual_output->sizes() == input.sizes(),
-                "residual and residual_output must have input's shape");
-    TORCH_CHECK(residual->scalar_type() == input.scalar_type() &&
-                    residual_output->scalar_type() == input.scalar_type(),
-                "every tensor must share input's dtype");
+    if (!on_device({residual, residual_output})) return Error::not_on_device;
+    if (residual->sizes() != input.sizes() || residual_output->sizes() != input.sizes())
+      return Error::shape_mismatch;
+    if (residual->scalar_type() != input.scalar_type() ||
+        residual_output->scalar_type() != input.scalar_type())
+      return Error::dtype_mismatch;
   }
-  refuse_overlap({&input, residual}, {&output, residual_output}, in_place);
-  refuse_overlap({&weight}, {&output, residual_output});
+  if (overlapping({&input, residual}, {&output, residual_output}, in_place) ||
+      overlapping({&weight}, {&output, residual_output}))
+    return Error::inputs_overlap_outputs;
+  return std::nullopt;
 }
 }  // namespace
 
 // all_reduce_rms_norm: at its config.
-Answer hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t table_slot,
+Refused hip_custom_communicator_all_reduce_rms_norm(int64_t state,
     torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output, double eps,
     const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false);
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false)) return refused(e);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  const std::optional<DType> weight_dtype = *weight_dtype;
+  if (!weight_dtype) return refused(Error::weight_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
-      s, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
+      s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), weight.data_ptr(), weight.stride(0),
       weight.size(0), output.data_ptr(), output.stride(0), output.stride(1),
-      output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
+      output.size(0), output.size(1), *dtype, *weight_dtype,
       static_cast<float>(eps),
-      algorithm, dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      algorithm, {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 // all_reduce_add_rms_norm: at its config.
-Answer hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t table_slot,
+Refused hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps, const std::string& algorithm, int64_t grid_x,
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false);
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false)) return refused(e);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  const std::optional<DType> weight_dtype = *weight_dtype;
+  if (!weight_dtype) return refused(Error::weight_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
-      s, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
+      s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), residual.data_ptr(), residual.stride(0),
       residual.stride(1), residual.size(0), residual.size(1), weight.data_ptr(),
       weight.stride(0), weight.size(0), output.data_ptr(), output.stride(0),
       output.stride(1), output.size(0), output.size(1),
       residual_output.data_ptr(), residual_output.stride(0),
       residual_output.stride(1), residual_output.size(0),
-      residual_output.size(1), dtype_of(input), dtype_of(weight),
+      residual_output.size(1), *dtype, *weight_dtype,
       static_cast<float>(eps),
-      algorithm, dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      algorithm, {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 namespace {
@@ -581,66 +464,47 @@ namespace {
 // it), `prefix_output` and `output` its shape; `blocks` [tokens, sources,
 // hidden], its first `num_blocks` the sources read; `block_output` (none: no
 // block written) a [tokens, hidden] slot, by the standard not one of the
-// sources; every one input's dtype.
-void attn_res_tensors(
+// sources; every one input's dtype. Or the Error they are refused for.
+std::optional<Error> attn_res_tensors(
     const torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
-    const torch::Tensor& blocks, const torch::Tensor& norm_weight,
-    const torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    const torch::Tensor& prefix_output, const torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks) {
-  check_device({&input, &norm_weight, &qk_weight, &prefix_output, &output});
-  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]; got ",
-              input.dim(), "-D");
+    const torch::Tensor& blocks, const torch::Tensor& norm_weight, const torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight, const torch::Tensor& prefix_output,
+    const torch::Tensor& output, const std::optional<torch::Tensor>& block_output,
+    int64_t num_blocks) {
+  if (!on_device({&input, &norm_weight, &qk_weight, &prefix_output, &output, &blocks}))
+    return Error::not_on_device;
+  if (input.dim() != 2) return Error::shape_mismatch;
   const int64_t n = input.size(1);
-  TORCH_CHECK(
-      prefix_output.sizes() == input.sizes() && output.sizes() == input.sizes(),
-      "prefix_output and output must have input's shape");
-  TORCH_CHECK(
-      blocks.is_cuda() && blocks.dim() == 3 &&
-          blocks.size(0) == input.size(0) && blocks.size(2) == n &&
-          blocks.stride(2) == 1,
-      "blocks must be [tokens, sources, hidden] with a unit hidden stride");
-  TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1),
-              "num_blocks must be in [0, ", blocks.size(1), "]");
-  std::vector<const torch::Tensor*> same = {&blocks, &norm_weight, &qk_weight,
-                                            &prefix_output, &output};
-  for (const std::optional<torch::Tensor>* o :
-       {&prefix, &output_norm_weight, &block_output})
+  if (prefix_output.sizes() != input.sizes() || output.sizes() != input.sizes() ||
+      blocks.dim() != 3 || blocks.size(0) != input.size(0) || blocks.size(2) != n ||
+      blocks.stride(2) != 1 || num_blocks < 0 || num_blocks > blocks.size(1) ||
+      norm_weight.dim() != 1 || norm_weight.numel() != n || qk_weight.dim() != 1 ||
+      qk_weight.numel() != n)
+    return Error::shape_mismatch;
+  std::vector<const torch::Tensor*> same = {&blocks, &norm_weight, &qk_weight, &prefix_output,
+                                            &output};
+  for (const std::optional<torch::Tensor>* o : {&prefix, &output_norm_weight, &block_output})
     if (*o) {
-      check_device({&**o});
+      if (!on_device({&**o})) return Error::not_on_device;
       same.push_back(&**o);
     }
   for (const torch::Tensor* t : same)
-    TORCH_CHECK(t->scalar_type() == input.scalar_type(),
-                "every tensor must share input's dtype");
-  if (prefix)
-    TORCH_CHECK(prefix->sizes() == input.sizes(),
-                "prefix must have input's shape");
-  if (block_output)
-    TORCH_CHECK(
-        block_output->sizes() == input.sizes() && block_output->stride(1) == 1,
-        "block_output must be [tokens, hidden] with a unit hidden stride");
-  for (const torch::Tensor* t : {&norm_weight, &qk_weight})
-    TORCH_CHECK(t->dim() == 1 && t->numel() == n,
-                "weights must be 1-D of hidden=", n);
-  if (output_norm_weight)
-    TORCH_CHECK(
-        output_norm_weight->dim() == 1 && output_norm_weight->numel() == n,
-        "output_norm_weight must be 1-D of hidden=", n);
-  // Its rows' and sources' strides are the interface's to refuse (whole packs);
-  // its start is here.
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
-                      hip_custom_communicator::kBuild.memory.pack_bytes ==
-                  0,
-              "blocks must start 16-byte aligned");
-  // The sources read are the first num_blocks; block_output may be a later slot
-  // of the same stack.
+    if (t->scalar_type() != input.scalar_type()) return Error::dtype_mismatch;
+  if ((prefix && prefix->sizes() != input.sizes()) ||
+      (block_output && (block_output->sizes() != input.sizes() || block_output->stride(1) != 1)) ||
+      (output_norm_weight && (output_norm_weight->dim() != 1 || output_norm_weight->numel() != n)))
+    return Error::shape_mismatch;
+  // Its rows' and sources' strides are the API's to refuse (whole packs); its start is here.
+  if (reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
+          hip_custom_communicator::kBuild.memory.pack_bytes != 0)
+    return Error::not_aligned;
+  // The sources read are the first num_blocks; block_output may be a later slot of the same stack.
   const torch::Tensor sources = blocks.narrow(1, 0, num_blocks);
-  refuse_overlap(
-      {&input, prefix ? &*prefix : nullptr, &sources, &norm_weight, &qk_weight,
-       output_norm_weight ? &*output_norm_weight : nullptr},
-      {&prefix_output, &output, block_output ? &*block_output : nullptr});
+  if (overlapping({&input, prefix ? &*prefix : nullptr, &sources, &norm_weight, &qk_weight,
+                   output_norm_weight ? &*output_norm_weight : nullptr},
+                  {&prefix_output, &output, block_output ? &*block_output : nullptr}))
+    return Error::inputs_overlap_outputs;
+  return std::nullopt;
 }
 
 // A [rows, cols] TENSOR'S ARGUMENTS, none's a null pointer and zeros.
@@ -655,7 +519,7 @@ Rows rows_of(const std::optional<torch::Tensor>& t) {
 }  // namespace
 
 // all_reduce_add_attn_res_rms_norm: at its config.
-Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, int64_t table_slot,
+Refused hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state,
     torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
@@ -664,14 +528,18 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, i
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
-                   num_blocks);
+                   num_blocks))
+    return refused(e);
   const Rows old = rows_of(prefix), block = rows_of(block_output);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::all_reduce_add_attn_res_rms_norm(
-      s, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
+      s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), old.ptr, old.stride_m, old.stride_n,
       old.size_m, old.size_n, blocks.data_ptr(), blocks.stride(0),
       blocks.stride(1), blocks.stride(2), blocks.size(0), blocks.size(1),
@@ -685,44 +553,54 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, i
       prefix_output.stride(1), prefix_output.size(0), prefix_output.size(1),
       output.data_ptr(), output.stride(0), output.stride(1), output.size(0),
       output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
-      block.size_n, dtype_of(input), static_cast<int>(num_blocks),
+      block.size_n, *dtype, static_cast<int>(num_blocks),
       static_cast<float>(eps), static_cast<float>(output_eps),
-      algorithm, dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      algorithm, {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), static_cast<int>(tile_k), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 // rms_norm: this rank's rows normed (the second kernel of an op Python composes), at its config.
-Answer hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, torch::Tensor& weight,
+Refused hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true);
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true)) return refused(e);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  const std::optional<DType> weight_dtype = *weight_dtype;
+  if (!weight_dtype) return refused(Error::weight_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::rms_norm(
       s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), weight.data_ptr(), weight.stride(0),
       weight.size(0), output.data_ptr(), output.stride(0), output.stride(1),
-      output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
+      output.size(0), output.size(1), *dtype, *weight_dtype,
       static_cast<float>(eps),
-      dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 // add_rms_norm: this rank's rows added and normed (the second kernel of an op Python composes),
 // at its config.
-Answer hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
+Refused hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
     torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true);
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true)) return refused(e);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  const std::optional<DType> weight_dtype = *weight_dtype;
+  if (!weight_dtype) return refused(Error::weight_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::add_rms_norm(
       s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), residual.data_ptr(), residual.stride(0),
@@ -731,16 +609,16 @@ Answer hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
       output.stride(1), output.size(0), output.size(1),
       residual_output.data_ptr(), residual_output.stride(0),
       residual_output.stride(1), residual_output.size(0),
-      residual_output.size(1), dtype_of(input), dtype_of(weight),
+      residual_output.size(1), *dtype, *weight_dtype,
       static_cast<float>(eps),
-      dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }
 
 // add_attn_res_rms_norm: AttnRes on this rank's rows (the second kernel of the op Python
 // composes), at its config.
-Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tensor& input,
+Refused hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks, torch::Tensor& norm_weight,
     torch::Tensor& qk_weight, const std::optional<torch::Tensor>& output_norm_weight,
     torch::Tensor& prefix_output, torch::Tensor& output,
@@ -749,12 +627,16 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tenso
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
-  attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
+  if (state == 0) return refused(Error::not_open);
+  hip_custom_communicator::CommsState& s = *state_at(state);
+  if (const std::optional<Error> e = attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
-                   num_blocks);
+                   num_blocks))
+    return refused(e);
   const Rows old = rows_of(prefix), block = rows_of(block_output);
+  const std::optional<DType> dtype = dtype_of(input);
+  if (!dtype) return refused(Error::dtype_not_built);
+  if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return refused(Error::field_out_of_range);
   const auto got = hip_custom_communicator::add_attn_res_rms_norm(
       s, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), old.ptr, old.stride_m, old.stride_n,
@@ -770,9 +652,9 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tenso
       prefix_output.stride(1), prefix_output.size(0), prefix_output.size(1),
       output.data_ptr(), output.stride(0), output.stride(1), output.size(0),
       output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
-      block.size_n, dtype_of(input), static_cast<int>(num_blocks),
+      block.size_n, *dtype, static_cast<int>(num_blocks),
       static_cast<float>(eps), static_cast<float>(output_eps),
-      dim3_from(grid_x, grid_y, grid_z), dim3_from(block_x, block_y, block_z), narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), quantization, narrowed(pack_bytes), quantize_from_bytes,
+      {static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)}, {static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)}, static_cast<int>(waves_per_eu), static_cast<int>(tile_m), static_cast<int>(tile_n), static_cast<int>(tile_k), quantization, static_cast<int>(pack_bytes), quantize_from_bytes,
       current_stream());
-  return answer(got);
+  return refused(got);
 }

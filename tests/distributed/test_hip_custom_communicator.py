@@ -16,7 +16,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Error,
     HipCustomCommunicator,
     parse_tuned_configs,
-    supported,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -524,15 +523,12 @@ def test_refused_calls(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_tuned_table():
-    """The shipped tuned table parses and checks on this device's arch, and every
-    op has a pick at Kimi-K3's decode and prefill sizes."""
+    """The shipped tuned table parses and checks for the arch the build targets, and
+    every op has a pick at Kimi-K3's decode and prefill sizes."""
     import vllm._rocm_C  # noqa: F401
 
-    found = supported(torch.device("cuda:0"), 2)
-    if isinstance(found, Error):
-        pytest.skip(f"not a supported device: {found.name}")
-    tuned = parse_tuned_configs(_TABLE, found.arch)
-    assert tuned is not None, f"no tuned table for {found.arch}"
+    tuned = parse_tuned_configs(_TABLE, "gfx950")
+    assert tuned is not None, "no tuned table for gfx950"
     for op in [
         "all_reduce",
         "all_reduce_rms_norm",
