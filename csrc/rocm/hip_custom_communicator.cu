@@ -75,13 +75,11 @@ constexpr int exact = 0;
 constexpr int int4 = 1;
 }  // namespace Quantization
 
-// THE TARGET, gfx950 (AMD Instinct MI355X; MI350X the same): the one arch the
-// build compiles device code for (CMakeLists.txt) and the host tunes for;
-// `open` refuses every other. Its wave is an ISA fact the builds are compiled
-// at (builds.py asserts every block whole waves), not a query: gfx9 runs
-// 64-lane waves only. Every other limit of the device is asked at `open`
-// (CommsState).
-constexpr const char* kTargetArch = "gfx950";
+// THE WAVE the kernels are compiled at: an ISA fact of the archs built (gfx9
+// runs 64-lane waves only; builds.py asserts every block whole waves), not a
+// query. Everything else about the device is asked at `open`
+// (DeviceProperties); which archs run is the build's (CMakeLists.txt) and the
+// tuned table's (a table an arch), not the host's.
 constexpr int kWaveSize = 64;
 
 // THE BUILD: a PACK is the widest load (global_load_dwordx4), the unit every
@@ -538,6 +536,21 @@ struct SymmetricMemory {
   std::vector<char*> peers;
 };
 
+// THE DEVICE A COMMUNICATOR RUNS ON, as open asked it once: its index, its arch
+// (gcnArchName's, `gfx950`: the tuned table Python reads), its wave's lanes (a
+// launch runs an instance compiled at them), its wall clock (a wait's timeout
+// is counted in its ticks), and the limits every launch is checked against: a
+// block's LDS, its compute units, the threads a CU holds, and a lane's scratch
+// (open's share of the device's).
+struct DeviceProperties {
+  int index = 0;
+  std::string arch;
+  int wave_size = 0;
+  int64_t clock_khz = 0;
+  int64_t lds_bytes = 0, compute_units = 0, threads_a_cu = 0,
+          scratch_a_lane = 0;
+};
+
 // THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (this
 // rank, the world, the device, the largest call, a wait's bound), what open
 // asked of the device, the symmetric memory, this rank's own buffers (the
@@ -548,14 +561,9 @@ struct SymmetricMemory {
 struct CommsState {
   int rank = 0;
   int world = 0;
-  int device = 0;
   int64_t max_rows = 0;
   uint64_t timeout_ticks = 0;
-  // THE DEVICE'S LIMITS a launch is checked against (open asks them once): a
-  // block's LDS, its compute units, the threads a CU holds, and a lane's
-  // scratch (open's share of the device's).
-  int64_t lds_bytes = 0, compute_units = 0, threads_a_cu = 0,
-          scratch_a_lane = 0;
+  DeviceProperties device;
   SymmetricMemory symmetric;
   // OWNED, this rank's alone: the pushed one-shot's epochs (a block's
   // `unfenced_epoch_words` int32 words), and a kernel's fault record, written
@@ -909,14 +917,15 @@ inline std::optional<Error> check_kernel(const CommsState& s,
   hipFuncAttributes f;
   HIP_CHECK(hipFuncGetAttributes(&f, kernel));
   if (threads > f.maxThreadsPerBlock) return Error::block_too_large;
-  if (static_cast<int64_t>(f.sharedSizeBytes) + shared_bytes > s.lds_bytes)
+  if (static_cast<int64_t>(f.sharedSizeBytes) + shared_bytes >
+      s.device.lds_bytes)
     return Error::lds_too_large;
-  if (static_cast<int64_t>(f.localSizeBytes) > s.scratch_a_lane)
+  if (static_cast<int64_t>(f.localSizeBytes) > s.device.scratch_a_lane)
     return Error::scratch_too_large;
   int per_cu = 0;  // asked of a kernel that launches alone
   HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
       &per_cu, kernel, threads, shared_bytes));
-  if (waits_on_peers && volume(grid) > int64_t{per_cu} * s.compute_units)
+  if (waits_on_peers && volume(grid) > int64_t{per_cu} * s.device.compute_units)
     return Error::grid_not_resident;
   return std::nullopt;
 }
@@ -1864,8 +1873,6 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   (void)hipGetLastError();
   if (found != hipSuccess)
     return {error_code(Error::device_not_built), 0, {}, "", {}};
-  if (arch != kTargetArch)
-    return {error_code(Error::device_not_tuned), 0, {}, "", {}};
   int khz = 0, lds = 0, cus = 0, threads_a_cu = 0, wave = 0;
   size_t scratch = 0;
   if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
@@ -1955,14 +1962,18 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   auto* s = new CommsState();
   s->rank = static_cast<int>(rank);
   s->world = static_cast<int>(world);
-  s->device = static_cast<int>(device);
+  s->device.index = static_cast<int>(device);
+  s->device.arch = arch;
+  s->device.wave_size = wave;
+  s->device.clock_khz = khz;
   s->max_rows = max_rows;
-  s->timeout_ticks = static_cast<uint64_t>(timeout_seconds * khz * 1000);
-  s->lds_bytes = lds;
-  s->compute_units = cus;
-  s->threads_a_cu = threads_a_cu;
-  s->scratch_a_lane = static_cast<int64_t>(scratch) /
-                      (int64_t{cus} * threads_a_cu) / scratch_shares;
+  s->timeout_ticks =
+      static_cast<uint64_t>(timeout_seconds * s->device.clock_khz * 1000);
+  s->device.lds_bytes = lds;
+  s->device.compute_units = cus;
+  s->device.threads_a_cu = threads_a_cu;
+  s->device.scratch_a_lane = static_cast<int64_t>(scratch) /
+                             (int64_t{cus} * threads_a_cu) / scratch_shares;
   SymmetricMemory& symmetric = s->symmetric;
   symmetric.max_blocks = max_blocks;
   symmetric.unfenced_blocks = unfenced_blocks;
@@ -2054,7 +2065,8 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
         per_byte == 0 ? staging_bytes
                       : std::min(partials_bytes / per_byte, staging_bytes));
   }
-  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, arch, capacity};
+  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, s->device.arch,
+          capacity};
 }
 
 // CONNECT: the symmetric memory joined: every peer's regions opened from their
@@ -2401,9 +2413,9 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (block_x > attributes.maxThreadsPerBlock)
     return error_code(Error::block_too_large);
   if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
-      s.lds_bytes)
+      s.device.lds_bytes)
     return error_code(Error::lds_too_large);
-  if (static_cast<int64_t>(attributes.localSizeBytes) > s.scratch_a_lane)
+  if (static_cast<int64_t>(attributes.localSizeBytes) > s.device.scratch_a_lane)
     return error_code(Error::scratch_too_large);
   // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
   // every peer arrives, so a grid past the blocks the device holds at once can
@@ -2414,7 +2426,7 @@ ErrorCode hip_custom_communicator_all_reduce(
           &blocks_a_cu, kernel, static_cast<int>(block_x),
           shared_memory_bytes) != hipSuccess)
     return error_code(Error::hip_failed);
-  if (grid_x > blocks_a_cu * s.compute_units)
+  if (grid_x > blocks_a_cu * s.device.compute_units)
     return error_code(Error::grid_not_resident);
   // ---- ITS VIEWS OF THE REGIONS, by its algorithm, in elements: a view [m, n]
   // at strides [stride_m, stride_n] (the line push's inbox [slot, m, n]); an
