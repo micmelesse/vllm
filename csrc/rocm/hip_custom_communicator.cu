@@ -2015,80 +2015,79 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
     int64_t tile_m, int64_t tile_n, const std::string& quantization_name, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
   using namespace hip_custom_communicator;
-  // THE CALL FROM TORCH: its state, its tensors, its config's ints.
+  // ---- THE CALL FROM TORCH: its state, its tensors stripped to pointers and strides, its
+  // config's ints. ----
   if (state == 0) return error_code(Error::not_open);
+  CommsState& s = *reinterpret_cast<CommsState*>(state);
   if (!on_device({&input, &output})) return error_code(Error::not_on_device);
-  if (output.sizes() != input.sizes()) return error_code(Error::shape_mismatch);
+  if (input.dim() != 2 || output.sizes() != input.sizes()) return error_code(Error::shape_mismatch);
   if (output.scalar_type() != input.scalar_type()) return error_code(Error::dtype_mismatch);
   if (overlapping({&input}, {&output})) return error_code(Error::inputs_overlap_outputs);
-  const std::optional<torch::Tensor> input_rows = as_rows(input),
-                                     output_rows = as_rows(output);
-  if (!input_rows || !output_rows)
-    return error_code(Error::not_contiguous);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
-  const void* input_ptr = input_rows->data_ptr();
-  const int64_t input_stride_m = input_rows->stride(0);
-  const int64_t input_stride_n = input_rows->stride(1);
-  const int64_t input_size_m = input_rows->size(0);
-  const int64_t input_size_n = input_rows->size(1);
-  void* output_ptr = output_rows->data_ptr();
-  const int64_t output_stride_m = output_rows->stride(0);
-  const int64_t output_stride_n = output_rows->stride(1);
-  const int64_t output_size_m = output_rows->size(0);
-  const int64_t output_size_n = output_rows->size(1);
+  const void* input_ptr = input.data_ptr();
+  const int64_t input_stride_m = input.stride(0), input_stride_n = input.stride(1);
+  const int64_t input_size_m = input.size(0), input_size_n = input.size(1);
+  void* output_ptr = output.data_ptr();
+  const int64_t output_stride_m = output.stride(0), output_stride_n = output.stride(1);
+  const int64_t output_size_m = output.size(0), output_size_n = output.size(1);
   const at::ScalarType dtype = input.scalar_type();
+  const int64_t e = elem_bytes(dtype);
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
+  // THE CONFIG'S NAMES.
   const std::optional<AllReduceAlgorithm> named = algorithm_named<AllReduceBuildConfig>(algorithm_name);
   if (!named) return error_code(Error::no_such_kernel);
   const AllReduceAlgorithm algorithm = *named;
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
+  const bool int4_config = quantization_name == "int4";
+  // THE WORLD AND THE DTYPE BUILT.
+  if (!world_built(s.world)) return error_code(Error::world_not_built);
+  if (!dtype_built(dtype)) return error_code(Error::dtype_not_built);
+  // THE LAUNCH IN THE HARDWARE'S RANGES (STANDARDS 3.2): the grid and the block x alone (the
+  // kernel's one dimension), the block whole waves up to the device's workgroup, the grid at most
+  // the blocks the signals have slots for, the waves a EU the CU holds.
+  if (grid_y != 1 || grid_z != 1 || block_y != 1 || block_z != 1 || block_x < kWaveSize ||
+      block_x > kMaxWorkgroup || block_x % kWaveSize != 0 || grid_x < 1 || grid_x > kMaxBlocks ||
+      waves_per_eu < 1 || waves_per_eu > kMaxWavesPerCu / kSimdsPerCu)
+    return error_code(Error::launch_out_of_range);
+  if (tile_m < 1 || tile_n < 1) return error_code(Error::field_not_positive);
+  // QUANTIZE_FROM_BYTES: an INT4 config's alone, and not negative.
+  if (!int4_config && quantize_from_bytes) return error_code(Error::field_not_this_templates);
+  const int64_t quantize_from = quantize_from_bytes.value_or(0);
+  if (quantize_from < 0) return error_code(Error::field_not_positive);
+  // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes), at least an element, whole packs a row
+  // (an aligned load of the pack's width); INT4 at the widest (the format's word is a pack of 8
+  // values: common.cuh's QUANTIZATION).
+  if (pack_bytes < 2 || pack_bytes > kPackBytes || (pack_bytes & (pack_bytes - 1)) != 0 ||
+      pack_bytes < e)
+    return error_code(Error::pack_out_of_range);
+  if (n * e % pack_bytes != 0) return error_code(Error::row_not_packs);
+  if (int4_config && pack_bytes != kPackBytes) return error_code(Error::quantization_not_supported);
+  // A LAYOUT THE PACKED LOADS CAN READ: the innermost stride 1, every row on whole packs.
+  if (input_stride_n != 1 || output_stride_n != 1) return error_code(Error::inner_stride_not_one);
+  if (input_stride_m * e % pack_bytes != 0 || output_stride_m * e % pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  // A BUILD THE KERNEL LISTS, named by what differs: its block, its waves, its tile.
   const AllReduceBuildConfig build{.algorithm = algorithm,
       .block = block,
       .waves_per_eu = static_cast<int>(waves_per_eu),
       .tile_m = static_cast<int>(tile_m),
       .tile_n = static_cast<int>(tile_n),
-      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .quantization = int4_config ? Quantization::int4 : Quantization::exact,
       .pack_bytes = static_cast<int>(pack_bytes)};
-  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e = refused(true, s.world, s.staging_bytes, s.partials_bytes, build,
-                                             grid, quantize_from_bytes, dtype, m, n))
-    return error_code(e);
-  const int64_t quantize_from = quantize_from_bytes.value_or(0);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
-                                 {input_stride_m, input_stride_n}}))
-    return error_code(e);
+  if (!built_at_block(OpType::all_reduce, build)) return error_code(Error::threads_not_built);
+  if (!built_at_waves(OpType::all_reduce, build)) return error_code(Error::waves_not_built);
+  if (!built(OpType::all_reduce, build)) return error_code(Error::tile_not_built);
   // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization is int4 and the
   // call's bytes reach its quantize_from_bytes, else exact (the kernel's one template parameter).
-  const bool quantize_int4 = build.quantization == Quantization::int4 &&
-                           input_size_m * input_size_n * elem_bytes(dtype) >=
-                               quantize_from;
-  const int q = quantize_int4 ? Quantization::int4 : Quantization::exact;
+  const bool quantize_int4 = int4_config && m * n * e >= quantize_from;
   // IN PLACE: the exact pull, every rank's input read where its table says.
-  const bool in_place = !is_push(algorithm) && q == Quantization::exact;
-  // THE UNFENCED REGION: the pushed one-shot pushes lines into its own inbox there, a tile a
-  // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
-  // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
-  // epoch as it was.
-  const bool unfenced = algorithm == AllReduceAlgorithm::one_shot_push;
-  if (unfenced && volume(grid) > kUnfencedBlocks) return error_code(Error::launch_out_of_range);
-  // THE WHOLE CALL IN ONE PASS (the regions are sized from the largest call; refused() refuses a
-  // call past them). The two-shots' exact share is the flat walk's, whole packs, rounded up: a
-  // rank's slice of a row in the partials, and the pushed two-shot's inbox [WORLD, slot] in the
-  // staging, its slot a share of the whole call.
-  const int64_t pack = build.pack_bytes;  // the build's
-  const int64_t packs = n * elem_bytes(dtype) / pack;
-  const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack;
-  const int64_t slot = (m * packs + s.world - 1) / s.world * pack / elem_bytes(dtype);
-  // THE EXACT PUSHED TWO-SHOT'S INBOX, its slots rounded up to whole packs.
-  const bool inbox = !quantize_int4 && algorithm == AllReduceAlgorithm::two_shot_push;
-  if (inbox && s.world * slot * elem_bytes(dtype) > s.staging_bytes) return error_code(Error::staging_too_small);
+  const bool in_place = !is_push(algorithm) && !quantize_int4;
   const int shared_memory_bytes = 0;
   const bool contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
@@ -2097,15 +2096,23 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   const void* kernel = nullptr;
   if (!with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
     return error_code(Error::tile_not_built);
-  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
-    return error_code(e);
-
-  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
+  if (const std::optional<Error> failed = check_kernel(kernel, grid, block, shared_memory_bytes, true))
+    return error_code(failed);
   // ---- ITS VIEWS OF THE REGIONS, by its algorithm, in elements: a view [m, n] at strides
   // [stride_m, stride_n] (the line push's inbox [slot, m, n]); an empty view (size 0) where it
-  // reads none. The kernels find a one-shot's payload in the staging from the input's sizes. ----
-  const int64_t e = elem_bytes(dtype);
+  // reads none. The kernels find a one-shot's payload in the staging from the input's sizes.
+  // THE WHOLE CALL IN ONE PASS: the regions are sized from the largest call the server makes, so
+  // a call past them is refused, never cut into bands. Every exact kernel's input fits the
+  // staging whole (an eager call's host copy, INPUT TABLES; a captured call's is read where it
+  // is, refused alike, so the eager and captured calls of one shape agree). ----
+  // The two-shots' exact share is the flat walk's, whole packs, rounded up: a rank's slice of a
+  // row in the partials, and the pushed two-shot's inbox [WORLD, slot] in the staging, its slot a
+  // share of the whole call.
+  const int64_t packs = n * e / pack_bytes;
+  const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack_bytes;
+  const int64_t slot = (m * packs + s.world - 1) / s.world * pack_bytes / e;
   const int64_t share = int4_flat_share(m, n, s.world);  // the INT4 flat walk's share
+  int64_t staging_need = quantize_int4 ? 0 : m * n * e, partials_need = 0;
   int64_t partials_stride_m = slice_bytes / e, partials_stride_n = 1, partials_size_m = 0,
           partials_size_n = slice_bytes / e;
   int64_t staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
@@ -2114,20 +2121,25 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   switch (algorithm) {
     case AllReduceAlgorithm::two_shot_pull:
     case AllReduceAlgorithm::two_shot_push:
+      staging_need = m * n * e, partials_need = m * slice_bytes;
       if (quantize_int4) {
         // THE INT4 FLAT WALK: this rank's share of the call's groups in the partials, and every
         // rank's share in the staging.
         partials_stride_m = share, partials_size_m = 1, partials_size_n = share;
         staging_stride_m = s.world * share, staging_stride_n = 1, staging_size_m = 1,
         staging_size_n = s.world * share;
+        staging_need = std::max(staging_need, int4_payload_bytes(1, s.world * share));
+        partials_need = std::max(partials_need, int4_payload_bytes(1, share));
       } else {
         // EXACT: this rank's slice of every row in the partials; the pushed two-shot's inbox in
         // the staging, WORLD slots of a share of the call (the pull reads every rank's input in
         // place, through the input table).
         partials_size_m = m;
-        if (algorithm == AllReduceAlgorithm::two_shot_push)
+        if (algorithm == AllReduceAlgorithm::two_shot_push) {
           staging_stride_m = slot, staging_stride_n = 1, staging_size_m = s.world,
           staging_size_n = slot;
+          staging_need = std::max(staging_need, s.world * slot * e);
+        }
       }
       break;
     case AllReduceAlgorithm::one_shot_pull:
@@ -2136,17 +2148,29 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
         partials_stride_m = 0, partials_size_n = 0;
         staging_stride_n = 1, staging_size_m = 1,
         staging_size_n = (int4_payload_bytes(m, n) + e - 1) / e;
+        staging_need = int4_payload_bytes(m, n);
       }
       break;
-    case AllReduceAlgorithm::one_shot_push:
+    case AllReduceAlgorithm::one_shot_push: {
       // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank,
       // row) of kUnfencedSlotBytes of payload each whatever the build (so a row is the same bytes
-      // at every build, its epoch its own), a writer's rows contiguous.
+      // at every build, its epoch its own), a writer's rows contiguous. ITS CAPACITY: a row of a
+      // block's tile in a slot's lines, a line a pack of at most kLinePayloadBytes (a narrower
+      // pack its line alone: kernels/all_reduce.cuh), INT4 a line a word of its tile's whole
+      // groups; a block's TILE_M rows of a bank's kUnfencedBlocks, a block its own slots (a grid
+      // past them is refused, never cut).
+      const int64_t line_pack = std::min<int64_t>(pack_bytes, kLinePayloadBytes);
+      const int64_t row_lines = quantize_int4
+          ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
+          : (tile_n * e + line_pack - 1) / line_pack;
+      if (row_lines > kUnfencedSlotBytes / kLinePayloadBytes || grid_x * tile_m > kUnfencedBlocks)
+        return error_code(Error::unfenced_too_small);
       unfenced_stride_slot = 2 * kUnfencedBlocks * (kUnfencedSlotBytes / e);
       unfenced_stride_m = kUnfencedSlotBytes / e, unfenced_stride_n = 1;
       unfenced_size_slot = s.world, unfenced_size_m = 2 * kUnfencedBlocks,
       unfenced_size_n = kUnfencedSlotBytes / e;
       break;
+    }
     case AllReduceAlgorithm::one_shot_push_staged: {
       // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot whole kInt4ScalesAlign),
       // no partials.
@@ -2157,13 +2181,16 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
       partials_stride_m = 0, partials_size_n = 0;
       staging_stride_n = 1, staging_size_m = 1,
       staging_size_n = (s.world * slot_bytes + e - 1) / e;
+      staging_need = s.world * slot_bytes;
       break;
     }
   }
-  // EVERY VIEW INSIDE ITS REGION (view_fits).
-  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
-      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, elem_bytes(dtype), s.staging_bytes) ||
-      !view_fits(unfenced_size_slot, unfenced_stride_slot, unfenced_size_m, unfenced_stride_m, unfenced_size_n, unfenced_stride_n, elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), unfenced_bytes(s.world)) ||
+  // THE REGIONS HOLD THE CALL, and every view lies inside its region (view_fits).
+  if (staging_need > s.staging_bytes) return error_code(Error::staging_too_small);
+  if (partials_need > s.partials_bytes) return error_code(Error::partials_too_small);
+  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, e, s.partials_bytes) ||
+      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, e, s.staging_bytes) ||
+      !view_fits(unfenced_size_slot, unfenced_stride_slot, unfenced_size_m, unfenced_stride_m, unfenced_size_n, unfenced_stride_n, e * (kLineBytes / kLinePayloadBytes), unfenced_bytes(s.world)) ||
       !view_fits(1, 0, int64_t{kUnfencedBlocks}, kUnfencedEpochsStrideBlock, kUnfencedEpochsStrideBlock, int64_t{1}, 4, kUnfencedEpochsBytes))
     return error_code(Error::view_past_region);
   // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
@@ -2171,10 +2198,10 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   void* const* table = nullptr;
   int64_t table_stride_m = staging_stride_m;
   if (in_place)
-    if (const std::optional<Error> e = input_table(s, input_ptr, input_stride_m, input_size_m,
-                                                   input_size_n, elem_bytes(dtype), stream, table,
+    if (const std::optional<Error> failed = input_table(s, input_ptr, input_stride_m, input_size_m,
+                                                   input_size_n, e, stream, table,
                                                    table_stride_m))
-      return error_code(e);
+      return error_code(failed);
   const int table_size = in_place ? s.world : 0;
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
