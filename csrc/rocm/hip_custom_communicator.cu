@@ -32,16 +32,16 @@
 #include "hip_custom_communicator/hip_custom_communicator.cuh"
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. Nothing crosses but values: Python owns the communicator's memory (three
-// buffers a rank: shared, private, host) as addresses, allocates, exchanges and frees it through
-// the functions below, and hands each op every address and size it reads. No C++ object lives
-// between calls.
+// THE TORCH OP BOUNDARY. Nothing crosses but values and handles: Python owns the communicator's
+// memory (three buffers a rank: shared, private, host) as addresses, and its state and its configs
+// (plain structs) as handles, makes and frees each through the functions below, and hands each op
+// its state, its config and its tensors. C++ keeps nothing between calls Python holds no handle
+// to.
 // =================================================================================
 
-// EACH OP TAKES ITS CONFIG LAST, every field of it, as the API's does: the kernel by its name, its
-// algorithm, the grid and the block, the waves a EU, the tile, the quantization. Nothing is optional and
-// nothing is picked here: Python fills what a caller leaves out and hands its table's pick the
-// same way.
+// EACH OP TAKES ITS COMMUNICATOR'S STATE AND ITS CONFIG AS HANDLES (below), then its tensors.
+// Nothing is optional and nothing is picked here: Python fills what a caller leaves out, makes the
+// config, and hands its table's pick the same way.
 
 namespace {
 hip_custom_communicator::DType dtype_of(const torch::Tensor& t) {
@@ -435,29 +435,228 @@ void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
 }
 }  // namespace
 
+// =================================================================================================
+// THE STATE AND THE CONFIGS, AS HANDLES: each a plain struct of the API's, made here and handed to
+// Python as its address (an int, as vLLM's custom all-reduce hands its own), passed back to every
+// op's call, and freed here when Python is done with it. C++ keeps none: Python owns every
+// lifetime. Each op's config is its own type, made by its own function from its own fields.
+// =================================================================================================
+
+// THE COMMUNICATOR'S STATE (the API's CommsState), made once its buffers are: its handle.
+int64_t hip_custom_communicator_state(int64_t rank, int64_t world, int64_t shared_buffer,
+                                      int64_t private_buffer, int64_t status_device,
+                                      int64_t timeout_ticks, int64_t max_rows,
+                                      int64_t staging_bytes, int64_t partials_bytes,
+                                      bool checked_after_launch) {
+  TORCH_CHECK(world >= 1 && rank >= 0 && rank < world,
+              "hip_custom_communicator: rank ", rank, " is not one of world ", world, "'s");
+  return reinterpret_cast<int64_t>(new hip_custom_communicator::CommsState{
+      .rank = narrowed(rank),
+      .world = narrowed(world),
+      .shared_buffer = reinterpret_cast<char*>(shared_buffer),
+      .private_buffer = reinterpret_cast<char*>(private_buffer),
+      .status_device = reinterpret_cast<uint32_t*>(status_device),
+      .timeout_ticks = static_cast<uint64_t>(timeout_ticks),
+      .max_rows = max_rows,
+      .staging_bytes = staging_bytes,
+      .partials_bytes = partials_bytes,
+      .checked_after_launch = checked_after_launch});
+}
+void hip_custom_communicator_free_state(int64_t state) {
+  delete reinterpret_cast<hip_custom_communicator::CommsState*>(state);
+}
+
+// A CONFIG AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
+// exactly one is set, the config's handle or the Error's number it is refused for.
+using ConfigWire = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
+
 namespace {
-// A CALL'S CONFIG: the kernel by its name, its algorithm, and every field of its config point, in
-// the essential order, checked whole (C++'s `forced`), or the Error it is refused for.
-using Picked = std::variant<hip_custom_communicator::KernelConfig, hip_custom_communicator::Error>;
-Picked forced_config(hip_custom_communicator::OpType o, const std::string& kernel,
-    const std::string& algorithm, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  using namespace hip_custom_communicator;
-  return forced(o, kernel, algorithm,
-                Dim3{narrowed(grid_x), narrowed(grid_y), narrowed(grid_z)},
-                Dim3{narrowed(block_x), narrowed(block_y), narrowed(block_z)},
-                narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
-                quantization_from(quantization), narrowed(pack_bytes), quantize_from_bytes);
+hip_custom_communicator::Dim3 dim3_from(int64_t x, int64_t y, int64_t z) {
+  return {narrowed(x), narrowed(y), narrowed(z)};
+}
+ConfigWire refused_config(hip_custom_communicator::Error e) {
+  return {std::nullopt, static_cast<int64_t>(e)};
+}
+// A CHECKED CONFIG's handle (a copy of it, Python's to free), or the Error it is refused for.
+template <typename B>
+ConfigWire handle_of(
+    const std::variant<hip_custom_communicator::OpConfig<B>, hip_custom_communicator::Error>&
+        got) {
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
+    return refused_config(*e);
+  return {reinterpret_cast<int64_t>(new hip_custom_communicator::OpConfig<B>(
+              std::get<hip_custom_communicator::OpConfig<B>>(got))),
+          std::nullopt};
 }
 }  // namespace
 
-namespace {
-Answer all_reduce_with(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& output,
-    const Picked& k) {
+// all_reduce's config: its algorithm by name, the grid, the block and its waves a EU, the tile,
+// what it moves, the pack, and the bytes an INT4 build quantizes from.
+ConfigWire hip_custom_communicator_all_reduce_config(
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  using hip_custom_communicator::AllReduceBuildConfig;
+  const auto named = hip_custom_communicator::algorithm_named<AllReduceBuildConfig>(algorithm);
+  if (!named) return refused_config(hip_custom_communicator::Error::no_such_kernel);
+  const AllReduceBuildConfig build{.algorithm = *named,
+                                   .block = dim3_from(block_x, block_y, block_z),
+                                   .waves_per_eu = narrowed(waves_per_eu),
+                                   .tile_m = narrowed(tile_m),
+                                   .tile_n = narrowed(tile_n),
+                                   .quantization = quantization_from(quantization),
+                                   .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_all_reduce_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AllReduceConfig*>(config);
+}
+
+// all_reduce_rms_norm's config: all_reduce's fields.
+ConfigWire hip_custom_communicator_all_reduce_rms_norm_config(
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  using hip_custom_communicator::AllReduceRmsNormBuildConfig;
+  const auto named =
+      hip_custom_communicator::algorithm_named<AllReduceRmsNormBuildConfig>(algorithm);
+  if (!named) return refused_config(hip_custom_communicator::Error::no_such_kernel);
+  const AllReduceRmsNormBuildConfig build{.algorithm = *named,
+                                          .block = dim3_from(block_x, block_y, block_z),
+                                          .waves_per_eu = narrowed(waves_per_eu),
+                                          .tile_m = narrowed(tile_m),
+                                          .tile_n = narrowed(tile_n),
+                                          .quantization = quantization_from(quantization),
+                                          .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_all_reduce_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AllReduceRmsNormConfig*>(config);
+}
+
+// all_reduce_add_rms_norm's config: all_reduce's fields.
+ConfigWire hip_custom_communicator_all_reduce_add_rms_norm_config(
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  using hip_custom_communicator::AllReduceAddRmsNormBuildConfig;
+  const auto named =
+      hip_custom_communicator::algorithm_named<AllReduceAddRmsNormBuildConfig>(algorithm);
+  if (!named) return refused_config(hip_custom_communicator::Error::no_such_kernel);
+  const AllReduceAddRmsNormBuildConfig build{.algorithm = *named,
+                                             .block = dim3_from(block_x, block_y, block_z),
+                                             .waves_per_eu = narrowed(waves_per_eu),
+                                             .tile_m = narrowed(tile_m),
+                                             .tile_n = narrowed(tile_n),
+                                             .quantization = quantization_from(quantization),
+                                             .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_all_reduce_add_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AllReduceAddRmsNormConfig*>(config);
+}
+
+// all_reduce_add_attn_res_rms_norm's config: all_reduce's fields and tile_k, its sources a step.
+ConfigWire hip_custom_communicator_all_reduce_add_attn_res_rms_norm_config(
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  using hip_custom_communicator::AllReduceAddAttnResRmsNormBuildConfig;
+  const auto named =
+      hip_custom_communicator::algorithm_named<AllReduceAddAttnResRmsNormBuildConfig>(algorithm);
+  if (!named) return refused_config(hip_custom_communicator::Error::no_such_kernel);
+  const AllReduceAddAttnResRmsNormBuildConfig build{
+      .algorithm = *named,
+      .block = dim3_from(block_x, block_y, block_z),
+      .waves_per_eu = narrowed(waves_per_eu),
+      .tile_m = narrowed(tile_m),
+      .tile_n = narrowed(tile_n),
+      .tile_k = narrowed(tile_k),
+      .quantization = quantization_from(quantization),
+      .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_all_reduce_add_attn_res_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AllReduceAddAttnResRmsNormConfig*>(config);
+}
+
+// rms_norm's config (its kernel on this rank's rows, one algorithm: none named): the grid, the
+// block and its waves a EU, the tile, what it moves, the pack, and the bytes it quantizes from.
+ConfigWire hip_custom_communicator_rms_norm_config(
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
+    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  const hip_custom_communicator::RmsNormBuildConfig build{
+      .block = dim3_from(block_x, block_y, block_z),
+      .waves_per_eu = narrowed(waves_per_eu),
+      .tile_m = narrowed(tile_m),
+      .tile_n = narrowed(tile_n),
+      .quantization = quantization_from(quantization),
+      .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::RmsNormConfig*>(config);
+}
+
+// add_rms_norm's config: rms_norm's fields.
+ConfigWire hip_custom_communicator_add_rms_norm_config(
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
+    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  const hip_custom_communicator::AddRmsNormBuildConfig build{
+      .block = dim3_from(block_x, block_y, block_z),
+      .waves_per_eu = narrowed(waves_per_eu),
+      .tile_m = narrowed(tile_m),
+      .tile_n = narrowed(tile_n),
+      .quantization = quantization_from(quantization),
+      .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_add_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AddRmsNormConfig*>(config);
+}
+
+// add_attn_res_rms_norm's config: rms_norm's fields and tile_k, its sources a step.
+ConfigWire hip_custom_communicator_add_attn_res_rms_norm_config(
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
+    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes) {
+  const hip_custom_communicator::AddAttnResRmsNormBuildConfig build{
+      .block = dim3_from(block_x, block_y, block_z),
+      .waves_per_eu = narrowed(waves_per_eu),
+      .tile_m = narrowed(tile_m),
+      .tile_n = narrowed(tile_n),
+      .tile_k = narrowed(tile_k),
+      .quantization = quantization_from(quantization),
+      .pack_bytes = narrowed(pack_bytes)};
+  return handle_of(hip_custom_communicator::config_of(
+      build, dim3_from(grid_x, grid_y, grid_z), quantize_from_bytes));
+}
+void hip_custom_communicator_free_add_attn_res_rms_norm_config(int64_t config) {
+  delete reinterpret_cast<hip_custom_communicator::AddAttnResRmsNormConfig*>(config);
+}
+
+// all_reduce: at its config.
+Answer hip_custom_communicator_all_reduce(int64_t state, int64_t config, int64_t table_slot,
+    torch::Tensor& input, torch::Tensor& output) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AllReduceConfig*>(config);
   check_device({&input, &output});
   TORCH_CHECK(output.sizes() == input.sizes(),
               "output and input must have the same shape");
@@ -468,35 +667,13 @@ Answer all_reduce_with(int64_t rank, int64_t world, int64_t shared_buffer, int64
                                      output_rows = as_rows(output);
   if (!input_rows || !output_rows)
     return refusal(hip_custom_communicator::Error::not_contiguous);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce(
-      static_cast<int>(rank), static_cast<int>(world),
-      reinterpret_cast<char*>(shared_buffer), reinterpret_cast<char*>(private_buffer),
-      reinterpret_cast<uint32_t*>(status_device), static_cast<uint64_t>(timeout_ticks), max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input_rows->data_ptr(), input_rows->stride(0),
+      s, c, table_slot, input_rows->data_ptr(), input_rows->stride(0),
       input_rows->stride(1), input_rows->size(0), input_rows->size(1),
       output_rows->data_ptr(), output_rows->stride(0), output_rows->stride(1),
       output_rows->size(0), output_rows->size(1), dtype_of(input),
-      std::get<hip_custom_communicator::KernelConfig>(k),
       current_stream());
   return answer(got);
-}
-}  // namespace
-
-// all_reduce: its config point, every field.
-Answer hip_custom_communicator_all_reduce(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& output,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return all_reduce_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input, output,
-      forced_config(hip_custom_communicator::OpType::all_reduce, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -536,60 +713,36 @@ void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
 }
 }  // namespace
 
-namespace {
-Answer all_reduce_rms_norm_with(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps,
-    const Picked& k) {
+// all_reduce_rms_norm: at its config.
+Answer hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t config,
+    int64_t table_slot, torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output,
+    double eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AllReduceRmsNormConfig*>(config);
   norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
-      static_cast<int>(rank), static_cast<int>(world),
-      reinterpret_cast<char*>(shared_buffer), reinterpret_cast<char*>(private_buffer),
-      reinterpret_cast<uint32_t*>(status_device), static_cast<uint64_t>(timeout_ticks), max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), weight.data_ptr(), weight.stride(0),
       weight.size(0), output.data_ptr(), output.stride(0), output.stride(1),
       output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
-      static_cast<float>(eps), std::get<hip_custom_communicator::KernelConfig>(k),
+      static_cast<float>(eps),
       current_stream());
   return answer(got);
 }
-}  // namespace
 
-// all_reduce_rms_norm: its config point, every field.
-Answer hip_custom_communicator_all_reduce_rms_norm(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return all_reduce_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input, weight, output, eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
-}
-
-namespace {
-Answer all_reduce_add_rms_norm_with(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    const Picked& k) {
+// all_reduce_add_rms_norm: at its config.
+Answer hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t config,
+    int64_t table_slot, torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
+    torch::Tensor& output, torch::Tensor& residual_output, double eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AllReduceAddRmsNormConfig*>(config);
   norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
-      static_cast<int>(rank), static_cast<int>(world),
-      reinterpret_cast<char*>(shared_buffer), reinterpret_cast<char*>(private_buffer),
-      reinterpret_cast<uint32_t*>(status_device), static_cast<uint64_t>(timeout_ticks), max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), residual.data_ptr(), residual.stride(0),
       residual.stride(1), residual.size(0), residual.size(1), weight.data_ptr(),
       weight.stride(0), weight.size(0), output.data_ptr(), output.stride(0),
@@ -597,27 +750,9 @@ Answer all_reduce_add_rms_norm_with(int64_t rank, int64_t world, int64_t shared_
       residual_output.data_ptr(), residual_output.stride(0),
       residual_output.stride(1), residual_output.size(0),
       residual_output.size(1), dtype_of(input), dtype_of(weight),
-      static_cast<float>(eps), std::get<hip_custom_communicator::KernelConfig>(k),
+      static_cast<float>(eps),
       current_stream());
   return answer(got);
-}
-}  // namespace
-
-// all_reduce_add_rms_norm: its config point, every field.
-Answer hip_custom_communicator_all_reduce_add_rms_norm(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return all_reduce_add_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input, residual, weight, output, residual_output, eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }
 
 namespace {
@@ -699,28 +834,23 @@ Rows rows_of(const std::optional<torch::Tensor>& t) {
 }
 }  // namespace
 
-namespace {
-Answer all_reduce_add_attn_res_rms_norm_with(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps,
-    const Picked& k) {
+// all_reduce_add_attn_res_rms_norm: at its config.
+Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, int64_t config,
+    int64_t table_slot, torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
+    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
+    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AllReduceAddAttnResRmsNormConfig*>(config);
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks);
   const Rows old = rows_of(prefix), block = rows_of(block_output);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce_add_attn_res_rms_norm(
-      static_cast<int>(rank), static_cast<int>(world),
-      reinterpret_cast<char*>(shared_buffer), reinterpret_cast<char*>(private_buffer),
-      reinterpret_cast<uint32_t*>(status_device), static_cast<uint64_t>(timeout_ticks), max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), old.ptr, old.stride_m, old.stride_n,
       old.size_m, old.size_n, blocks.data_ptr(), blocks.stride(0),
       blocks.stride(1), blocks.stride(2), blocks.size(0), blocks.size(1),
@@ -736,75 +866,40 @@ Answer all_reduce_add_attn_res_rms_norm_with(int64_t rank, int64_t world, int64_
       output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
       block.size_n, dtype_of(input), static_cast<int>(num_blocks),
       static_cast<float>(eps), static_cast<float>(output_eps),
-      std::get<hip_custom_communicator::KernelConfig>(k),
       current_stream());
   return answer(got);
 }
-}  // namespace
 
-// all_reduce_add_attn_res_rms_norm: its config point, every field.
-Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t rank, int64_t world, int64_t shared_buffer, int64_t private_buffer,
-    int64_t status_device, int64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes,
-    int64_t partials_bytes, int64_t table_slot, bool checked_after_launch, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return all_reduce_add_attn_res_rms_norm_with(rank, world, shared_buffer, private_buffer, status_device, timeout_ticks, max_rows,
-      staging_bytes, partials_bytes, table_slot, checked_after_launch, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
-}
-
-namespace {
-Answer rms_norm_with(int64_t world, bool checked_after_launch, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps,
-    const Picked& k) {
+// rms_norm: this rank's rows normed (the second kernel of an op Python composes), at its config.
+Answer hip_custom_communicator_rms_norm(int64_t state, int64_t config, torch::Tensor& input,
+    torch::Tensor& weight, torch::Tensor& output, double eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::RmsNormConfig*>(config);
   norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::rms_norm(
-      static_cast<int>(world), checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), weight.data_ptr(), weight.stride(0),
       weight.size(0), output.data_ptr(), output.stride(0), output.stride(1),
       output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
-      static_cast<float>(eps), std::get<hip_custom_communicator::KernelConfig>(k),
+      static_cast<float>(eps),
       current_stream());
   return answer(got);
 }
-}  // namespace
 
-// rms_norm: this rank's rows normed (the second kernel of an op Python composes), its config
-// point, every field.
-Answer hip_custom_communicator_rms_norm(int64_t world, bool checked_after_launch, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return rms_norm_with(world, checked_after_launch, input, weight, output, eps,
-      forced_config(hip_custom_communicator::OpType::rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
-}
-
-namespace {
-Answer add_rms_norm_with(int64_t world, bool checked_after_launch, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    const Picked& k) {
+// add_rms_norm: this rank's rows added and normed (the second kernel of an op Python composes),
+// at its config.
+Answer hip_custom_communicator_add_rms_norm(int64_t state, int64_t config, torch::Tensor& input,
+    torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AddRmsNormConfig*>(config);
   norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::add_rms_norm(
-      static_cast<int>(world), checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), residual.data_ptr(), residual.stride(0),
       residual.stride(1), residual.size(0), residual.size(1), weight.data_ptr(),
       weight.stride(0), weight.size(0), output.data_ptr(), output.stride(0),
@@ -812,44 +907,29 @@ Answer add_rms_norm_with(int64_t world, bool checked_after_launch, torch::Tensor
       residual_output.data_ptr(), residual_output.stride(0),
       residual_output.stride(1), residual_output.size(0),
       residual_output.size(1), dtype_of(input), dtype_of(weight),
-      static_cast<float>(eps), std::get<hip_custom_communicator::KernelConfig>(k),
+      static_cast<float>(eps),
       current_stream());
   return answer(got);
 }
-}  // namespace
 
-// add_rms_norm: this rank's rows added and normed (the second kernel of an op Python composes),
-// its config point, every field.
-Answer hip_custom_communicator_add_rms_norm(int64_t world, bool checked_after_launch, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return add_rms_norm_with(world, checked_after_launch, input, residual, weight, output, residual_output, eps,
-      forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
-}
-
-namespace {
-Answer add_attn_res_rms_norm_with(int64_t world, bool checked_after_launch, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+// add_attn_res_rms_norm: AttnRes on this rank's rows (the second kernel of the op Python
+// composes), at its config.
+Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t state, int64_t config,
+    torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps,
-    const Picked& k) {
+    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
+    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps) {
+  TORCH_CHECK(state != 0 && config != 0,
+              "hip_custom_communicator: a call takes its communicator's state and its op's config");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  const auto& c = *reinterpret_cast<const hip_custom_communicator::AddAttnResRmsNormConfig*>(config);
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks);
   const Rows old = rows_of(prefix), block = rows_of(block_output);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
-    return refusal(*e);
   const auto got = hip_custom_communicator::add_attn_res_rms_norm(
-      static_cast<int>(world), checked_after_launch, input.data_ptr(), input.stride(0), input.stride(1),
+      s, c, input.data_ptr(), input.stride(0), input.stride(1),
       input.size(0), input.size(1), old.ptr, old.stride_m, old.stride_n,
       old.size_m, old.size_n, blocks.data_ptr(), blocks.stride(0),
       blocks.stride(1), blocks.stride(2), blocks.size(0), blocks.size(1),
@@ -865,27 +945,6 @@ Answer add_attn_res_rms_norm_with(int64_t world, bool checked_after_launch, torc
       output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
       block.size_n, dtype_of(input), static_cast<int>(num_blocks),
       static_cast<float>(eps), static_cast<float>(output_eps),
-      std::get<hip_custom_communicator::KernelConfig>(k),
       current_stream());
   return answer(got);
-}
-}  // namespace
-
-// add_attn_res_rms_norm: AttnRes on this rank's rows (the second kernel of the op Python
-// composes), its config point, every field.
-Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t world, bool checked_after_launch, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps,
-    const std::string& kernel, const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  return add_attn_res_rms_norm_with(world, checked_after_launch, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
-      forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
-                                    waves_per_eu, tile_m, tile_n, tile_k, quantization, pack_bytes, quantize_from_bytes));
 }

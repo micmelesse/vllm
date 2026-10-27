@@ -300,8 +300,9 @@ constexpr const char* to_string(Where w) {
 // =================================================================================================
 
 // THE VOCABULARY, every type the tables and the handle name: why a call cannot run (`Error`),
-// what a caller asks for (`OpType`), and what is tuned and forced (`KernelConfig`: its op's
-// build, its algorithm its op file's). `DType` is common.cuh's; what runs is `Config`.
+// what a caller asks for (`OpType`), and what is tuned and forced (each op's `OpConfig`: its op's
+// build, its algorithm its op file's; `KernelConfig` any op's). `DType` is common.cuh's; what runs
+// is `Config`.
 
 
 
@@ -386,8 +387,8 @@ constexpr const char* to_string(Error e) {
     case Error::field_not_positive:
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
-      return "field_not_this_templates: a forced tile_k other than 1 on a kernel "
-             "with no K";
+      return "field_not_this_templates: a field its kernel does not have (tile_k on "
+             "a kernel with no K, quantize_from_bytes on an exact build)";
     case Error::inner_stride_not_one:
       return "inner_stride_not_one: a buffer's innermost stride is not 1 (the "
              "loads are packs)";
@@ -627,6 +628,21 @@ struct KernelConfig {
   BuildConfig build;
   LaunchConfig launch;
 };
+
+// EACH OP'S CONFIG, one type an op: its build (its op's own) and its launch. Made and checked
+// once (`config_of`), held by Python as a handle, and handed to its op's every call.
+template <typename B>
+struct OpConfig {
+  B build;
+  LaunchConfig launch;
+};
+using AllReduceConfig = OpConfig<AllReduceBuildConfig>;
+using AllReduceRmsNormConfig = OpConfig<AllReduceRmsNormBuildConfig>;
+using AllReduceAddRmsNormConfig = OpConfig<AllReduceAddRmsNormBuildConfig>;
+using AllReduceAddAttnResRmsNormConfig = OpConfig<AllReduceAddAttnResRmsNormBuildConfig>;
+using RmsNormConfig = OpConfig<RmsNormBuildConfig>;
+using AddRmsNormConfig = OpConfig<AddRmsNormBuildConfig>;
+using AddAttnResRmsNormConfig = OpConfig<AddAttnResRmsNormBuildConfig>;
 
 // THE FIELDS EVERY BUILD HAS.
 constexpr OpType op_of(const BuildConfig& b) {
@@ -1232,99 +1248,49 @@ constexpr bool launch_fits(const LaunchConfig& l) {
 }
 
 // =================================================================================================
-// 1. THE FORCING: a whole config point, every field given (the C++ API takes no optional; what a
-// caller may leave out is Python's to fill): the op's kernel, its algorithm, the grid, the block
-// and its waves a EU, the tile, the quantization. A value out of range is its Error; a build the
-// kernel does not list is the check's to name. Every call is forced: Python hands its table's
-// pick the same way.
+// 1. AN OP'S CONFIG, CHECKED ONCE: every field given (the C++ API takes no optional; what a caller
+// may leave out is Python's to fill), its algorithm by name among its kernel's. A value out of
+// range is its Error; a build the kernel does not list is the call's check to name.
 // =================================================================================================
 
-// A BUILD OF TYPE B at `algorithm`, by its name among its kernel's (a norm on rows has one,
-// kRowsAlgorithm), or none where its kernel has no such algorithm.
+// AN ALGORITHM OF B'S KERNEL by its name, or none where the kernel has no such algorithm.
 template <typename B>
-std::optional<BuildConfig> build_named(std::string_view algorithm, Dim3 block, int waves_per_eu,
-                                       int tile_m, int tile_n, int tile_k, int quantization,
-                                       int pack_bytes) {
-  B b{};
-  if constexpr (HasAlgorithm<B>) {
-    const auto named = std::find_if(std::begin(B::algorithms), std::end(B::algorithms),
-                                    [&](const auto& a) { return algorithm == a.name; });
-    if (named == std::end(B::algorithms)) return std::nullopt;
-    b.algorithm = named->algorithm;
-  } else if (algorithm != kRowsAlgorithm) {
-    return std::nullopt;
-  }
-  b.block = block;
-  b.waves_per_eu = waves_per_eu;
-  b.tile_m = tile_m;
-  b.tile_n = tile_n;
-  if constexpr (requires { b.tile_k; }) b.tile_k = tile_k;
-  b.quantization = quantization;
-  b.pack_bytes = pack_bytes;
-  return b;
-}
-// Op `o`'s build at `algorithm` (build_named, of o's type).
-inline std::optional<BuildConfig> build_named(OpType o, std::string_view algorithm, Dim3 block,
-                                              int waves_per_eu, int tile_m, int tile_n,
-                                              int tile_k, int quantization, int pack_bytes) {
-  const auto as = [&]<OpType OP>() {
-    return build_named<build_t<OP>>(algorithm, block, waves_per_eu, tile_m, tile_n, tile_k,
-                                    quantization, pack_bytes);
-  };
-  switch (o) {
-    case OpType::all_reduce: return as.template operator()<OpType::all_reduce>();
-    case OpType::all_reduce_rms_norm: return as.template operator()<OpType::all_reduce_rms_norm>();
-    case OpType::all_reduce_add_rms_norm:
-      return as.template operator()<OpType::all_reduce_add_rms_norm>();
-    case OpType::all_reduce_add_attn_res_rms_norm:
-      return as.template operator()<OpType::all_reduce_add_attn_res_rms_norm>();
-    case OpType::rms_norm: return as.template operator()<OpType::rms_norm>();
-    case OpType::add_rms_norm: return as.template operator()<OpType::add_rms_norm>();
-    case OpType::add_attn_res_rms_norm:
-      return as.template operator()<OpType::add_attn_res_rms_norm>();
-  }
+constexpr std::optional<decltype(B::algorithm)> algorithm_named(std::string_view name) {
+  for (const auto& a : B::algorithms)
+    if (name == a.name) return a.algorithm;
   return std::nullopt;
 }
 
-// THE FORCED CONFIG of op `o`: its kernel (by name, the op's own) at one of its algorithms, the
-// grid and the block (x alone, every kernel's one dimension: y and z 1) of whole waves up to the
-// device's workgroup (the hardware's limit; a wider block's register trade is the tune's to
-// measure), the grid at most the blocks the signals have slots for (every block the device holds
-// resident: whether this kernel's are is grid_not_resident), waves a EU the CU holds, the tile
-// positive (tile_k 1 where the kernel has no K), the quantization exact or int4. Each limit is the
-// hardware's (STANDARDS 3.2).
-inline std::variant<KernelConfig, Error> forced(OpType o, std::string_view kernel,
-                                                std::string_view algorithm, Dim3 grid,
-                                                Dim3 block, int waves_per_eu, int tile_m,
-                                                int tile_n, int tile_k, int quantization,
-                                                int pack_bytes,
-                                                std::optional<int64_t> quantize_from_bytes) {
-  if (kernel != op(o).kernel) return Error::no_such_kernel;
-  if (quantization != Quantization::exact && quantization != Quantization::int4)
+// THE CONFIG of `build` on `grid`, checked: the grid and the block (x alone, every kernel's one
+// dimension: y and z 1) of whole waves up to the device's workgroup (the hardware's limit; a wider
+// block's register trade is the tune's to measure), the grid at most the blocks the signals have
+// slots for (every block the device holds resident: whether this kernel's are is
+// grid_not_resident), waves a EU the CU holds, the tile positive, the quantization exact or int4,
+// a pack a load the hardware has. QUANTIZE FROM is an INT4 build's alone (none given: 0, it always
+// quantizes). Each limit is the hardware's (STANDARDS 3.2).
+template <typename B>
+std::variant<OpConfig<B>, Error> config_of(const B& build, Dim3 grid,
+                                           std::optional<int64_t> quantize_from_bytes) {
+  if (build.quantization != Quantization::exact && build.quantization != Quantization::int4)
     return Error::no_such_quantization;
+  const Dim3 block = build.block;
   if (!x_alone(block) || !x_alone(grid) || block.x < kTarget.wave_size ||
       block.x > kTarget.max_workgroup || block.x % kTarget.wave_size != 0 || grid.x < 1 ||
-      grid.x > kMaxBlocks || waves_per_eu < 1 ||
-      waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
+      grid.x > kMaxBlocks || build.waves_per_eu < 1 ||
+      build.waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
     return Error::launch_out_of_range;
-  if (tile_m < 1 || tile_n < 1 || tile_k < 1) return Error::field_not_positive;
-  const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm ||
-                     o == OpType::add_attn_res_rms_norm;
-  if (!has_k && tile_k != 1) return Error::field_not_this_templates;
-  // QUANTIZE FROM, an INT4 build's alone (none given: 0, it always quantizes): an exact build
-  // moves nothing quantized, and has none.
-  if (quantization == Quantization::exact && quantize_from_bytes)
+  int tile_k = 1;  // a kernel with no K: its identity
+  if constexpr (requires { build.tile_k; }) tile_k = build.tile_k;
+  if (build.tile_m < 1 || build.tile_n < 1 || tile_k < 1) return Error::field_not_positive;
+  if (build.quantization == Quantization::exact && quantize_from_bytes)
     return Error::field_not_this_templates;
   if (quantize_from_bytes.value_or(0) < 0) return Error::field_not_positive;
   // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest); an element's at least is
   // the call's (refused): the dtype is not known here.
-  if (pack_bytes < 2 || pack_bytes > kBuild.memory.pack_bytes ||
-      (pack_bytes & (pack_bytes - 1)) != 0)
+  if (build.pack_bytes < 2 || build.pack_bytes > kBuild.memory.pack_bytes ||
+      (build.pack_bytes & (build.pack_bytes - 1)) != 0)
     return Error::pack_out_of_range;
-  const std::optional<BuildConfig> b = build_named(o, algorithm, block, waves_per_eu, tile_m,
-                                                   tile_n, tile_k, quantization, pack_bytes);
-  if (!b) return Error::no_such_kernel;
-  return KernelConfig{*b, {grid, quantize_from_bytes.value_or(0)}};
+  return OpConfig<B>{build, {grid, quantize_from_bytes.value_or(0)}};
 }
 
 // =================================================================================================
@@ -2256,6 +2222,23 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
 
 namespace hip_custom_communicator {
 
+// THE COMMUNICATOR'S STATE, what every op's call reads and none changes: this rank and the world,
+// its buffers (Python's: allocated, exchanged and freed there) and their regions' sizes, how long a
+// kernel waits on a peer, and whether each launch is checked after it runs. Made once at open,
+// held by Python as a handle, freed at close.
+struct CommsState {
+  int rank;
+  int world;
+  char* shared_buffer;
+  char* private_buffer;
+  uint32_t* status_device;
+  uint64_t timeout_ticks;
+  int64_t max_rows;
+  int64_t staging_bytes;
+  int64_t partials_bytes;
+  bool checked_after_launch;
+};
+
 // A LAUNCH DIMENSION AS HIP TAKES IT.
 inline dim3 dim3_of(const Dim3& d) {
   return dim3(static_cast<unsigned>(d.x), static_cast<unsigned>(d.y),
@@ -2268,31 +2251,30 @@ inline dim3 dim3_of(const Dim3& d) {
 // =================================================================================================
 
 inline std::variant<Config, Error> all_reduce(
-    int rank, int world, char* shared_buffer, char* private_buffer, uint32_t* status_device,
-    uint64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes,
-    int64_t table_slot, bool checked_after_launch, const void* input, int64_t input_stride_m,
-    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
-    void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype, const KernelConfig& k, hipStream_t stream) {
+    const CommsState& s, const AllReduceConfig& c, int64_t table_slot, const void* input,
+    int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    int64_t output_size_n, DType dtype, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(staging_bytes, partials_bytes,
-                                         max_rows * int64_t{sizeof(float)}, unfenced_bytes(world));
+  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
+                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(private_buffer + kPrivateRegionPtrArrays);
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   char* const* const unfenced_ptr_array = region_ptr_arrays + kUnfencedArray * kMaxRanks;
   const auto unfenced_epochs =
-      reinterpret_cast<int32_t*>(private_buffer + kPrivateUnfencedEpochs);
-  const auto tables = reinterpret_cast<void* const*>(private_buffer + kPrivateTables);
+      reinterpret_cast<int32_t*>(s.private_buffer + kPrivateUnfencedEpochs);
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   if (const std::optional<Error> e =
           layout_refused(dtype, pack_bytes_of(k.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
-  std::variant<Config, Error> checked = all_reduce_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+  std::variant<Config, Error> checked = all_reduce_config(s.world, s.staging_bytes, s.partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
       dtype, k);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
@@ -2318,9 +2300,9 @@ inline std::variant<Config, Error> all_reduce(
             std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
     };
     fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
-         config.partials_stride_n, elem_bytes(dtype), partials_bytes);
+         config.partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
-         config.staging_stride_n, elem_bytes(dtype), staging_bytes);
+         config.staging_stride_n, elem_bytes(dtype), s.staging_bytes);
     fits("unfenced", config.unfenced_size_slot, config.unfenced_stride_slot, config.unfenced_size_m,
          config.unfenced_stride_m, config.unfenced_size_n, config.unfenced_stride_n,
          elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), (layout.unfenced_guard - layout.unfenced));
@@ -2345,11 +2327,11 @@ inline std::variant<Config, Error> all_reduce(
     // it reads the staging.
     const bool in_table = config.in_place;
     void* const* const table =
-        in_table ? input_table(tables, table_slot, shared_buffer + layout.staging, staging_bytes,
+        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
                                elem_bytes(dtype), stream)
                  : nullptr;
-    const int table_size = in_table ? world : 0;
+    const int table_size = in_table ? s.world : 0;
     const int64_t table_stride_m =
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
@@ -2361,35 +2343,35 @@ inline std::variant<Config, Error> all_reduce(
         reinterpret_cast<const T* const*>(table), table_size, table_stride_m, table_stride_n,
         static_cast<T*>(output), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        partials_ptr_array, world, config.partials_stride_m,
+        partials_ptr_array, s.world, config.partials_stride_m,
         config.partials_stride_n, static_cast<int>(config.partials_size_m),
         static_cast<int>(config.partials_size_n), staging_ptr_array,
-        world, config.staging_stride_m, config.staging_stride_n,
+        s.world, config.staging_stride_m, config.staging_stride_n,
         static_cast<int>(config.staging_size_m), static_cast<int>(config.staging_size_n),
-        unfenced_ptr_array, world, config.unfenced_stride_slot,
+        unfenced_ptr_array, s.world, config.unfenced_stride_slot,
         config.unfenced_stride_m, config.unfenced_stride_n,
         static_cast<int>(config.unfenced_size_slot), static_cast<int>(config.unfenced_size_m),
         static_cast<int>(config.unfenced_size_n), unfenced_epochs,
         kUnfencedEpochsStrideBlock, int64_t{1},
         static_cast<int>(kUnfencedBlocks),
         static_cast<int>(kUnfencedEpochsStrideBlock), signals_ptr_array,
-        world, kSignalsStrideParity, int64_t{kMaxRanks},
+        s.world, kSignalsStrideParity, int64_t{kMaxRanks},
         int64_t{1}, int64_t{2}, int64_t{kMaxBlocks},
-        int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks);
+        int64_t{kMaxRanks}, s.status_device, int64_t{1},
+        int64_t{kStatusFields}, s.rank, s.timeout_ticks);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce after it: no write past a region (the guards), no
     // fault, every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(shared_buffer, layout); !broken.empty())
+        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
           throw std::runtime_error("hip_custom_communicator all_reduce after its launch: " + broken);
         std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), status_device, sizeof(words), hipMemcpyDefault));
+        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
         if (words[static_cast<int>(StatusField::state)] != 0 ||
             words[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce after its launch: a fault or an "
@@ -2424,25 +2406,23 @@ inline std::variant<Config, Error> all_reduce(
 // =================================================================================================
 
 inline std::variant<Config, Error> all_reduce_rms_norm(
-    int rank, int world, char* shared_buffer, char* private_buffer, uint32_t* status_device,
-    uint64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes,
-    int64_t table_slot, bool checked_after_launch, const void* input, int64_t input_stride_m,
-    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
-    const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
-    void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype,
-    DType weight_dtype, float eps, const KernelConfig& k, hipStream_t stream) {
+    const CommsState& s, const AllReduceRmsNormConfig& c, int64_t table_slot, const void* input,
+    int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
+    const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
+    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n,
+    DType dtype, DType weight_dtype, float eps, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(staging_bytes, partials_bytes,
-                                         max_rows * int64_t{sizeof(float)}, unfenced_bytes(world));
+  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
+                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(private_buffer + kPrivateRegionPtrArrays);
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto tables = reinterpret_cast<void* const*>(private_buffer + kPrivateTables);
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   if (const std::optional<Error> e =
           layout_refused(dtype, pack_bytes_of(k.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -2450,7 +2430,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
   if (const std::optional<Error> e =
           layout_refused(weight_dtype, pack_bytes_of(k.build), {{0, weight_stride_n}}))
     return *e;
-  std::variant<Config, Error> checked = all_reduce_rms_norm_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+  std::variant<Config, Error> checked = all_reduce_rms_norm_config(s.world, s.staging_bytes, s.partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       weight, weight_stride_n, weight_size_n, output, output_stride_m,
       output_stride_n, output_size_m, output_size_n, dtype, weight_dtype, eps,
       k, stream);
@@ -2477,9 +2457,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
             std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
     };
     fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
-         config.partials_stride_n, elem_bytes(dtype), partials_bytes);
+         config.partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
-         config.staging_stride_n, elem_bytes(dtype), staging_bytes);
+         config.staging_stride_n, elem_bytes(dtype), s.staging_bytes);
     if (volume(config.grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
@@ -2488,11 +2468,11 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     // it reads the staging.
     const bool in_table = quantization_of(config.build) == Quantization::exact;
     void* const* const table =
-        in_table ? input_table(tables, table_slot, shared_buffer + layout.staging, staging_bytes,
+        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
                                elem_bytes(dtype), stream)
                  : nullptr;
-    const int table_size = in_table ? world : 0;
+    const int table_size = in_table ? s.world : 0;
     const int64_t table_stride_m =
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
@@ -2506,31 +2486,31 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
             weight_stride_n,
         static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
         output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), partials_ptr_array, world,
+        static_cast<int>(output_size_n), partials_ptr_array, s.world,
          config.partials_stride_m,
         config.partials_stride_n, static_cast<int>(config.partials_size_m),
         static_cast<int>(config.partials_size_n), staging_ptr_array,
-            world, config.staging_stride_m,
+            s.world, config.staging_stride_m,
         config.staging_stride_n, static_cast<int>(config.staging_size_m),
         static_cast<int>(config.staging_size_n), signals_ptr_array,
-            world, kSignalsStrideParity,
+            s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
-        int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks, eps);
+        int64_t{kMaxRanks}, s.status_device, int64_t{1},
+        int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_rms_norm after it: no write past a region (the guards), no
     // fault, every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(shared_buffer, layout); !broken.empty())
+        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
           throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: " + broken);
         std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), status_device, sizeof(words), hipMemcpyDefault));
+        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
         if (words[static_cast<int>(StatusField::state)] != 0 ||
             words[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm after its launch: a fault or an "
@@ -2559,31 +2539,29 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
 }
 
 inline std::variant<Config, Error> all_reduce_add_rms_norm(
-    int rank, int world, char* shared_buffer, char* private_buffer, uint32_t* status_device,
-    uint64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes,
-    int64_t table_slot, bool checked_after_launch, const void* input, int64_t input_stride_m,
-    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
+    const CommsState& s, const AllReduceAddRmsNormConfig& c, int64_t table_slot, const void* input,
+    int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* residual, int64_t residual_stride_m, int64_t residual_stride_n,
-    int64_t residual_size_m, int64_t residual_size_n, const void* weight,
-    int64_t weight_stride_n, int64_t weight_size_n, void* output,
-    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
-    int64_t output_size_n, void* residual_output,
+    int64_t residual_size_m, int64_t residual_size_n, const void* weight, int64_t weight_stride_n,
+    int64_t weight_size_n, void* output, int64_t output_stride_m, int64_t output_stride_n,
+    int64_t output_size_m, int64_t output_size_n, void* residual_output,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
-    int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
-    DType weight_dtype, float eps, const KernelConfig& k, hipStream_t stream) {
+    int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype, DType weight_dtype,
+    float eps, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(staging_bytes, partials_bytes,
-                                         max_rows * int64_t{sizeof(float)}, unfenced_bytes(world));
+  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
+                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(private_buffer + kPrivateRegionPtrArrays);
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   const auto scales_ptr_array =
       reinterpret_cast<float* const*>(region_ptr_arrays + kScalesArray * kMaxRanks);
-  const auto tables = reinterpret_cast<void* const*>(private_buffer + kPrivateTables);
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   if (const std::optional<Error> e = layout_refused(
           dtype, pack_bytes_of(k.build), {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
@@ -2594,7 +2572,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           layout_refused(weight_dtype, pack_bytes_of(k.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
-      all_reduce_add_rms_norm_config(world, max_rows, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      all_reduce_add_rms_norm_config(s.world, s.max_rows, s.staging_bytes, s.partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
           residual, residual_stride_m, residual_stride_n, residual_size_m,
           residual_size_n, weight, weight_stride_n, weight_size_n, output,
           output_stride_m, output_stride_n, output_size_m, output_size_n,
@@ -2624,9 +2602,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
             std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
     };
     fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
-         config.partials_stride_n, elem_bytes(dtype), partials_bytes);
+         config.partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
-         config.staging_stride_n, elem_bytes(dtype), staging_bytes);
+         config.staging_stride_n, elem_bytes(dtype), s.staging_bytes);
     fits("scales", 1, 0, config.scales_size_m, config.scales_stride_m, 1, 1, 4, (layout.partials_guard - layout.scales));
     if (volume(config.grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm before its launch: a grid of " +
@@ -2636,11 +2614,11 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     // it reads the staging.
     const bool in_table = quantization_of(config.build) == Quantization::exact;
     void* const* const table =
-        in_table ? input_table(tables, table_slot, shared_buffer + layout.staging, staging_bytes,
+        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
                                elem_bytes(dtype), stream)
                  : nullptr;
-    const int table_size = in_table ? world : 0;
+    const int table_size = in_table ? s.world : 0;
     const int64_t table_stride_m =
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
@@ -2660,32 +2638,32 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         residual_output_stride_m, residual_output_stride_n,
         static_cast<int>(residual_output_size_m),
         static_cast<int>(residual_output_size_n), partials_ptr_array,
-            world,
+            s.world,
          config.partials_stride_m,
         config.partials_stride_n, static_cast<int>(config.partials_size_m),
         static_cast<int>(config.partials_size_n), scales_ptr_array,
-        world, config.scales_stride_m, static_cast<int>(config.scales_size_m),
-        staging_ptr_array, world, config.staging_stride_m,
+        s.world, config.scales_stride_m, static_cast<int>(config.scales_size_m),
+        staging_ptr_array, s.world, config.staging_stride_m,
         config.staging_stride_n, static_cast<int>(config.staging_size_m),
         static_cast<int>(config.staging_size_n), signals_ptr_array,
-            world, kSignalsStrideParity,
+            s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
-        int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks, eps);
+        int64_t{kMaxRanks}, s.status_device, int64_t{1},
+        int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_add_rms_norm after it: no write past a region (the guards), no
     // fault, every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(shared_buffer, layout); !broken.empty())
+        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
           throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: " + broken);
         std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), status_device, sizeof(words), hipMemcpyDefault));
+        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
         if (words[static_cast<int>(StatusField::state)] != 0 ||
             words[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm after its launch: a fault or an "
@@ -2725,37 +2703,32 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
 // =================================================================================================
 
 inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
-    int rank, int world, char* shared_buffer, char* private_buffer, uint32_t* status_device,
-    uint64_t timeout_ticks, int64_t max_rows, int64_t staging_bytes, int64_t partials_bytes,
-    int64_t table_slot, bool checked_after_launch, const void* input, int64_t input_stride_m,
-    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
-    const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
-    int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks,
-    int64_t blocks_stride_m, int64_t blocks_stride_r, int64_t blocks_stride_n,
-    int64_t blocks_size_m, int64_t blocks_size_r, int64_t blocks_size_n,
-    const void* norm_weight, int64_t norm_weight_stride_n,
-    int64_t norm_weight_size_n, const void* qk_weight,
-    int64_t qk_weight_stride_n, int64_t qk_weight_size_n,
-    const void* output_norm_weight, int64_t output_norm_weight_stride_n,
-    int64_t output_norm_weight_size_n, void* prefix_output,
-    int64_t prefix_output_stride_m, int64_t prefix_output_stride_n,
-    int64_t prefix_output_size_m, int64_t prefix_output_size_n, void* output,
-    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    const CommsState& s, const AllReduceAddAttnResRmsNormConfig& c, int64_t table_slot,
+    const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
+    int64_t input_size_n, const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
+    int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n, int64_t blocks_size_m, int64_t blocks_size_r,
+    int64_t blocks_size_n, const void* norm_weight, int64_t norm_weight_stride_n,
+    int64_t norm_weight_size_n, const void* qk_weight, int64_t qk_weight_stride_n,
+    int64_t qk_weight_size_n, const void* output_norm_weight, int64_t output_norm_weight_stride_n,
+    int64_t output_norm_weight_size_n, void* prefix_output, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, int64_t prefix_output_size_m, int64_t prefix_output_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
-    int64_t block_output_stride_n, int64_t block_output_size_m,
-    int64_t block_output_size_n, DType dtype, int num_blocks, float eps,
-    float output_eps, const KernelConfig& k, hipStream_t stream) {
+    int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
+    DType dtype, int num_blocks, float eps, float output_eps, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(staging_bytes, partials_bytes,
-                                         max_rows * int64_t{sizeof(float)}, unfenced_bytes(world));
+  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
+                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
   char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(private_buffer + kPrivateRegionPtrArrays);
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
   const auto signals_ptr_array =
       reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto tables = reinterpret_cast<void* const*>(private_buffer + kPrivateTables);
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   if (const std::optional<Error> e = layout_refused(
           dtype, pack_bytes_of(k.build), {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
@@ -2781,7 +2754,7 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
             dtype, pack_bytes_of(k.build), {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<Config, Error> checked =
-      all_reduce_add_attn_res_rms_norm_config(world, staging_bytes, partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      all_reduce_add_attn_res_rms_norm_config(s.world, s.staging_bytes, s.partials_bytes, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
           prefix, prefix_stride_m, prefix_stride_n, prefix_size_m,
           prefix_size_n, blocks, blocks_stride_m, blocks_stride_r,
           blocks_stride_n, blocks_size_m, blocks_size_r, blocks_size_n,
@@ -2816,9 +2789,9 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
             std::to_string((last + 1) * elem) + ", past the region's " + std::to_string(region_bytes));
     };
     fits("partials", 1, 0, config.partials_size_m, config.partials_stride_m, config.partials_size_n,
-         config.partials_stride_n, elem_bytes(dtype), partials_bytes);
+         config.partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, config.staging_size_m, config.staging_stride_m, config.staging_size_n,
-         config.staging_stride_n, elem_bytes(dtype), staging_bytes);
+         config.staging_stride_n, elem_bytes(dtype), s.staging_bytes);
     if (volume(config.grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: a grid of " +
           std::to_string(volume(config.grid)) + " blocks past the signals' " +
@@ -2827,11 +2800,11 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
     // it reads the staging.
     const bool in_table = quantization_of(config.build) == Quantization::exact;
     void* const* const table =
-        in_table ? input_table(tables, table_slot, shared_buffer + layout.staging, staging_bytes,
+        in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
                                elem_bytes(dtype), stream)
                  : nullptr;
-    const int table_size = in_table ? world : 0;
+    const int table_size = in_table ? s.world : 0;
     const int64_t table_stride_m =
         !in_table ? config.staging_stride_m : table_slot > 0 ? input_stride_m : input_size_n;
     const int64_t table_stride_n = !in_table ? config.staging_stride_n : 1;
@@ -2860,30 +2833,30 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
         block_output_stride_m, block_output_stride_n,
         static_cast<int>(block_output_size_m),
         static_cast<int>(block_output_size_n), partials_ptr_array,
-        world, config.partials_stride_m, config.partials_stride_n,
+        s.world, config.partials_stride_m, config.partials_stride_n,
         static_cast<int>(config.partials_size_m), static_cast<int>(config.partials_size_n),
-        staging_ptr_array, world, config.staging_stride_m,
+        staging_ptr_array, s.world, config.staging_stride_m,
         config.staging_stride_n, static_cast<int>(config.staging_size_m),
         static_cast<int>(config.staging_size_n), signals_ptr_array,
-            world, kSignalsStrideParity,
+            s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
-        int64_t{kMaxRanks}, status_device, int64_t{1},
-        int64_t{kStatusFields}, rank, timeout_ticks, num_blocks, eps,
+        int64_t{kMaxRanks}, s.status_device, int64_t{1},
+        int64_t{kStatusFields}, s.rank, s.timeout_ticks, num_blocks, eps,
         output_eps);
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of all_reduce_add_attn_res_rms_norm after it: no write past a region (the guards), no
     // fault, every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
-        if (const std::string broken = guards_broken(shared_buffer, layout); !broken.empty())
+        if (const std::string broken = guards_broken(s.shared_buffer, layout); !broken.empty())
           throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: " + broken);
         std::array<uint32_t, kStatusFields> words{};
-        HIP_CHECK(hipMemcpy(words.data(), status_device, sizeof(words), hipMemcpyDefault));
+        HIP_CHECK(hipMemcpy(words.data(), s.status_device, sizeof(words), hipMemcpyDefault));
         if (words[static_cast<int>(StatusField::state)] != 0 ||
             words[static_cast<int>(StatusField::abort)] != 0)
           throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm after its launch: a fault or an "
@@ -2917,11 +2890,12 @@ inline std::variant<Config, Error> all_reduce_add_attn_res_rms_norm(
 // =================================================================================================
 
 inline std::variant<Config, Error> rms_norm(
-    int world, bool checked_after_launch, const void* input, int64_t input_stride_m, int64_t input_stride_n,
-    int64_t input_size_m, int64_t input_size_n, const void* weight, int64_t weight_stride_n,
-    int64_t weight_size_n, void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype, DType weight_dtype, float eps,
-    const KernelConfig& k, hipStream_t stream) {
+    const CommsState& s, const RmsNormConfig& c, const void* input, int64_t input_stride_m,
+    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* weight,
+    int64_t weight_stride_n, int64_t weight_size_n, void* output, int64_t output_stride_m,
+    int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n, DType dtype,
+    DType weight_dtype, float eps, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   if (const std::optional<Error> e =
           layout_refused(dtype, pack_bytes_of(k.build), {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -2930,7 +2904,7 @@ inline std::variant<Config, Error> rms_norm(
           layout_refused(weight_dtype, pack_bytes_of(k.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
-      rms_norm_config(world, input_size_m, input_size_n, dtype, weight_dtype, k);
+      rms_norm_config(s.world, input_size_m, input_size_n, dtype, weight_dtype, k);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::rms_norm>(config, [&]<Instance I>() {
@@ -2956,7 +2930,7 @@ inline std::variant<Config, Error> rms_norm(
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of rms_norm after it: (a norm on rows
     // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
@@ -2983,15 +2957,16 @@ inline std::variant<Config, Error> rms_norm(
 }
 
 inline std::variant<Config, Error> add_rms_norm(
-    int world, bool checked_after_launch, const void* input, int64_t input_stride_m, int64_t input_stride_n,
-    int64_t input_size_m, int64_t input_size_n, const void* residual, int64_t residual_stride_m,
-    int64_t residual_stride_n, int64_t residual_size_m, int64_t residual_size_n,
-    const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
-    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    const CommsState& s, const AddRmsNormConfig& c, const void* input, int64_t input_stride_m,
+    int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* residual,
+    int64_t residual_stride_m, int64_t residual_stride_n, int64_t residual_size_m,
+    int64_t residual_size_n, const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, void* residual_output, int64_t residual_output_stride_m,
     int64_t residual_output_stride_n, int64_t residual_output_size_m,
     int64_t residual_output_size_n, DType dtype, DType weight_dtype, float eps,
-    const KernelConfig& k, hipStream_t stream) {
+    hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   if (const std::optional<Error> e = layout_refused(
           dtype, pack_bytes_of(k.build), {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
@@ -3002,7 +2977,7 @@ inline std::variant<Config, Error> add_rms_norm(
           layout_refused(weight_dtype, pack_bytes_of(k.build), {{0, weight_stride_n}}))
     return *e;
   std::variant<Config, Error> checked =
-      add_rms_norm_config(world, input_size_m, input_size_n, dtype, weight_dtype, k);
+      add_rms_norm_config(s.world, input_size_m, input_size_n, dtype, weight_dtype, k);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::add_rms_norm>(config, [&]<Instance I>() {
@@ -3032,7 +3007,7 @@ inline std::variant<Config, Error> add_rms_norm(
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of add_rms_norm after it: (a norm on rows
     // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
@@ -3062,11 +3037,11 @@ inline std::variant<Config, Error> add_rms_norm(
 }
 
 inline std::variant<Config, Error> add_attn_res_rms_norm(
-    int world, bool checked_after_launch, const void* input, int64_t input_stride_m, int64_t input_stride_n,
-    int64_t input_size_m, int64_t input_size_n, const void* prefix, int64_t prefix_stride_m,
-    int64_t prefix_stride_n, int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks,
-    int64_t blocks_stride_m, int64_t blocks_stride_r, int64_t blocks_stride_n,
-    int64_t blocks_size_m, int64_t blocks_size_r, int64_t blocks_size_n,
+    const CommsState& s, const AddAttnResRmsNormConfig& c, const void* input,
+    int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
+    const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, int64_t prefix_size_m,
+    int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
+    int64_t blocks_stride_n, int64_t blocks_size_m, int64_t blocks_size_r, int64_t blocks_size_n,
     const void* norm_weight, int64_t norm_weight_stride_n, int64_t norm_weight_size_n,
     const void* qk_weight, int64_t qk_weight_stride_n, int64_t qk_weight_size_n,
     const void* output_norm_weight, int64_t output_norm_weight_stride_n,
@@ -3075,8 +3050,8 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
     int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
-    DType dtype, int num_blocks, float eps, float output_eps, const KernelConfig& k,
-    hipStream_t stream) {
+    DType dtype, int num_blocks, float eps, float output_eps, hipStream_t stream) {
+  const KernelConfig k{c.build, c.launch};
   if (const std::optional<Error> e = layout_refused(
           dtype, pack_bytes_of(k.build), {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
@@ -3100,7 +3075,7 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
             dtype, pack_bytes_of(k.build), {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<Config, Error> checked =
-      add_attn_res_rms_norm_config(world, input_size_m, input_size_n, dtype, num_blocks, k);
+      add_attn_res_rms_norm_config(s.world, input_size_m, input_size_n, dtype, num_blocks, k);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::add_attn_res_rms_norm>(config, [&]<Instance I>() {
@@ -3137,7 +3112,7 @@ inline std::variant<Config, Error> add_attn_res_rms_norm(
     // AFTER THE LAUNCH, checked (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1) and not captured: the
     // kernel done, every expectation of add_attn_res_rms_norm after it: (a norm on rows
     // touches no shared memory and waits on no peer: no guard, no fault) every output finite where the input is.
-    if (checked_after_launch) {
+    if (s.checked_after_launch) {
       hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
       HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
       if (capturing == hipStreamCaptureStatusNone) {
