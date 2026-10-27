@@ -85,15 +85,13 @@ constexpr int kMaxWavesPerCu = 32;   // resident at once
 constexpr int kSimdsPerCu = 4;       // a wave runs on one SIMD
 constexpr int kXgmiLinks = 7;        // one to each peer in an 8-GPU node
 
-// A TENSOR'S ELEMENT TYPE, as the build names it. f32 is a norm weight's, not a call's.
-enum class DType { f16, bf16, f32 };
 
 // THE BUILD: a PACK is the widest load (global_load_dwordx4), the unit every kernel loads, sums and
 // stores, as in vLLM's and aiter's custom all-reduce; the dtypes and worlds dispatch instantiates,
 // and the check refuses the rest. The exchange is sized at open from the largest call, never a
 // constant; a build's block is its config's (any the device launches).
 constexpr int kPackBytes = 16;
-constexpr std::array<DType, 2> kDtypes = {DType::f16, DType::bf16};
+constexpr std::array<at::ScalarType, 2> kDtypes = {at::ScalarType::Half, at::ScalarType::BFloat16};
 constexpr std::array<int, 3> kWorlds = {2, 4, 8};
 
 // THE PEERS' LIMITS, for the layouts host and device share (the signal block, the state): at most
@@ -119,7 +117,7 @@ constexpr int kWhereCount = 2;
 
 // THE VOCABULARY, every type the tables and the handle name: why a call cannot run (`Error`),
 // what a caller asks for (`OpType`), and what is compiled in (each op's build, its algorithm its
-// op file's). `DType` is common.cuh's.
+// op file's). `at::ScalarType` is common.cuh's.
 
 
 // WHY C++ REFUSED. C++ never raises: every function returns its Error as a value (none: it ran),
@@ -448,7 +446,7 @@ constexpr int64_t kPrivateBytes =
 
 // A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly
 // these).
-constexpr DType kNormWeights[] = {DType::f32};
+constexpr at::ScalarType kNormWeights[] = {at::ScalarType::Float};
 
 struct Op {
   OpType type;
@@ -456,10 +454,10 @@ struct Op {
   // Its kernel's name (the table's `kernel`).
   const char* kernel;
   // The dtypes its input may have.
-  std::span<const DType> dtypes;
+  std::span<const at::ScalarType> dtypes;
   // The dtypes its weight may have besides its input's; none for an op with no
   // weight.
-  std::span<const DType> weights;
+  std::span<const at::ScalarType> weights;
   // Whether its input is [rows, cols] as given (2-D), not any shape read as
   // rows of its last dimension.
   bool two_d;
@@ -509,8 +507,8 @@ template <typename B>
 struct Instance {
   B build;
   int world;
-  DType dtype;
-  DType weight_dtype;
+  at::ScalarType dtype;
+  at::ScalarType weight_dtype;
   bool contiguous;
   bool chunked;
   bool tail;
@@ -527,29 +525,12 @@ template <int INT_VALUE>
 using constant = std::integral_constant<int, INT_VALUE>;
 
 
-// THE C++ TYPE OF A BUILT DTYPE.
-template <DType DTYPE_ID>
-struct of_dtype;
-template <>
-struct of_dtype<DType::f16> {
-  using t = c10::Half;
-};
-template <>
-struct of_dtype<DType::bf16> {
-  using t = c10::BFloat16;
-};
 template <auto LISTED_BUILD>
 struct build_constant {
   static constexpr auto value = LISTED_BUILD;
 };
 
 
-template <>
-struct of_dtype<DType::f32> { using t = float; };
-
-template <typename T>
-constexpr DType dtype_of = std::is_same_v<T, c10::Half> ? DType::f16 : std::is_same_v<T,
-    c10::BFloat16> ? DType::bf16 : DType::f32;
 
 
 // THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (this rank, the world,
@@ -605,16 +586,18 @@ namespace hip_custom_communicator {
 
 
 
-constexpr const char* to_string(DType d) {
+// A DTYPE BY THE NAME PYTHON'S BUILD INFO GIVES IT (its `_DTYPES`).
+constexpr const char* to_string(at::ScalarType d) {
   switch (d) {
-    case DType::f16:
+    case at::ScalarType::Half:
       return "f16";
-    case DType::bf16:
+    case at::ScalarType::BFloat16:
       return "bf16";
-    case DType::f32:
+    case at::ScalarType::Float:
       return "f32";
+    default:
+      return "unknown";
   }
-  return "unknown";
 }
 
 // WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly
@@ -626,7 +609,7 @@ constexpr bool built_in(const std::array<ELEMENT, NUM_BUILT>& built,
     if (b == x) return true;
   return false;
 }
-constexpr bool dtype_built(DType d) {
+constexpr bool dtype_built(at::ScalarType d) {
   return built_in(kDtypes, d);
 }
 constexpr bool world_built(int world) {
@@ -831,7 +814,7 @@ constexpr int compiled_quantization(const B& b) {
   return b.pack_bytes == kPackBytes ? b.quantization : Quantization::exact;
 }
 
-constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
+constexpr int elem_bytes(at::ScalarType d) { return d == at::ScalarType::Float ? 4 : 2; }
 constexpr int64_t unfenced_bytes(int world) {
   return 2 * int64_t{kUnfencedBlocks} * world * kUnfencedSlotBytes * (kLineBytes / kLinePayloadBytes);
 }
@@ -1103,7 +1086,7 @@ constexpr void every_algorithm(F&& f) {
 // rows starting on whole packs of `pack` bytes, the build's ({stride_m, stride_n} a
 // buffer, in elements of `dtype`; a vector's stride_m 0).
 inline std::optional<Error> layout_refused(
-    DType dtype, int64_t pack, std::initializer_list<std::pair<int64_t, int64_t>> strides) {
+    at::ScalarType dtype, int64_t pack, std::initializer_list<std::pair<int64_t, int64_t>> strides) {
   for (const auto& [m, n] : strides) {
     if (n != 1) return Error::inner_stride_not_one;
     if (m * elem_bytes(dtype) % pack != 0)
@@ -1124,7 +1107,7 @@ inline std::optional<Error> layout_refused(
 template <typename B>
 std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
                              int64_t partials_bytes, const B& build, Dim3 grid,
-                             std::optional<int64_t> quantize_from_bytes, DType dtype, int64_t m,
+                             std::optional<int64_t> quantize_from_bytes, at::ScalarType dtype, int64_t m,
                              int64_t n) {
   if (collective && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
@@ -1241,10 +1224,10 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
 
 
 // THE WEIGHT a norm takes: its input's dtype, or one of its op's `weights`.
-constexpr std::optional<Error> weight_refused(OpType o, DType dtype,
-                                              DType weight_dtype) {
+constexpr std::optional<Error> weight_refused(OpType o, at::ScalarType dtype,
+                                              at::ScalarType weight_dtype) {
   if (weight_dtype == dtype) return std::nullopt;
-  for (const DType w : op(o).weights)
+  for (const at::ScalarType w : op(o).weights)
     if (weight_dtype == w) return std::nullopt;
   return Error::weight_not_built;
 }
@@ -1263,25 +1246,25 @@ bool by_world(int world, VISITOR&& f) {
 }
 
 template <typename VISITOR, size_t... INDICES>
-bool by_dtype_in(DType d, VISITOR& f, std::index_sequence<INDICES...>) {
+bool by_dtype_in(at::ScalarType d, VISITOR& f, std::index_sequence<INDICES...>) {
   constexpr auto& built = kDtypes;
-  return ((d == built[INDICES] && (f(type<typename of_dtype<built[INDICES]>::t>{}), true)) ||
+  return ((d == built[INDICES] && (f(type<c10::impl::ScalarTypeToCPPTypeT<built[INDICES]>>{}), true)) ||
           ...);
 }
 
 template <typename VISITOR>
-bool by_dtype(DType d, VISITOR&& f) {
+bool by_dtype(at::ScalarType d, VISITOR&& f) {
   return by_dtype_in(d, f, std::make_index_sequence<kDtypes.size()>{});
 }
 
 // A norm's weight: T itself, or fp32.
 template <typename DTYPE, typename VISITOR>
-bool by_weight(DType weight, DType dtype, VISITOR&& f) {
+bool by_weight(at::ScalarType weight, at::ScalarType dtype, VISITOR&& f) {
   if (weight == dtype) {
     f(type<DTYPE>{});
     return true;
   }
-  if (weight == DType::f32) {
+  if (weight == at::ScalarType::Float) {
     f(type<float>{});
     return true;
   }
@@ -1308,7 +1291,7 @@ bool by_build(const BuildConfig& b, VISITOR&& f) {
 // the Instance as its template argument, every field a constant. Whether the build compiled that
 // instance (a call validated first always finds it).
 template <OpType OP, typename F>
-bool with_instance(const build_t<OP>& build, int world, DType dtype, DType weight_dtype,
+bool with_instance(const build_t<OP>& build, int world, at::ScalarType dtype, at::ScalarType weight_dtype,
                    bool contiguous, bool chunked, bool tail, bool quantize_int4, F&& f) {
   bool found = false;
   by_world(world, [&](auto world_constant) {
@@ -1324,7 +1307,7 @@ bool with_instance(const build_t<OP>& build, int world, DType dtype, DType weigh
             constexpr Instance<build_t<OP>> I = [=] {
               build_t<OP> compiled = B;
               compiled.quantization = compiled_quantization(B);
-              return Instance<build_t<OP>>{compiled, WORLD, dtype_of<T>, dtype_of<W>,
+              return Instance<build_t<OP>>{compiled, WORLD, c10::CppTypeToScalarType<T>::value, c10::CppTypeToScalarType<W>::value,
                                            CONTIGUOUS, CHUNKED, TAIL, QUANTIZE_INT4};
             }();
             f.template operator()<I>();
@@ -1369,8 +1352,8 @@ bool with_instance(const build_t<OP>& build, int world, DType dtype, DType weigh
 template <Instance I>
 const void* kernel_pointer() {
   constexpr auto B = I.build;
-  using T = typename of_dtype<I.dtype>::t;
-  using W = typename of_dtype<I.weight_dtype>::t;
+  using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+  using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
   if constexpr (B.op == OpType::all_reduce)
     return reinterpret_cast<const void*>(
         all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n, B.block.x,
@@ -1463,17 +1446,7 @@ inline dim3 dim3_of(const Dim3& d) {
 // table's pick the same way; the API checks it.
 
 namespace {
-using hip_custom_communicator::DType;
 using hip_custom_communicator::Error;
-
-// A TENSOR'S DTYPE, where the build has it.
-std::optional<DType> dtype_of_tensor(const torch::Tensor& t) {
-  const at::ScalarType s = t.scalar_type();
-  if (s == at::ScalarType::Half) return DType::f16;
-  if (s == at::ScalarType::BFloat16) return DType::bf16;
-  if (s == at::ScalarType::Float) return DType::f32;
-  return std::nullopt;
-}
 
 // EVERY CONFIG FIELD AN INT: the API takes ints.
 bool all_ints(std::initializer_list<int64_t> vs) {
@@ -1574,7 +1547,6 @@ bool overlapping(std::initializer_list<const torch::Tensor*> inputs,
 }  // namespace
 
 namespace {
-using hip_custom_communicator::DType;
 using hip_custom_communicator::Error;
 
 // A NORM CALL'S TENSORS, or the Error they are refused for: input [tokens, hidden], output (and
@@ -1668,7 +1640,7 @@ std::optional<Error> attn_res_tensors(
 BuildInfoWire hip_custom_communicator_build_info() {
   using namespace hip_custom_communicator;
   Names dtypes, ops, errors, where_names;
-  for (const DType d : kDtypes) dtypes.push_back(to_string(d));
+  for (const at::ScalarType d : kDtypes) dtypes.push_back(to_string(d));
   const std::vector<int64_t> worlds(kWorlds.begin(),
                                     kWorlds.end());
   for (int i = 0; i < kNumOps; ++i)
@@ -1713,8 +1685,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
   Names op_dtypes, op_weights;
   std::vector<int64_t> op_facts;
   for (const Op& o : kOps) {
-    for (const DType d : o.dtypes) op_dtypes.push_back(to_string(d));
-    for (const DType d : o.weights) op_weights.push_back(to_string(d));
+    for (const at::ScalarType d : o.dtypes) op_dtypes.push_back(to_string(d));
+    for (const at::ScalarType d : o.weights) op_weights.push_back(to_string(d));
     op_facts.insert(op_facts.end(), {static_cast<int64_t>(o.dtypes.size()),
                                      static_cast<int64_t>(o.weights.size()),
                                      o.two_d});
@@ -1784,7 +1756,7 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world, int64_t devic
     return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
   };
   int64_t partials_bytes = 0, staging_bytes = int4_payload_bytes(max_rows, max_cols);
-  for (const DType d : kDtypes) {
+  for (const at::ScalarType d : kDtypes) {
     const int64_t packs = (max_cols * elem_bytes(d) + pack - 1) / pack;
     every_algorithm([&](OpType, auto a) {
       const int64_t need = partials_need(a, max_rows, packs, static_cast<int>(world), pack);
@@ -2036,8 +2008,6 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
                                      output_rows = as_rows(output);
   if (!input_rows || !output_rows)
     return error_code(Error::not_contiguous);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input_rows->data_ptr();
@@ -2050,7 +2020,7 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   const int64_t output_stride_n = output_rows->stride(1);
   const int64_t output_size_m = output_rows->size(0);
   const int64_t output_size_n = output_rows->size(1);
-  const DType dtype = *found_dtype;
+  const at::ScalarType dtype = input.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2189,8 +2159,8 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.contiguous, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2234,10 +2204,6 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
   if (const std::optional<Error> e = norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false)) return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
-  const std::optional<DType> found_weight_dtype = dtype_of_tensor(weight);
-  if (!found_weight_dtype) return error_code(Error::weight_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -2253,8 +2219,8 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
   const int64_t output_stride_n = output.stride(1);
   const int64_t output_size_m = output.size(0);
   const int64_t output_size_n = output.size(1);
-  const DType dtype = *found_dtype;
-  const DType weight_dtype = *found_weight_dtype;
+  const at::ScalarType dtype = input.scalar_type();
+  const at::ScalarType weight_dtype = weight.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2346,8 +2312,8 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     all_reduce_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2392,10 +2358,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
   if (const std::optional<Error> e = norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false)) return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
-  const std::optional<DType> found_weight_dtype = dtype_of_tensor(weight);
-  if (!found_weight_dtype) return error_code(Error::weight_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -2421,8 +2383,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
   const int64_t residual_output_stride_n = residual_output.stride(1);
   const int64_t residual_output_size_m = residual_output.size(0);
   const int64_t residual_output_size_n = residual_output.size(1);
-  const DType dtype = *found_dtype;
-  const DType weight_dtype = *found_weight_dtype;
+  const at::ScalarType dtype = input.scalar_type();
+  const at::ScalarType weight_dtype = weight.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2535,8 +2497,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     all_reduce_add_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2591,8 +2553,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks))
     return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -2636,7 +2596,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
   const int64_t block_output_stride_n = block_output ? block_output->stride(1) : 0;
   const int64_t block_output_size_m = block_output ? block_output->size(0) : 0;
   const int64_t block_output_size_n = block_output ? block_output->size(1) : 0;
-  const DType dtype = *found_dtype;
+  const at::ScalarType dtype = input.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2747,8 +2707,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     all_reduce_add_attn_res_rms_norm<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n,
         B.tile_k, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2805,10 +2765,6 @@ ErrorCode hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, 
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
   if (const std::optional<Error> e = norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true)) return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
-  const std::optional<DType> found_weight_dtype = dtype_of_tensor(weight);
-  if (!found_weight_dtype) return error_code(Error::weight_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -2824,8 +2780,8 @@ ErrorCode hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, 
   const int64_t output_stride_n = output.stride(1);
   const int64_t output_size_m = output.size(0);
   const int64_t output_size_n = output.size(1);
-  const DType dtype = *found_dtype;
-  const DType weight_dtype = *found_weight_dtype;
+  const at::ScalarType dtype = input.scalar_type();
+  const at::ScalarType weight_dtype = weight.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2864,8 +2820,8 @@ ErrorCode hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   with_instance<OpType::rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu,
         I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -2896,10 +2852,6 @@ ErrorCode hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& inp
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
   if (const std::optional<Error> e = norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true)) return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
-  const std::optional<DType> found_weight_dtype = dtype_of_tensor(weight);
-  if (!found_weight_dtype) return error_code(Error::weight_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -2925,8 +2877,8 @@ ErrorCode hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& inp
   const int64_t residual_output_stride_n = residual_output.stride(1);
   const int64_t residual_output_size_m = residual_output.size(0);
   const int64_t residual_output_size_n = residual_output.size(1);
-  const DType dtype = *found_dtype;
-  const DType weight_dtype = *found_weight_dtype;
+  const at::ScalarType dtype = input.scalar_type();
+  const at::ScalarType weight_dtype = weight.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -2967,8 +2919,8 @@ ErrorCode hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& inp
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   with_instance<OpType::add_rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
-    using W = typename of_dtype<I.weight_dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
+    using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
     add_rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
         B.waves_per_eu, I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
@@ -3009,8 +2961,6 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks))
     return error_code(e);
-  const std::optional<DType> found_dtype = dtype_of_tensor(input);
-  if (!found_dtype) return error_code(Error::dtype_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
@@ -3054,7 +3004,7 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
   const int64_t block_output_stride_n = block_output ? block_output->stride(1) : 0;
   const int64_t block_output_size_m = block_output ? block_output->size(0) : 0;
   const int64_t block_output_size_n = block_output ? block_output->size(1) : 0;
-  const DType dtype = *found_dtype;
+  const at::ScalarType dtype = input.scalar_type();
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -3109,7 +3059,7 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
-    using T = typename of_dtype<I.dtype>::t;
+    using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
     add_attn_res_rms_norm_rows<T, B.tile_m, B.tile_n, B.tile_k, B.block.x, I.wave_size,
         B.pack_bytes, B.waves_per_eu, I.chunked>
         <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(

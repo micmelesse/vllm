@@ -112,6 +112,7 @@ def literal(kernel: str, b: tuple) -> str:
 # header asserts them equal, so a change there fails the compile naming this file.
 WAVE_SIZE, PACK_BYTES = 64, 16
 DTYPES = (("f16", "c10::Half"), ("bf16", "c10::BFloat16"))
+SCALAR_TYPES = {"f16": "Half", "bf16": "BFloat16"}
 WORLDS = (2, 4, 8)
 HEADERS = (
     "kernels/all_reduce.cuh",
@@ -249,8 +250,8 @@ def main() -> None:
         "static_assert(kWorlds == std::array<int, 3>{"
         + ", ".join(map(str, WORLDS))
         + "}, \"builds.py's worlds are not the host's\");",
-        "static_assert(kDtypes == std::array<DType, 2>{"
-        + ", ".join(f"DType::{d}" for d, _ in DTYPES)
+        "static_assert(kDtypes == std::array<at::ScalarType, 2>{"
+        + ", ".join(f"at::ScalarType::{SCALAR_TYPES[d]}" for d, _ in DTYPES)
         + "}, \"builds.py's dtypes are not the host's\");",
         "",
     ]
