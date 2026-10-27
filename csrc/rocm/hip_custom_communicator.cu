@@ -1907,149 +1907,7 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     std::optional<int64_t> rms_norm_tile_n,
     std::optional<int64_t> rms_norm_pack_bytes) {
   using namespace hip_custom_communicator;
-  // THE ALGORITHM: one fused kernel's (one_shot_pull, two_shot_pull,
-  // two_shot_push), or a SPLIT, `split_<the all-reduce's algorithm>`: our
-  // all-reduce (all_reduce's whole call, at this config's fields), then the
-  // RMSNorm on this rank's rows in place on its output (at the rms_norm_
-  // fields), back to back on the stream. The rms_norm_ fields are a split's
-  // alone: given to a fused algorithm, or missing from a split, refused.
-  constexpr std::string_view kSplit = "split_";
-  const bool split = algorithm_name.rfind(kSplit, 0) == 0;
-  for (const std::optional<int64_t>& field :
-       {rms_norm_grid_x, rms_norm_grid_y, rms_norm_grid_z, rms_norm_block_x,
-        rms_norm_block_y, rms_norm_block_z, rms_norm_waves_per_eu,
-        rms_norm_tile_m, rms_norm_tile_n, rms_norm_pack_bytes}) {
-    if (!split && field) return error_code(Error::field_not_this_templates);
-    if (split && !field) return error_code(Error::field_missing);
-  }
-  if (split) {
-    // ---- THE CALL FROM TORCH, the norm's part: its state, the weight and the
-    // output it norms in place, its config's ints (the all-reduce checks its
-    // own). ----
-    if (state == 0) return error_code(Error::not_open);
-    CommsState& s = *reinterpret_cast<CommsState*>(state);
-    if (!weight.is_cuda() || !output.is_cuda())
-      return error_code(Error::not_on_device);
-    if (output.dim() != 2 || weight.dim() != 1 ||
-        weight.numel() != output.size(1))
-      return error_code(Error::shape_mismatch);
-    for (const int64_t v :
-         {*rms_norm_grid_x, *rms_norm_grid_y, *rms_norm_grid_z,
-          *rms_norm_block_x, *rms_norm_block_y, *rms_norm_block_z,
-          *rms_norm_waves_per_eu, *rms_norm_tile_m, *rms_norm_tile_n,
-          *rms_norm_pack_bytes})
-      if (v < std::numeric_limits<int>::min() ||
-          v > std::numeric_limits<int>::max())
-        return error_code(Error::field_out_of_range);
-    const void* weight_ptr = weight.data_ptr();
-    const int64_t weight_stride_n = weight.stride(0),
-                  weight_size_n = weight.size(0);
-    void* output_ptr = output.data_ptr();
-    const int64_t output_stride_m = output.stride(0),
-                  output_stride_n = output.stride(1);
-    const int64_t output_size_m = output.size(0),
-                  output_size_n = output.size(1);
-    const at::ScalarType dtype = output.scalar_type();
-    const at::ScalarType weight_dtype = weight.scalar_type();
-    const int64_t e = output.element_size();
-    const int64_t n = output_size_n;
-    const Dim3 rms_norm_grid{static_cast<int>(*rms_norm_grid_x),
-                             static_cast<int>(*rms_norm_grid_y),
-                             static_cast<int>(*rms_norm_grid_z)};
-    const Dim3 rms_norm_block{static_cast<int>(*rms_norm_block_x),
-                              static_cast<int>(*rms_norm_block_y),
-                              static_cast<int>(*rms_norm_block_z)};
-    const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-    // ---- PRECONDITIONS of the norm on rows, in order: its config, the call
-    // against it, its compiled kernel on this device. ----
-    // THE GRID: x alone, at least a block (it waits on no peer: any grid runs).
-    if (*rms_norm_grid_y != 1 || *rms_norm_grid_z != 1 || *rms_norm_grid_x < 1)
-      return error_code(Error::launch_out_of_range);
-    if (*rms_norm_tile_m < 1 || *rms_norm_tile_n < 1)
-      return error_code(Error::field_not_positive);
-    // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes), at least an
-    // element, whole packs a row.
-    if (*rms_norm_pack_bytes < 2 || *rms_norm_pack_bytes > kPackBytes ||
-        (*rms_norm_pack_bytes & (*rms_norm_pack_bytes - 1)) != 0 ||
-        *rms_norm_pack_bytes < e)
-      return error_code(Error::pack_out_of_range);
-    if (n * e % *rms_norm_pack_bytes != 0)
-      return error_code(Error::row_not_packs);
-    // THE WEIGHT read a pack at a time, a pack's worth of the output's elements
-    // a load: its address on such a load.
-    if (reinterpret_cast<uintptr_t>(weight_ptr) %
-            (kPackBytes / e * weight.element_size()) !=
-        0)
-      return error_code(Error::not_aligned);
-    // A LAYOUT THE PACKED LOADS CAN READ: the innermost stride 1, the output's
-    // rows on whole packs.
-    if (output_stride_n != 1 || weight_stride_n != 1)
-      return error_code(Error::inner_stride_not_one);
-    if (output_stride_m * e % *rms_norm_pack_bytes != 0)
-      return error_code(Error::row_stride_not_packs);
-    // THE INSTANCE: the norm compiled at this config, on this device, for this
-    // call (builds.py's kRmsNormInstances); a row wider than the tile its
-    // CHUNKED instance.
-    const bool chunked = n > *rms_norm_tile_n;
-    const int shared_memory_bytes = 0;
-    void* kernel = nullptr;
-    for (const auto& i : kRmsNormInstances)
-      if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
-          i.block_z == *rms_norm_block_z &&
-          i.waves_per_eu == *rms_norm_waves_per_eu &&
-          i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
-          i.quantization == Quantization::exact &&
-          i.pack_bytes == *rms_norm_pack_bytes &&
-          i.wave_size == s.device.wave_size && i.dtype == dtype &&
-          i.weight_dtype == weight_dtype && i.chunked == chunked)
-        kernel = i.kernel;
-    if (kernel == nullptr) return error_code(Error::not_built);
-    // THE KERNEL ON THIS DEVICE, as its compiler left it (it waits on no peer:
-    // no residency).
-    hipFuncAttributes attributes;
-    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
-      return error_code(Error::hip_failed);
-    if (*rms_norm_block_x > attributes.maxThreadsPerBlock)
-      return error_code(Error::block_too_large);
-    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
-        s.device.lds_bytes)
-      return error_code(Error::lds_too_large);
-    if (static_cast<int64_t>(attributes.localSizeBytes) >
-        s.device.scratch_a_lane)
-      return error_code(Error::scratch_too_large);
-    // ---- THE ALL-REDUCE: its whole call, into the output (it refuses before
-    // it launches). ----
-    if (const ErrorCode refused = hip_custom_communicator_all_reduce(
-            state, input, output, algorithm_name.substr(kSplit.size()), grid_x,
-            grid_y, grid_z, block_x, block_y, block_z, waves_per_eu, tile_m,
-            tile_n, quantization_name, pack_bytes, quantize_from_bytes))
-      return refused;
-    // ---- THE NORM, on the sum in place: every element written by the thread
-    // that read it, after it read it. ----
-    const auto launch = [&]<typename T, typename W>() {
-      const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(kernel);
-      typed<<<dim3_of(rms_norm_grid), dim3_of(rms_norm_block),
-              shared_memory_bytes, stream>>>(
-          static_cast<const T*>(output_ptr), output_stride_m, output_stride_n,
-          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-          static_cast<const W*>(weight_ptr), weight_stride_n,
-          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), eps);
-    };
-    if (dtype == at::ScalarType::BFloat16 &&
-        weight_dtype == at::ScalarType::Float)
-      launch.template operator()<c10::BFloat16, float>();
-    else if (dtype == at::ScalarType::BFloat16)
-      launch.template operator()<c10::BFloat16, c10::BFloat16>();
-    else if (weight_dtype == at::ScalarType::Float)
-      launch.template operator()<c10::Half, float>();
-    else
-      launch.template operator()<c10::Half, c10::Half>();
-    // POSTCONDITION: the launch went in.
-    if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
-    return std::nullopt;
-  }
+  using namespace hip_custom_communicator;
   // ---- THE CALL FROM TORCH: its state, its tensors stripped to pointers and
   // strides, its config's ints. ----
   if (state == 0) return error_code(Error::not_open);
@@ -2066,6 +1924,32 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     if (v < std::numeric_limits<int>::min() ||
         v > std::numeric_limits<int>::max())
       return error_code(Error::field_out_of_range);
+  // THE ALGORITHM: one fused kernel's (one_shot_pull, two_shot_pull,
+  // two_shot_push), or a SPLIT, `split_<the all-reduce's algorithm>`: our
+  // all-reduce kernel (at this config's fields, its checks and views written
+  // out here as all_reduce's are), then the RMSNorm on this rank's rows in
+  // place on its output (at the rms_norm_ fields), back to back on the stream.
+  // Every refusal, either path's, before any launch. The rms_norm_ fields are a
+  // split's alone: given to a fused algorithm, or missing from a split,
+  // refused.
+  constexpr std::string_view kSplit = "split_";
+  const bool split = algorithm_name.rfind(kSplit, 0) == 0;
+  for (const std::optional<int64_t>& field :
+       {rms_norm_grid_x, rms_norm_grid_y, rms_norm_grid_z, rms_norm_block_x,
+        rms_norm_block_y, rms_norm_block_z, rms_norm_waves_per_eu,
+        rms_norm_tile_m, rms_norm_tile_n, rms_norm_pack_bytes}) {
+    if (!split && field) return error_code(Error::field_not_this_templates);
+    if (split && !field) return error_code(Error::field_missing);
+  }
+  if (split)
+    for (const int64_t v :
+         {*rms_norm_grid_x, *rms_norm_grid_y, *rms_norm_grid_z,
+          *rms_norm_block_x, *rms_norm_block_y, *rms_norm_block_z,
+          *rms_norm_waves_per_eu, *rms_norm_tile_m, *rms_norm_tile_n,
+          *rms_norm_pack_bytes})
+      if (v < std::numeric_limits<int>::min() ||
+          v > std::numeric_limits<int>::max())
+        return error_code(Error::field_out_of_range);
   const void* input_ptr = input.data_ptr();
   const int64_t input_stride_m = input.stride(0),
                 input_stride_n = input.stride(1);
@@ -2090,13 +1974,28 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   // ---- PRECONDITIONS, every Error the call can be refused for, in this order:
   // the config alone; the call against the config; the compiled kernel on this
   // device; the regions. Past this section the call runs. ----
-  // THE CONFIG'S NAMES.
-  AllReduceRmsNormAlgorithm algorithm;
-  if (algorithm_name == "one_shot_pull")
+  // THE CONFIG'S NAMES: the fused kernel's algorithm, or the split's
+  // all-reduce's.
+  AllReduceRmsNormAlgorithm algorithm{};
+  AllReduceAlgorithm all_reduce_algorithm{};
+  const std::string_view named =
+      split ? std::string_view(algorithm_name).substr(kSplit.size())
+            : std::string_view(algorithm_name);
+  if (split && named == "one_shot_pull")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
+  else if (split && named == "one_shot_push")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
+  else if (split && named == "one_shot_push_staged")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
+  else if (split && named == "two_shot_pull")
+    all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
+  else if (split && named == "two_shot_push")
+    all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
+  else if (!split && named == "one_shot_pull")
     algorithm = AllReduceRmsNormAlgorithm::one_shot_pull;
-  else if (algorithm_name == "two_shot_pull")
+  else if (!split && named == "two_shot_pull")
     algorithm = AllReduceRmsNormAlgorithm::two_shot_pull;
-  else if (algorithm_name == "two_shot_push")
+  else if (!split && named == "two_shot_push")
     algorithm = AllReduceRmsNormAlgorithm::two_shot_push;
   else
     return error_code(Error::no_such_kernel);
@@ -2110,13 +2009,14 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
       grid_x > s.symmetric.max_blocks)
     return error_code(Error::launch_out_of_range);
   if (tile_m < 1 || tile_n < 1) return error_code(Error::field_not_positive);
-  // QUANTIZE_FROM_BYTES: an INT4 config's alone, and 0: this op's INT4 build
-  // always quantizes (its kernel has no exact instance of its own).
+  // QUANTIZE_FROM_BYTES: an INT4 config's alone, and not negative; the fused
+  // kernel's 0 (its INT4 build always quantizes: no exact instance of its own),
+  // the split's all-reduce's any (it passes a call below it exact).
   if (!int4_config && quantize_from_bytes)
     return error_code(Error::field_not_this_templates);
-  if (quantize_from_bytes.value_or(0) < 0)
-    return error_code(Error::field_not_positive);
-  if (quantize_from_bytes.value_or(0) != 0)
+  const int64_t quantize_from = quantize_from_bytes.value_or(0);
+  if (quantize_from < 0) return error_code(Error::field_not_positive);
+  if (!split && quantize_from != 0)
     return error_code(Error::field_not_this_templates);
   // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes); INT4 at the widest
   // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION), and
@@ -2124,8 +2024,9 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   if (pack_bytes < 2 || pack_bytes > kPackBytes ||
       (pack_bytes & (pack_bytes - 1)) != 0)
     return error_code(Error::pack_out_of_range);
-  if (int4_config && (pack_bytes != kPackBytes ||
-                      algorithm == AllReduceRmsNormAlgorithm::one_shot_pull))
+  if (int4_config &&
+      (pack_bytes != kPackBytes ||
+       (!split && algorithm == AllReduceRmsNormAlgorithm::one_shot_pull)))
     return error_code(Error::quantization_not_supported);
   // THE CALL'S DTYPE BUILT (the world is: open refuses the rest), and its
   // elements whole packs: at least an element a pack, whole packs a row (an
@@ -2164,93 +2065,338 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
         (weight_first < output_last && output_first < weight_last))
       return error_code(Error::inputs_overlap_outputs);
   }
-  // WHAT THE CALL PICKS: INT4 where the config is (it always quantizes); in
-  // place, the exact pull, every rank's input read where its table says; a row
-  // wider than the tile, the build's CHUNKED instance; an INT4 row with a tail,
-  // its TAIL instance (int4_tail).
-  const bool quantize_int4 = int4_config;
-  const bool pull = algorithm != AllReduceRmsNormAlgorithm::two_shot_push;
-  const bool in_place = pull && !quantize_int4;
-  const bool chunked = n > tile_n;
-  const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
+  // WHAT THE CALL MOVES: INT4 where the config is and, for the split's
+  // all-reduce, the call's bytes reach its quantize_from_bytes (the fused
+  // kernel's INT4 build always quantizes).
+  const bool quantize_int4 =
+      int4_config && (!split || m * n * e >= quantize_from);
   const int shared_memory_bytes = 0;
-  // THE INSTANCE: the kernel compiled at this config, on this device, for this
-  // call (builds.py's kAllReduceRmsNormInstances, a row each); a config the
-  // table did not build, or a weight dtype no build has, is refused here.
+  // ITS KERNELS, ITS VIEWS OF THE REGIONS AND WHAT THE REGIONS MUST HOLD, by
+  // its path: the fused kernel's, or the split's all-reduce's and its norm's.
   void* kernel = nullptr;
-  for (const auto& i : kAllReduceRmsNormInstances)
-    if (i.algorithm == algorithm && i.block_x == block_x &&
-        i.block_y == block_y && i.block_z == block_z &&
-        i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
-        i.tile_n == tile_n &&
-        i.quantization ==
-            (int4_config ? Quantization::int4 : Quantization::exact) &&
-        i.pack_bytes == pack_bytes && i.world == s.world &&
-        i.wave_size == s.device.wave_size && i.dtype == dtype &&
-        i.weight_dtype == weight_dtype && i.chunked == chunked &&
-        i.tail == tail && i.quantize_int4 == quantize_int4)
-      kernel = i.kernel;
-  if (kernel == nullptr) return error_code(Error::not_built);
-  // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
-  // and the LDS at the launch; the scratch only when the dispatch runs,
-  // aborting the queue and the process with it.
-  hipFuncAttributes attributes;
-  if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
-    return error_code(Error::hip_failed);
-  if (block_x > attributes.maxThreadsPerBlock)
-    return error_code(Error::block_too_large);
-  if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
-      s.device.lds_bytes)
-    return error_code(Error::lds_too_large);
-  if (static_cast<int64_t>(attributes.localSizeBytes) > s.device.scratch_a_lane)
-    return error_code(Error::scratch_too_large);
-  // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
-  // every peer arrives, so a grid past the blocks the device holds at once can
-  // hang (HIP never refuses it).
-  int blocks_a_cu = 0;
-  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &blocks_a_cu, kernel, static_cast<int>(block_x),
-          shared_memory_bytes) != hipSuccess)
-    return error_code(Error::hip_failed);
-  if (grid_x > blocks_a_cu * s.device.compute_units)
-    return error_code(Error::grid_not_resident);
-  // ---- ITS VIEWS OF THE REGIONS, in elements, [rows, row] at stride row: a
-  // row is n, or the INT4 pulled two-shot's payload row, whole groups (it walks
-  // whole groups a thread: its kernel's n_pad). The staging holds the input's
-  // rows, or that two-shot's INT4 inbox, WORLD slots of an owner's ceil(m /
-  // WORLD) rows; the partials what a two-shot keeps: the pull its rank's rows,
-  // the push every row's columns. THE WHOLE CALL IN ONE PASS: the regions are
-  // sized from the largest call the server makes, so a call past them is
-  // refused, never cut into bands; every input fits the staging whole (an eager
-  // call's host copy). ----
-  const bool groups_a_thread =
-      quantize_int4 && algorithm == AllReduceRmsNormAlgorithm::two_shot_pull;
-  const int64_t row =
-      groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
-  const int64_t owned_rows = (m + s.world - 1) / s.world;
-  const int64_t staging_stride_m = row, staging_stride_n = 1,
-                staging_size_m = groups_a_thread ? s.world * owned_rows : m,
-                staging_size_n = row;
-  const int64_t partials_stride_m = row, partials_stride_n = 1,
-                partials_size_m =
-                    algorithm == AllReduceRmsNormAlgorithm::two_shot_pull
-                        ? owned_rows
-                    : algorithm == AllReduceRmsNormAlgorithm::two_shot_push ? m
-                                                                            : 0,
-                partials_size_n = row;
-  // THE REGIONS HOLD THE CALL: its input whole; INT4, the payloads (the pull's
-  // its staged rows' and its owned rows', the push's the call's); and each
-  // view's end, its last element's (an empty view reads nothing).
-  int64_t staging_need = m * n * e, partials_need = partials_size_m * n * e;
-  if (quantize_int4 && groups_a_thread) {
-    staging_need =
-        std::max(staging_need, int4_payload_bytes(staging_size_m, row));
-    partials_need =
-        std::max(partials_need, int4_payload_bytes(owned_rows, row));
-  } else if (quantize_int4) {
-    staging_need = std::max(staging_need, int4_payload_bytes(m, n));
-    partials_need = std::max(partials_need, int4_payload_bytes(1, m * n));
+  void* rms_norm_kernel = nullptr;
+  Dim3 rms_norm_grid{}, rms_norm_block{};
+  bool in_place = false;
+  int64_t staging_need = 0, partials_need = 0;
+  int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0,
+          partials_size_n = 0;
+  int64_t staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0,
+          staging_size_n = 0;
+  int64_t unfenced_stride_slot = 0, unfenced_stride_m = 0,
+          unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0,
+          unfenced_size_n = 0;
+  if (split) {
+    // ---- THE SPLIT'S ALL-REDUCE, at this config's fields: all_reduce's checks
+    // and views, its own. ----
+    // IN PLACE: the exact pull, every rank's input read where its table says.
+    in_place = (all_reduce_algorithm == AllReduceAlgorithm::one_shot_pull ||
+                all_reduce_algorithm == AllReduceAlgorithm::two_shot_pull) &&
+               !quantize_int4;
+    const bool contiguous = input_stride_m == n * input_stride_n &&
+                            output_stride_m == n * output_stride_n;
+    // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
+    const bool tail =
+        quantize_int4 && int4_tail(all_reduce_algorithm, m, n, s.world);
+    // THE PUSHED ONE-SHOT'S UNFENCED REGION HOLDS ITS TILES: a row of a block's
+    // tile in a slot's lines, a line a pack of at most kLinePayloadBytes (a
+    // narrower pack its line alone: kernels/all_reduce.cuh), INT4 a line a word
+    // of its tile's whole groups; a block's TILE_M rows of a bank's
+    // unfenced_blocks, a block its own slots (a grid past them is refused,
+    // never cut).
+    if (all_reduce_algorithm == AllReduceAlgorithm::one_shot_push) {
+      const int64_t line_pack =
+          std::min<int64_t>(pack_bytes, kLinePayloadBytes);
+      const int64_t row_lines =
+          quantize_int4
+              ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
+              : (tile_n * e + line_pack - 1) / line_pack;
+      if (row_lines > s.symmetric.unfenced_slot_bytes / kLinePayloadBytes ||
+          grid_x * tile_m > s.symmetric.unfenced_blocks)
+        return error_code(Error::unfenced_too_small);
+    }
+    // THE INSTANCE: the kernel compiled at this config, on this device, for
+    // this call (builds.py's kAllReduceInstances, a row each); a config the
+    // table did not build is refused here.
+    for (const auto& i : kAllReduceInstances)
+      if (i.algorithm == all_reduce_algorithm && i.block_x == block_x &&
+          i.block_y == block_y && i.block_z == block_z &&
+          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
+          i.tile_n == tile_n &&
+          i.quantization ==
+              (int4_config ? Quantization::int4 : Quantization::exact) &&
+          i.pack_bytes == pack_bytes && i.world == s.world &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.contiguous == contiguous && i.tail == tail &&
+          i.quantize_int4 == quantize_int4)
+        kernel = i.kernel;
+    if (kernel == nullptr) return error_code(Error::not_built);
+    // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
+    // and the LDS at the launch; the scratch only when the dispatch runs,
+    // aborting the queue and the process with it (the tune's crashes,
+    // 2026-10-24: AttnRes at 64 threads, tile 4x16384x4, 21 KiB a lane).
+    hipFuncAttributes attributes;
+    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (block_x > attributes.maxThreadsPerBlock)
+      return error_code(Error::block_too_large);
+    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
+        s.device.lds_bytes)
+      return error_code(Error::lds_too_large);
+    if (static_cast<int64_t>(attributes.localSizeBytes) >
+        s.device.scratch_a_lane)
+      return error_code(Error::scratch_too_large);
+    // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
+    // every peer arrives, so a grid past the blocks the device holds at once
+    // can hang (HIP never refuses it). The blocks a CU holds from the kernel's
+    // registers, LDS and the CU's wave slots, times the CUs.
+    int blocks_a_cu = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            shared_memory_bytes) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (grid_x > blocks_a_cu * s.device.compute_units)
+      return error_code(Error::grid_not_resident);
+    // ---- ITS VIEWS OF THE REGIONS, by its all_reduce_algorithm, in elements:
+    // a view [m, n] at strides [stride_m, stride_n] (the line push's inbox
+    // [slot, m, n]); an empty view (size 0) where it reads none. The kernels
+    // find a one-shot's payload in the staging from the input's sizes.
+    // THE WHOLE CALL IN ONE PASS: the regions are sized from the largest call
+    // the server makes, so a call past them is refused, never cut into bands.
+    // Every exact kernel's input fits the staging whole (an eager call's host
+    // copy,
+    // INPUT TABLES; a captured call's is read where it is, refused alike, so
+    // the eager and captured calls of one shape agree). ----
+    // The two-shots' exact share is the flat walk's, whole packs, rounded up: a
+    // rank's slice of a row in the partials, and the pushed two-shot's inbox
+    // [WORLD, slot] in the staging, its slot a share of the whole call.
+    const int64_t packs = n * e / pack_bytes;
+    const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack_bytes;
+    const int64_t slot = (m * packs + s.world - 1) / s.world * pack_bytes / e;
+    const int64_t share =
+        int4_flat_share(m, n, s.world);  // the INT4 flat walk's share
+    staging_need = quantize_int4 ? 0 : m * n * e;
+    partials_stride_m = slice_bytes / e, partials_stride_n = 1,
+    partials_size_n = slice_bytes / e;
+    switch (all_reduce_algorithm) {
+      case AllReduceAlgorithm::two_shot_pull:
+      case AllReduceAlgorithm::two_shot_push:
+        staging_need = m * n * e, partials_need = m * slice_bytes;
+        if (quantize_int4) {
+          // THE INT4 FLAT WALK: this rank's share of the call's groups in the
+          // partials, and every rank's share in the staging.
+          partials_stride_m = share, partials_size_m = 1,
+          partials_size_n = share;
+          staging_stride_m = s.world * share, staging_stride_n = 1,
+          staging_size_m = 1, staging_size_n = s.world * share;
+          staging_need =
+              std::max(staging_need, int4_payload_bytes(1, s.world * share));
+          partials_need = std::max(partials_need, int4_payload_bytes(1, share));
+        } else {
+          // EXACT: this rank's slice of every row in the partials; the pushed
+          // two-shot's inbox in the staging, WORLD slots of a share of the call
+          // (the pull reads every rank's input in place, through the input
+          // table).
+          partials_size_m = m;
+          if (all_reduce_algorithm == AllReduceAlgorithm::two_shot_push) {
+            staging_stride_m = slot, staging_stride_n = 1,
+            staging_size_m = s.world, staging_size_n = slot;
+            staging_need = std::max(staging_need, s.world * slot * e);
+          }
+        }
+        break;
+      case AllReduceAlgorithm::one_shot_pull:
+        // INT4: its [m, n] payload in the staging, no partials (exact: every
+        // rank's input in place).
+        if (quantize_int4) {
+          partials_stride_m = 0, partials_size_n = 0;
+          staging_stride_n = 1, staging_size_m = 1,
+          staging_size_n = (int4_payload_bytes(m, n) + e - 1) / e;
+          staging_need = int4_payload_bytes(m, n);
+        }
+        break;
+      case AllReduceAlgorithm::one_shot_push:
+        // THE UNFENCED REGION: [writer, row, n] payload elements, 2 *
+        // unfenced_blocks rows (bank, row) of unfenced_slot_bytes of payload
+        // each whatever the build (so a row is the same bytes at every build,
+        // its epoch its own), a writer's rows contiguous.
+        unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
+                               (s.symmetric.unfenced_slot_bytes / e);
+        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+        unfenced_stride_n = 1;
+        unfenced_size_slot = s.world,
+        unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
+        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
+        break;
+      case AllReduceAlgorithm::one_shot_push_staged: {
+        // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot
+        // whole kInt4ScalesAlign), no partials.
+        const int64_t payload =
+            quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
+        const int64_t slot_bytes = quantize_int4
+                                       ? (payload + kInt4ScalesAlign - 1) /
+                                             kInt4ScalesAlign * kInt4ScalesAlign
+                                       : payload;
+        partials_stride_m = 0, partials_size_n = 0;
+        staging_stride_n = 1, staging_size_m = 1,
+        staging_size_n = (s.world * slot_bytes + e - 1) / e;
+        staging_need = s.world * slot_bytes;
+        break;
+      }
+    }
+    rms_norm_grid = Dim3{static_cast<int>(*rms_norm_grid_x),
+                         static_cast<int>(*rms_norm_grid_y),
+                         static_cast<int>(*rms_norm_grid_z)};
+    rms_norm_block = Dim3{static_cast<int>(*rms_norm_block_x),
+                          static_cast<int>(*rms_norm_block_y),
+                          static_cast<int>(*rms_norm_block_z)};
+    // THE SPLIT'S NORM ON ROWS, at the rms_norm_ fields: its config, the call
+    // against it, its compiled kernel on this device.
+    // THE GRID: x alone, at least a block (it waits on no peer: any grid runs).
+    if (*rms_norm_grid_y != 1 || *rms_norm_grid_z != 1 || *rms_norm_grid_x < 1)
+      return error_code(Error::launch_out_of_range);
+    if (*rms_norm_tile_m < 1 || *rms_norm_tile_n < 1)
+      return error_code(Error::field_not_positive);
+    // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes), at least an
+    // element, whole packs a row.
+    if (*rms_norm_pack_bytes < 2 || *rms_norm_pack_bytes > kPackBytes ||
+        (*rms_norm_pack_bytes & (*rms_norm_pack_bytes - 1)) != 0 ||
+        *rms_norm_pack_bytes < e)
+      return error_code(Error::pack_out_of_range);
+    if (n * e % *rms_norm_pack_bytes != 0)
+      return error_code(Error::row_not_packs);
+    // THE WEIGHT read a pack at a time, a pack's worth of the output's elements
+    // a load: its address on such a load.
+    if (reinterpret_cast<uintptr_t>(weight_ptr) %
+            (kPackBytes / e * weight.element_size()) !=
+        0)
+      return error_code(Error::not_aligned);
+    // A LAYOUT THE PACKED LOADS CAN READ: the innermost stride 1, the output's
+    // rows on whole packs.
+    if (output_stride_n != 1 || weight_stride_n != 1)
+      return error_code(Error::inner_stride_not_one);
+    if (output_stride_m * e % *rms_norm_pack_bytes != 0)
+      return error_code(Error::row_stride_not_packs);
+    // THE INSTANCE: the norm compiled at this config, on this device, for this
+    // call (builds.py's kRmsNormInstances); a row wider than the tile its
+    // CHUNKED instance.
+    const bool rms_norm_chunked = n > *rms_norm_tile_n;
+    for (const auto& i : kRmsNormInstances)
+      if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
+          i.block_z == *rms_norm_block_z &&
+          i.waves_per_eu == *rms_norm_waves_per_eu &&
+          i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
+          i.quantization == Quantization::exact &&
+          i.pack_bytes == *rms_norm_pack_bytes &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
+        rms_norm_kernel = i.kernel;
+    if (rms_norm_kernel == nullptr) return error_code(Error::not_built);
+    // THE KERNEL ON THIS DEVICE, as its compiler left it (it waits on no peer:
+    // no residency).
+    hipFuncAttributes rms_norm_attributes;
+    if (hipFuncGetAttributes(&rms_norm_attributes, rms_norm_kernel) !=
+        hipSuccess)
+      return error_code(Error::hip_failed);
+    if (*rms_norm_block_x > rms_norm_attributes.maxThreadsPerBlock)
+      return error_code(Error::block_too_large);
+    if (static_cast<int64_t>(rms_norm_attributes.sharedSizeBytes) +
+            shared_memory_bytes >
+        s.device.lds_bytes)
+      return error_code(Error::lds_too_large);
+    if (static_cast<int64_t>(rms_norm_attributes.localSizeBytes) >
+        s.device.scratch_a_lane)
+      return error_code(Error::scratch_too_large);
+  } else {
+    // ---- THE FUSED KERNEL ----
+    // WHAT THE CALL PICKS: INT4 where the config is (it always quantizes); in
+    // place, the exact pull, every rank's input read where its table says; a
+    // row wider than the tile, the build's CHUNKED instance; an INT4 row with a
+    // tail, its TAIL instance (int4_tail).
+    const bool pull = algorithm != AllReduceRmsNormAlgorithm::two_shot_push;
+    in_place = pull && !quantize_int4;
+    const bool chunked = n > tile_n;
+    const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
+    // THE INSTANCE: the kernel compiled at this config, on this device, for
+    // this call (builds.py's kAllReduceRmsNormInstances, a row each); a config
+    // the table did not build, or a weight dtype no build has, is refused here.
+    for (const auto& i : kAllReduceRmsNormInstances)
+      if (i.algorithm == algorithm && i.block_x == block_x &&
+          i.block_y == block_y && i.block_z == block_z &&
+          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
+          i.tile_n == tile_n &&
+          i.quantization ==
+              (int4_config ? Quantization::int4 : Quantization::exact) &&
+          i.pack_bytes == pack_bytes && i.world == s.world &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.weight_dtype == weight_dtype && i.chunked == chunked &&
+          i.tail == tail && i.quantize_int4 == quantize_int4)
+        kernel = i.kernel;
+    if (kernel == nullptr) return error_code(Error::not_built);
+    // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
+    // and the LDS at the launch; the scratch only when the dispatch runs,
+    // aborting the queue and the process with it.
+    hipFuncAttributes attributes;
+    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (block_x > attributes.maxThreadsPerBlock)
+      return error_code(Error::block_too_large);
+    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
+        s.device.lds_bytes)
+      return error_code(Error::lds_too_large);
+    if (static_cast<int64_t>(attributes.localSizeBytes) >
+        s.device.scratch_a_lane)
+      return error_code(Error::scratch_too_large);
+    // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
+    // every peer arrives, so a grid past the blocks the device holds at once
+    // can hang (HIP never refuses it).
+    int blocks_a_cu = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            shared_memory_bytes) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (grid_x > blocks_a_cu * s.device.compute_units)
+      return error_code(Error::grid_not_resident);
+    // ---- ITS VIEWS OF THE REGIONS, in elements, [rows, row] at stride row: a
+    // row is n, or the INT4 pulled two-shot's payload row, whole groups (it
+    // walks whole groups a thread: its kernel's n_pad). The staging holds the
+    // input's rows, or that two-shot's INT4 inbox, WORLD slots of an owner's
+    // ceil(m / WORLD) rows; the partials what a two-shot keeps: the pull its
+    // rank's rows, the push every row's columns. THE WHOLE CALL IN ONE PASS:
+    // the regions are sized from the largest call the server makes, so a call
+    // past them is refused, never cut into bands; every input fits the staging
+    // whole (an eager call's host copy). ----
+    const bool groups_a_thread =
+        quantize_int4 && algorithm == AllReduceRmsNormAlgorithm::two_shot_pull;
+    const int64_t row =
+        groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
+    const int64_t owned_rows = (m + s.world - 1) / s.world;
+    staging_stride_m = row, staging_stride_n = 1,
+    staging_size_m = groups_a_thread ? s.world * owned_rows : m,
+    staging_size_n = row;
+    partials_stride_m = row, partials_stride_n = 1,
+    partials_size_m =
+        algorithm == AllReduceRmsNormAlgorithm::two_shot_pull   ? owned_rows
+        : algorithm == AllReduceRmsNormAlgorithm::two_shot_push ? m
+                                                                : 0,
+    partials_size_n = row;
+    // WHAT THE REGIONS MUST HOLD: its input whole; INT4, the payloads (the
+    // pull's its staged rows' and its owned rows', the push's the call's).
+    staging_need = m * n * e, partials_need = partials_size_m * n * e;
+    if (quantize_int4 && groups_a_thread) {
+      staging_need =
+          std::max(staging_need, int4_payload_bytes(staging_size_m, row));
+      partials_need =
+          std::max(partials_need, int4_payload_bytes(owned_rows, row));
+    } else if (quantize_int4) {
+      staging_need = std::max(staging_need, int4_payload_bytes(m, n));
+      partials_need = std::max(partials_need, int4_payload_bytes(1, m * n));
+    }
   }
+  // THE REGIONS HOLD THE CALL: what the kernel stages and keeps, and each
+  // view's end, its last element's (an empty view reads nothing). The kernels
+  // check their indices only against the sizes handed them (October 26: n11
+  // rebooted seven times on views past their regions). The unfenced views are
+  // that region's whole layout (open's): they fit by construction.
   const int64_t staging_end =
       staging_size_m == 0 || staging_size_n == 0
           ? 0
@@ -2300,37 +2446,96 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     }
     peer_inputs_size = s.world, peer_inputs_stride_n = 1;
   }
-  // THE LAUNCH: the instance's kernel, at the call's dtypes.
-  const auto launch = [&]<typename T, typename W>() {
-    const auto typed = reinterpret_cast<AllReduceRmsNormKernel<T, W>>(kernel);
-    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
-        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
-        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
-        peer_inputs_stride_m, peer_inputs_stride_n,
-        static_cast<const W*>(weight_ptr), weight_stride_n,
-        static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
-        s.world, partials_stride_m, partials_stride_n,
-        static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
-        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-        staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
-        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-  };
-  if (dtype == at::ScalarType::BFloat16 &&
-      weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::BFloat16, float>();
-  else if (dtype == at::ScalarType::BFloat16)
-    launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else if (weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::Half, float>();
-  else
-    launch.template operator()<c10::Half, c10::Half>();
-  // POSTCONDITION: the launch went in.
+  // ---- THE LAUNCH, by its path: the split's all-reduce, then its norm on the
+  // sum in place, back to back; or the fused kernel. ----
+  if (split) {
+    // THE LAUNCH: the instance's kernel, at the call's dtypes.
+    const auto launch = [&]<typename T, typename W>() {
+      const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
+      typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+          static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+          static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+          reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
+          peer_inputs_stride_m, peer_inputs_stride_n,
+          static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          s.symmetric.partials_ptr_array, s.world, partials_stride_m,
+          partials_stride_n, static_cast<int>(partials_size_m),
+          static_cast<int>(partials_size_n), s.symmetric.staging_ptr_array,
+          s.world, staging_stride_m, staging_stride_n,
+          static_cast<int>(staging_size_m), static_cast<int>(staging_size_n),
+          s.symmetric.unfenced_ptr_array, s.world, unfenced_stride_slot,
+          unfenced_stride_m, unfenced_stride_n,
+          static_cast<int>(unfenced_size_slot),
+          static_cast<int>(unfenced_size_m), static_cast<int>(unfenced_size_n),
+          s.unfenced_epochs, s.unfenced_epoch_words, int64_t{1},
+          static_cast<int>(s.symmetric.unfenced_blocks),
+          static_cast<int>(s.unfenced_epoch_words),
+          s.symmetric.signals_ptr_array, s.world,
+          s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+          int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+          int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
+    };
+    if (dtype == at::ScalarType::BFloat16)
+      launch.template operator()<c10::BFloat16, c10::BFloat16>();
+    else
+      launch.template operator()<c10::Half, c10::Half>();
+    // ---- THE NORM, on the sum in place: every element written by the thread
+    // that read it, after it read it. ----
+    const auto launch_rms_norm = [&]<typename T, typename W>() {
+      const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(rms_norm_kernel);
+      typed<<<dim3_of(rms_norm_grid), dim3_of(rms_norm_block),
+              shared_memory_bytes, stream>>>(
+          static_cast<const T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          static_cast<const W*>(weight_ptr), weight_stride_n,
+          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
+          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), eps);
+    };
+    if (dtype == at::ScalarType::BFloat16 &&
+        weight_dtype == at::ScalarType::Float)
+      launch_rms_norm.template operator()<c10::BFloat16, float>();
+    else if (dtype == at::ScalarType::BFloat16)
+      launch_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
+    else if (weight_dtype == at::ScalarType::Float)
+      launch_rms_norm.template operator()<c10::Half, float>();
+    else
+      launch_rms_norm.template operator()<c10::Half, c10::Half>();
+  } else {
+    // THE LAUNCH: the instance's kernel, at the call's dtypes.
+    const auto launch = [&]<typename T, typename W>() {
+      const auto typed = reinterpret_cast<AllReduceRmsNormKernel<T, W>>(kernel);
+      typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+          static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+          static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+          reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
+          peer_inputs_stride_m, peer_inputs_stride_n,
+          static_cast<const W*>(weight_ptr), weight_stride_n,
+          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
+          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
+          s.world, partials_stride_m, partials_stride_n,
+          static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
+          s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+          staging_stride_n, static_cast<int>(staging_size_m),
+          static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+          s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
+          int64_t{1}, int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
+          s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
+          s.timeout_ticks, eps);
+    };
+    if (dtype == at::ScalarType::BFloat16 &&
+        weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::BFloat16, float>();
+    else if (dtype == at::ScalarType::BFloat16)
+      launch.template operator()<c10::BFloat16, c10::BFloat16>();
+    else if (weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::Half, float>();
+    else
+      launch.template operator()<c10::Half, c10::Half>();
+  }
+  // POSTCONDITION: the launches went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
 }
