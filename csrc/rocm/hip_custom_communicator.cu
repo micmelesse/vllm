@@ -2174,14 +2174,17 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
       break;
     }
   }
-  // THE REGIONS HOLD THE CALL, and every view lies inside its region (view_fits).
-  if (staging_need > s.staging_bytes) return error_code(Error::staging_too_small);
-  if (partials_need > s.partials_bytes) return error_code(Error::partials_too_small);
-  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, e, s.partials_bytes) ||
-      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n, staging_stride_n, e, s.staging_bytes) ||
-      !view_fits(unfenced_size_slot, unfenced_stride_slot, unfenced_size_m, unfenced_stride_m, unfenced_size_n, unfenced_stride_n, e * (kLineBytes / kLinePayloadBytes), unfenced_bytes(s.world)) ||
-      !view_fits(1, 0, int64_t{kUnfencedBlocks}, kUnfencedEpochsStrideBlock, kUnfencedEpochsStrideBlock, int64_t{1}, 4, kUnfencedEpochsBytes))
-    return error_code(Error::view_past_region);
+  // THE REGIONS HOLD THE CALL: what the kernel stages and keeps, and each view's end, its last
+  // element's (an empty view reads nothing). The kernels check their indices only against the
+  // sizes handed them (October 26: n11 rebooted seven times on views past their regions). The
+  // unfenced views are that region's whole layout (unfenced_bytes, kUnfencedEpochsBytes): they fit
+  // by construction.
+  const int64_t staging_end = staging_size_m == 0 || staging_size_n == 0 ? 0
+      : ((staging_size_m - 1) * staging_stride_m + (staging_size_n - 1) * staging_stride_n + 1) * e;
+  const int64_t partials_end = partials_size_m == 0 || partials_size_n == 0 ? 0
+      : ((partials_size_m - 1) * partials_stride_m + (partials_size_n - 1) * partials_stride_n + 1) * e;
+  if (std::max(staging_need, staging_end) > s.staging_bytes) return error_code(Error::staging_too_small);
+  if (std::max(partials_need, partials_end) > s.partials_bytes) return error_code(Error::partials_too_small);
   // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
   // pull), or none where it reads the staging.
   void* const* table = nullptr;
