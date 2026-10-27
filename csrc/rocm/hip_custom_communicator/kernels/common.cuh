@@ -961,8 +961,11 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         }
     }
     const int bank_rows = output_size_m / 2;
+    // THE STRIDES ARE THE TENSOR'S ELEMENTS: raw INT4 registers (uint32_t) carry a 16-bit dtype's
+    // payload, the only INT4 built, so a slot and a row are its bytes, as the line read's.
+    constexpr int64_t kElemBytes = kRaw ? 2 : int64_t{sizeof(U)};
     char* const slot = reinterpret_cast<char*>(output) +
-                       int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)} * kLineScale;
+                       int64_t{output_slot} * output_stride_slot * kElemBytes * kLineScale;
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
@@ -973,6 +976,12 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       for (int k = 0; k < kPacks; ++k) {
         // A pack's columns: its values', a raw INT4 pack's a word of kInt4Group / kInt4GroupPacks.
         constexpr int kElems = kRaw ? kInt4Group / kInt4GroupPacks : kPackElems;
+        // INT4: A LANE PAST THE CLIP WRITES NOTHING. Its clamped place's owner quantized the pack
+        // under its own group's scale, the lane under another's: two writers' halves (word,
+        // scale) would mix in one line. Exact's clamped lanes write the owner's very bytes.
+        if constexpr (QUANTIZE_INT4) {
+          if (col_at(k) >= clip_n / kElems) continue;
+        }
         const int col = min(col_at(k), clip_n / kElems - 1);
         uint32_t words[2 * kLines] = {};
         if constexpr (QUANTIZE_INT4) {
@@ -982,7 +991,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
           __builtin_memcpy(words, input[i][k], sizeof(V));
         }
         // A row's packs' first lines, then their second (the line read's layout).
-        const uint32_t half = static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
+        const uint32_t half = static_cast<uint32_t>(output_stride_m * kElemBytes);
         uint32_t at = static_cast<uint32_t>(row) * half * kLineScale +
                       static_cast<uint32_t>(col) * uint32_t{kLineBytes};
         asm volatile("" : "+v"(at));

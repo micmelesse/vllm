@@ -2065,8 +2065,7 @@ class HipCustomCommunicator:
                     partials_bytes=self._layout.partials_bytes,
                     table_slot=self._table_slot(
                         input,
-                        _moves_exact(config, input)
-                        and config.algorithm not in _PUSHED,
+                        _moves_exact(config, input) and config.algorithm not in _PUSHED,
                     ),
                     checked_after_launch=self._checked,
                     input=input,
@@ -2088,7 +2087,9 @@ class HipCustomCommunicator:
                     quantize_from_bytes=config.quantize_from_bytes,
                 )
                 if error != -1:
-                    raise CommunicatorError(Error(error), f"{config} on {input.shape}")
+                    raise CommunicatorError(
+                        Error(error), f"{_record(config)} on {input.shape}"
+                    )
             case _:
                 raise AssertionError(f"all_reduce: a pick of {len(configs)} configs")
         return output
@@ -2232,7 +2233,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{fused_config} on {input.shape}"
+                        Error(error), f"{_record(fused_config)} on {input.shape}"
                     )
             case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
@@ -2274,7 +2275,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{reduce_config} on {input.shape}"
+                        Error(error), f"{_record(reduce_config)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
                     world=self._world,
@@ -2301,7 +2302,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{norm_config} on {input.shape}"
+                        Error(error), f"{_record(norm_config)} on {input.shape}"
                     )
             case _:
                 raise AssertionError(
@@ -2454,7 +2455,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{fused_config} on {input.shape}"
+                        Error(error), f"{_record(fused_config)} on {input.shape}"
                     )
             case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
@@ -2496,7 +2497,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{reduce_config} on {input.shape}"
+                        Error(error), f"{_record(reduce_config)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
                     world=self._world,
@@ -2525,7 +2526,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{norm_config} on {input.shape}"
+                        Error(error), f"{_record(norm_config)} on {input.shape}"
                     )
             case _:
                 raise AssertionError(
@@ -2705,7 +2706,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{fused_config} on {input.shape}"
+                        Error(error), f"{_record(fused_config)} on {input.shape}"
                     )
             case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then
@@ -2747,7 +2748,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{reduce_config} on {input.shape}"
+                        Error(error), f"{_record(reduce_config)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
                     world=self._world,
@@ -2782,7 +2783,7 @@ class HipCustomCommunicator:
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{norm_config} on {input.shape}"
+                        Error(error), f"{_record(norm_config)} on {input.shape}"
                     )
             case _:
                 raise AssertionError(
@@ -2897,7 +2898,7 @@ class HipCustomCommunicator:
             quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
-            raise CommunicatorError(Error(error), f"{config} on {input.shape}")
+            raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
         return output
 
     @final
@@ -3006,7 +3007,7 @@ class HipCustomCommunicator:
             quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
-            raise CommunicatorError(Error(error), f"{config} on {input.shape}")
+            raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
         return output, residual_output
 
     @final
@@ -3142,7 +3143,7 @@ class HipCustomCommunicator:
             quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
-            raise CommunicatorError(Error(error), f"{config} on {input.shape}")
+            raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
         return prefix_output, output
 
     @final
