@@ -113,11 +113,8 @@ using BuildInfoWire =
 // ran is what Python passed: C++ runs the config it is given, or refuses it.
 using Answer = int64_t;
 Answer refusal(hip_custom_communicator::Error e) { return static_cast<int64_t>(e); }
-Answer answer(const std::variant<hip_custom_communicator::Config,
-                                 hip_custom_communicator::Error>& got) {
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return refusal(*e);
-  return -1;
+Answer answer(std::optional<hip_custom_communicator::Error> refused) {
+  return refused ? refusal(*refused) : -1;
 }
 
 // SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is
