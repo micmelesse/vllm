@@ -62,14 +62,13 @@ void paged_attention(
 // op's kernel's name, op and BuildConfigs (flat, a build's fields in the names'
 // order, 0 where its op's BuildConfig has none, with each op's count),
 // and each op's plain call (its dtypes and its weight's besides its input's,
-// flat, and four ints an op), and the unfenced region's blocks (the pushed
-// one-shot's most blocks), and each build's algorithm by name.
+// flat, and four ints an op), and each build's algorithm by name.
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<int64_t>, std::vector<int64_t>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<int64_t>, int64_t,
+           std::vector<std::string>, std::vector<int64_t>,
            std::vector<std::string>>
 hip_custom_communicator_build_info();
 std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,

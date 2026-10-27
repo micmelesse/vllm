@@ -339,8 +339,6 @@ class BuildInfo:
     # Each op by name, in C++'s `OpType` order: its kernel, its builds (what a tuner
     # searches) and its plain call.
     ops: dict[str, OpRecord]
-    # The pushed one-shot's most blocks: a block's own slots in the unfenced region.
-    unfenced_blocks: int
 
 
 @functools.cache
@@ -361,7 +359,6 @@ def build_info() -> BuildInfo:
         op_dtypes,
         op_weights,
         op_facts,
-        unfenced_blocks,
         algorithms,
     ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
     assert list(kernel_ops) == list(ops), "an op's kernel out of the ops' order"
@@ -413,7 +410,6 @@ def build_info() -> BuildInfo:
         tuple(errors),
         tuple(where_names),
         records,
-        unfenced_blocks,
     )
 
 
