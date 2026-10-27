@@ -1132,7 +1132,7 @@ class Arguments:
 
     @functools.cached_property
     def world(self) -> int:
-        return self.world
+        return self.device_group.size()
 
     @functools.cached_property
     def rank(self) -> int:
