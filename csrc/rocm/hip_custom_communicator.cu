@@ -553,6 +553,14 @@ struct CommsState {
   // (its share's sums; the add-RMSNorm pull's INT4 row scales at their end), the unfenced region
   // (the pushed one-shot's inbox), and the arena's bytes. The same on every rank.
   int64_t signals = 0, staging = 0, partials = 0, scales = 0, unfenced = 0, arena_bytes = 0;
+  // EACH REGION'S DEVICE ARRAY of every rank's address of it (in the private buffer, written by
+  // connect), and the pushed one-shot's epochs: what every launch hands its kernel.
+  uint32_t* const* signals_ptr_array = nullptr;
+  char* const* staging_ptr_array = nullptr;
+  char* const* partials_ptr_array = nullptr;
+  float* const* scales_ptr_array = nullptr;
+  char* const* unfenced_ptr_array = nullptr;
+  int32_t* unfenced_epochs = nullptr;
   char* shared_buffer = nullptr;   // OWNED: the arena, exported to the peers
   char* private_buffer = nullptr;  // OWNED: the region arrays, the epochs, the input tables
   uint32_t* status_device = nullptr;  // OWNED: a kernel's fault record, written before it traps
@@ -1873,6 +1881,15 @@ ErrorCode hip_custom_communicator_connect(int64_t state, const std::vector<int64
     (void)hipGetLastError();
     return error_code(Error::hip_failed);
   }
+  char* const* const region_ptr_arrays =
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
+  s.signals_ptr_array =
+      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
+  s.staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
+  s.partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
+  s.scales_ptr_array = reinterpret_cast<float* const*>(region_ptr_arrays + kScalesArray * kMaxRanks);
+  s.unfenced_ptr_array = region_ptr_arrays + kUnfencedArray * kMaxRanks;
+  s.unfenced_epochs = reinterpret_cast<int32_t*>(s.private_buffer + kPrivateUnfencedEpochs);
   return std::nullopt;
 }
 
@@ -2084,61 +2101,64 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
-  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
-  // and the private buffer's arrays, epochs and tables (kPrivate*).
-  char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
-  const auto signals_ptr_array =
-      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
-  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
-  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  char* const* const unfenced_ptr_array = region_ptr_arrays + kUnfencedArray * kMaxRanks;
-  const auto unfenced_epochs =
-      reinterpret_cast<int32_t*>(s.private_buffer + kPrivateUnfencedEpochs);
-  // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
-  // elements: zeros where it reads none.
-  int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, unfenced_stride_slot = 0, unfenced_stride_m = 0, unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0, unfenced_size_n = 0;
-  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): both two-shots'.
-  const bool int4_flat = quantize_int4 && is_two_shot(algorithm);
-  const int64_t share = int4_flat_share(m, n, s.world);
-  partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
-  partials_stride_n = 1;
-  // THE ONE-SHOTS USE NO PARTIALS: an empty view.
-  partials_size_m = !is_two_shot(algorithm) ? 0 : int4_flat ? 1 : m;
-  partials_size_n = int4_flat ? share : slice_bytes / elem_bytes(dtype);
-  staging_stride_m = in_place || unfenced ? 0 : int4_flat ? s.world * share : inbox ? slot : n;
-  staging_stride_n = in_place || unfenced ? 0 : 1;
-  staging_size_m = in_place || unfenced ? 0 : int4_flat ? 1 : inbox ? s.world : m;
-  staging_size_n = in_place || unfenced ? 0 : int4_flat ? s.world * share : inbox ? slot : n;
-  // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank, row) of
-  // kUnfencedSlotBytes of payload each whatever the build (so a row is the same bytes at every
-  // build, its epoch its own), a writer's rows contiguous.
-  unfenced_stride_slot = unfenced ? 2 * kUnfencedBlocks * (kUnfencedSlotBytes / elem_bytes(dtype)) : 0;
-  unfenced_stride_m = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
-  unfenced_stride_n = unfenced ? 1 : 0;
-  unfenced_size_slot = unfenced ? s.world : 0;
-  unfenced_size_m = unfenced ? 2 * kUnfencedBlocks : 0;
-  unfenced_size_n = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
-  // THE ONE-SHOTS IN THE STAGING (kernels/all_reduce.cuh), as bytes over the dtype's elements
-  // (what the launch's region checks read): the INT4 pull's [m, n] payload; the staged push's
-  // WORLD slots of an input (INT4: its payload); no partials. The kernels find them from the
-  // input's sizes. (The line push's inbox is the unfenced region, above.)
-  if (is_one_shot(algorithm) && algorithm != AllReduceAlgorithm::one_shot_push &&
-      (quantize_int4 || algorithm == AllReduceAlgorithm::one_shot_push_staged)) {
-    const int64_t payload = quantize_int4 ? int4_payload_bytes(m, n) : m * n * elem_bytes(dtype);
-    const int64_t slot = quantize_int4 ? (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign *
-                                             kInt4ScalesAlign
-                                       : payload;
-    const int64_t staged =
-        algorithm == AllReduceAlgorithm::one_shot_push_staged ? s.world * slot : payload;
-    staging_stride_m = 0;
-    staging_stride_n = 1;
-    staging_size_m = 1;
-    staging_size_n = (staged + elem_bytes(dtype) - 1) / elem_bytes(dtype);
-    partials_stride_m = 0;
-    partials_stride_n = 1;
-    partials_size_m = 0;
-    partials_size_n = 0;
+  // ---- ITS VIEWS OF THE REGIONS, by its algorithm, in elements: a view [m, n] at strides
+  // [stride_m, stride_n] (the line push's inbox [slot, m, n]); an empty view (size 0) where it
+  // reads none. The kernels find a one-shot's payload in the staging from the input's sizes. ----
+  const int64_t e = elem_bytes(dtype);
+  const int64_t share = int4_flat_share(m, n, s.world);  // the INT4 flat walk's share
+  int64_t partials_stride_m = slice_bytes / e, partials_stride_n = 1, partials_size_m = 0,
+          partials_size_n = slice_bytes / e;
+  int64_t staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
+  int64_t unfenced_stride_slot = 0, unfenced_stride_m = 0, unfenced_stride_n = 0,
+          unfenced_size_slot = 0, unfenced_size_m = 0, unfenced_size_n = 0;
+  switch (algorithm) {
+    case AllReduceAlgorithm::two_shot_pull:
+    case AllReduceAlgorithm::two_shot_push:
+      if (quantize_int4) {
+        // THE INT4 FLAT WALK: this rank's share of the call's groups in the partials, and every
+        // rank's share in the staging.
+        partials_stride_m = share, partials_size_m = 1, partials_size_n = share;
+        staging_stride_m = s.world * share, staging_stride_n = 1, staging_size_m = 1,
+        staging_size_n = s.world * share;
+      } else {
+        // EXACT: this rank's slice of every row in the partials; the pushed two-shot's inbox in
+        // the staging, WORLD slots of a share of the call (the pull reads every rank's input in
+        // place, through the input table).
+        partials_size_m = m;
+        if (algorithm == AllReduceAlgorithm::two_shot_push)
+          staging_stride_m = slot, staging_stride_n = 1, staging_size_m = s.world,
+          staging_size_n = slot;
+      }
+      break;
+    case AllReduceAlgorithm::one_shot_pull:
+      // INT4: its [m, n] payload in the staging, no partials (exact: every rank's input in place).
+      if (quantize_int4) {
+        partials_stride_m = 0, partials_size_n = 0;
+        staging_stride_n = 1, staging_size_m = 1,
+        staging_size_n = (int4_payload_bytes(m, n) + e - 1) / e;
+      }
+      break;
+    case AllReduceAlgorithm::one_shot_push:
+      // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank,
+      // row) of kUnfencedSlotBytes of payload each whatever the build (so a row is the same bytes
+      // at every build, its epoch its own), a writer's rows contiguous.
+      unfenced_stride_slot = 2 * kUnfencedBlocks * (kUnfencedSlotBytes / e);
+      unfenced_stride_m = kUnfencedSlotBytes / e, unfenced_stride_n = 1;
+      unfenced_size_slot = s.world, unfenced_size_m = 2 * kUnfencedBlocks,
+      unfenced_size_n = kUnfencedSlotBytes / e;
+      break;
+    case AllReduceAlgorithm::one_shot_push_staged: {
+      // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot whole kInt4ScalesAlign),
+      // no partials.
+      const int64_t payload = quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
+      const int64_t slot_bytes =
+          quantize_int4 ? (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign
+                        : payload;
+      partials_stride_m = 0, partials_size_n = 0;
+      staging_stride_n = 1, staging_size_m = 1,
+      staging_size_n = (s.world * slot_bytes + e - 1) / e;
+      break;
+    }
   }
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n, partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
@@ -2169,18 +2189,18 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
         reinterpret_cast<const T* const*>(table), table_size, table_stride_m, table_stride_n,
         static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        partials_ptr_array, s.world, partials_stride_m,
+        s.partials_ptr_array, s.world, partials_stride_m,
         partials_stride_n, static_cast<int>(partials_size_m),
-        static_cast<int>(partials_size_n), staging_ptr_array,
+        static_cast<int>(partials_size_n), s.staging_ptr_array,
         s.world, staging_stride_m, staging_stride_n,
         static_cast<int>(staging_size_m), static_cast<int>(staging_size_n),
-        unfenced_ptr_array, s.world, unfenced_stride_slot,
+        s.unfenced_ptr_array, s.world, unfenced_stride_slot,
         unfenced_stride_m, unfenced_stride_n,
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
-        static_cast<int>(unfenced_size_n), unfenced_epochs,
+        static_cast<int>(unfenced_size_n), s.unfenced_epochs,
         kUnfencedEpochsStrideBlock, int64_t{1},
         static_cast<int>(kUnfencedBlocks),
-        static_cast<int>(kUnfencedEpochsStrideBlock), signals_ptr_array,
+        static_cast<int>(kUnfencedEpochsStrideBlock), s.signals_ptr_array,
         s.world, kSignalsStrideParity, int64_t{kMaxRanks},
         int64_t{1}, int64_t{2}, int64_t{kMaxBlocks},
         int64_t{kMaxRanks}, s.status_device, int64_t{1},
@@ -2272,14 +2292,6 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
-  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
-  // and the private buffer's arrays, epochs and tables (kPrivate*).
-  char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
-  const auto signals_ptr_array =
-      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
-  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
-  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
@@ -2324,13 +2336,13 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
             weight_stride_n,
         static_cast<int>(weight_size_n), static_cast<T*>(output_ptr), output_stride_m,
         output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), partials_ptr_array, s.world,
+        static_cast<int>(output_size_n), s.partials_ptr_array, s.world,
          partials_stride_m,
         partials_stride_n, static_cast<int>(partials_size_m),
-        static_cast<int>(partials_size_n), staging_ptr_array,
+        static_cast<int>(partials_size_n), s.staging_ptr_array,
             s.world, staging_stride_m,
         staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), signals_ptr_array,
+        static_cast<int>(staging_size_n), s.signals_ptr_array,
             s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
@@ -2451,16 +2463,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
-  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
-  // and the private buffer's arrays, epochs and tables (kPrivate*).
-  char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
-  const auto signals_ptr_array =
-      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
-  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
-  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto scales_ptr_array =
-      reinterpret_cast<float* const*>(region_ptr_arrays + kScalesArray * kMaxRanks);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, scales_stride_m = 0, scales_size_m = 0;
@@ -2514,15 +2516,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
         static_cast<int>(output_size_n), static_cast<T*>(residual_output_ptr),
         residual_output_stride_m, residual_output_stride_n,
         static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), partials_ptr_array,
+        static_cast<int>(residual_output_size_n), s.partials_ptr_array,
             s.world,
          partials_stride_m,
         partials_stride_n, static_cast<int>(partials_size_m),
-        static_cast<int>(partials_size_n), scales_ptr_array,
+        static_cast<int>(partials_size_n), s.scales_ptr_array,
         s.world, scales_stride_m, static_cast<int>(scales_size_m),
-        staging_ptr_array, s.world, staging_stride_m,
+        s.staging_ptr_array, s.world, staging_stride_m,
         staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), signals_ptr_array,
+        static_cast<int>(staging_size_n), s.signals_ptr_array,
             s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
@@ -2667,14 +2669,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
-  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
-  // and the private buffer's arrays, epochs and tables (kPrivate*).
-  char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
-  const auto signals_ptr_array =
-      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
-  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
-  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
@@ -2733,12 +2727,12 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
         static_cast<int>(output_size_n), static_cast<T*>(block_output_ptr),
         block_output_stride_m, block_output_stride_n,
         static_cast<int>(block_output_size_m),
-        static_cast<int>(block_output_size_n), partials_ptr_array,
+        static_cast<int>(block_output_size_n), s.partials_ptr_array,
         s.world, partials_stride_m, partials_stride_n,
         static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
-        staging_ptr_array, s.world, staging_stride_m,
+        s.staging_ptr_array, s.world, staging_stride_m,
         staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), signals_ptr_array,
+        static_cast<int>(staging_size_n), s.signals_ptr_array,
             s.world, kSignalsStrideParity,
         int64_t{kMaxRanks}, int64_t{1},
         int64_t{2}, int64_t{kMaxBlocks},
