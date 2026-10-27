@@ -2185,17 +2185,34 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
       : ((partials_size_m - 1) * partials_stride_m + (partials_size_n - 1) * partials_stride_n + 1) * e;
   if (std::max(staging_need, staging_end) > s.staging_bytes) return error_code(Error::staging_too_small);
   if (std::max(partials_need, partials_end) > s.partials_bytes) return error_code(Error::partials_too_small);
-  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input in place (an exact
-  // pull), or none where it reads the staging.
+  // THE INPUT TABLE (INPUT TABLES): where the exact pull reads every rank's input in place; no
+  // table where the kernel reads the staging. Captured: the next table slot reserved for this
+  // input (register_graph_buffers fills it with every rank's address when the capture exits), its
+  // rows at the input's stride. Eager: the input copied into this rank's staging (it fits: the
+  // staging_need above), read through the eager table, slot 0, its rows n apart.
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   void* const* table = nullptr;
-  int64_t table_stride_m = staging_stride_m;
-  if (in_place)
-    if (const std::optional<Error> failed = input_table(s, input_ptr, input_stride_m, input_size_m,
-                                                   input_size_n, e, stream, table,
-                                                   table_stride_m))
-      return error_code(failed);
-  const int table_size = in_place ? s.world : 0;
-  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
+  int table_size = 0;
+  int64_t table_stride_m = staging_stride_m, table_stride_n = staging_stride_n;
+  if (in_place) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &capture) != hipSuccess) return error_code(Error::hip_failed);
+    if (capture == hipStreamCaptureStatusActive) {
+      if (s.next_slot >= kInputTableSlots) return error_code(Error::tables_full);
+      s.pending.emplace_back(s.next_slot, input_ptr);
+      table = tables + s.next_slot * kMaxRanks;
+      table_stride_m = input_stride_m;
+      ++s.next_slot;
+    } else {
+      if (hipMemcpy2DAsync(s.shared_buffer + s.staging, static_cast<size_t>(n * e), input_ptr,
+                           static_cast<size_t>(input_stride_m * e), static_cast<size_t>(n * e),
+                           static_cast<size_t>(m), hipMemcpyDeviceToDevice, stream) != hipSuccess)
+        return error_code(Error::hip_failed);
+      table = tables;
+      table_stride_m = n;
+    }
+    table_size = s.world, table_stride_n = 1;
+  }
   with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
