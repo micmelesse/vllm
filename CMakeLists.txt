@@ -1557,7 +1557,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     # ITS KERNEL INSTANCES, A FILE A BUILD (builds.py writes them beside the builds, with the
     # header that keeps the host from instantiating any): compiled in parallel, each cached alone.
     set(VLLM_HCC_HOST
-      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator/hip_custom_communicator.cuh)
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator.cu)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VLLM_HCC_HOST})
     execute_process(
       COMMAND ${Python_EXECUTABLE} ${VLLM_HCC_BUILDS_SCRIPT} ${VLLM_HCC_TABLE}

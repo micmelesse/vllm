@@ -11,7 +11,7 @@ order the tables first name them. THE BUILD MAKES WHAT IT IS TOLD (Michael, Octo
 nothing is left out and nothing added; every kernel takes any config it is built at
 (its tails its own), and what an algorithm cannot do at a call (INT4 on a one-shot, a
 pushed one-shot's tile past its slot) is refused by name at the call
-(`hip_custom_communicator.cuh`'s checks), never by the build. CMake runs this at
+(`hip_custom_communicator.cu`'s checks), never by the build. CMake runs this at
 configure (the table and this file
 are configure dependencies), and the host file includes what it writes: one
 `constexpr BuildConfig` array a template, `kBuilds_<kernel>`. A config of the table is
@@ -19,7 +19,7 @@ then always a build, and a build is always in the table. The pattern is vLLM's o
 Machete's `generate.py` and Marlin's `generate_kernels.py` write their kernel instances
 at configure the same way (CMakeLists.txt).
 
-    python3 builds.py <hip_custom_communicator.json> <out.inc> <arch>[;<arch>...] <host.cuh>
+    python3 builds.py <hip_custom_communicator.json> <out.inc> <arch>[;<arch>...] <hip_custom_communicator.cu>
 
 A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input picks, which a tune adds on
 its own copy of the table; gd's tune prunes them when it writes. A file NAMES ITS BUILD
