@@ -307,6 +307,7 @@ class Error(IntEnum):
     tables_full = 34
     ranks_disagree = 35
     not_open = 36
+    field_missing = 37
 
     # PYTHON'S OWN, after C++'s. Why it is disabled:
     no_problem_size = 100  # no server config to size the exchange from
@@ -1544,15 +1545,17 @@ class HipCustomCommunicator:
                         f"{Error(error).name}: {config} on {input.shape}"
                     )
             case AllReduceRmsNormSplitConfig():
-                # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
-                # norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the norm
-                # writes its rows over them in place (STANDARDS 3.5), no tensor of its
-                # own.
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+                # THE SPLIT, an algorithm of the same op (`split_<the all-reduce's>`):
+                # C++ runs our all-reduce into the output, then the norm on its rows
+                # in place, back to back. Its config's fields are the all-reduce's,
+                # its rms_norm_ fields the norm's.
+                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
                     state=self.state.handle,
                     input=input,
+                    weight=weight,
                     output=output,
-                    algorithm=config.all_reduce.algorithm,
+                    eps=eps,
+                    algorithm=f"split_{config.all_reduce.algorithm}",
                     grid_x=config.all_reduce.grid_x,
                     grid_y=config.all_reduce.grid_y,
                     grid_z=config.all_reduce.grid_z,
@@ -1565,33 +1568,20 @@ class HipCustomCommunicator:
                     quantization=config.all_reduce.quantization,
                     pack_bytes=config.all_reduce.pack_bytes,
                     quantize_from_bytes=config.all_reduce.quantize_from_bytes,
+                    rms_norm_grid_x=config.rows.grid_x,
+                    rms_norm_grid_y=config.rows.grid_y,
+                    rms_norm_grid_z=config.rows.grid_z,
+                    rms_norm_block_x=config.rows.block_x,
+                    rms_norm_block_y=config.rows.block_y,
+                    rms_norm_block_z=config.rows.block_z,
+                    rms_norm_waves_per_eu=config.rows.waves_per_eu,
+                    rms_norm_tile_m=config.rows.tile_m,
+                    rms_norm_tile_n=config.rows.tile_n,
+                    rms_norm_pack_bytes=config.rows.pack_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(
-                        f"{Error(error).name}: {config.all_reduce} on {input.shape}"
-                    )
-                error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
-                    state=self.state.handle,
-                    input=output,
-                    weight=weight,
-                    output=output,
-                    eps=eps,
-                    grid_x=config.rows.grid_x,
-                    grid_y=config.rows.grid_y,
-                    grid_z=config.rows.grid_z,
-                    block_x=config.rows.block_x,
-                    block_y=config.rows.block_y,
-                    block_z=config.rows.block_z,
-                    waves_per_eu=config.rows.waves_per_eu,
-                    tile_m=config.rows.tile_m,
-                    tile_n=config.rows.tile_n,
-                    quantization=config.rows.quantization,
-                    pack_bytes=config.rows.pack_bytes,
-                    quantize_from_bytes=config.rows.quantize_from_bytes,
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config.rows} on {input.shape}"
+                        f"{Error(error).name}: {config} on {input.shape}"
                     )
         return output
 
@@ -1971,60 +1961,6 @@ class HipCustomCommunicator:
     # ---- THE NORMS ON THIS RANK'S ROWS, no peer: the second kernel of an op as two
     # kernels of ours, a caller's to compose (our all-reduce, then one of these on its
     # sum). No table: a call gives its config, whole. ----
-
-    @final
-    def rms_norm(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-        *,
-        config: RmsNormConfig,
-    ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(input, weight, eps)` on this rank's rows, `input` a
-        sum, at the config given. Returns the normed rows."""
-        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
-        # is not [rows, cols].
-        if self.disabled:
-            raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
-        assert self.state is not None, "an open communicator has its state"
-        if input.dim() != 2:
-            raise RuntimeError(f"not_two_d: not {tuple(input.shape)}")
-
-        # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
-        output = torch.empty_like(input)
-        if (
-            self.lifecycle.status == "capturing"
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            return output
-
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: a norm on rows moves nothing quantized.
-        if config.quantization != "exact":
-            raise AssertionError(f"a norm on rows given an INT4 config: {config}")
-
-        error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
-            state=self.state.handle,
-            input=input,
-            weight=weight,
-            output=output,
-            eps=eps,
-            grid_x=config.grid_x,
-            grid_y=config.grid_y,
-            grid_z=config.grid_z,
-            block_x=config.block_x,
-            block_y=config.block_y,
-            block_z=config.block_z,
-            waves_per_eu=config.waves_per_eu,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            quantization=config.quantization,
-            pack_bytes=config.pack_bytes,
-            quantize_from_bytes=config.quantize_from_bytes,
-        )
-        if error is not None:
-            raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
-        return output
 
     @final
     def add_rms_norm(

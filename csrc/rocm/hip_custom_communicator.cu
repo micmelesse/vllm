@@ -131,6 +131,7 @@ enum class Error : int {
   tables_full = 34,
   ranks_disagree = 35,
   not_open = 36,
+  field_missing = 37,
 };
 
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what
@@ -1894,8 +1895,161 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
+    std::optional<int64_t> quantize_from_bytes,
+    std::optional<int64_t> rms_norm_grid_x,
+    std::optional<int64_t> rms_norm_grid_y,
+    std::optional<int64_t> rms_norm_grid_z,
+    std::optional<int64_t> rms_norm_block_x,
+    std::optional<int64_t> rms_norm_block_y,
+    std::optional<int64_t> rms_norm_block_z,
+    std::optional<int64_t> rms_norm_waves_per_eu,
+    std::optional<int64_t> rms_norm_tile_m,
+    std::optional<int64_t> rms_norm_tile_n,
+    std::optional<int64_t> rms_norm_pack_bytes) {
   using namespace hip_custom_communicator;
+  // THE ALGORITHM: one fused kernel's (one_shot_pull, two_shot_pull,
+  // two_shot_push), or a SPLIT, `split_<the all-reduce's algorithm>`: our
+  // all-reduce (all_reduce's whole call, at this config's fields), then the
+  // RMSNorm on this rank's rows in place on its output (at the rms_norm_
+  // fields), back to back on the stream. The rms_norm_ fields are a split's
+  // alone: given to a fused algorithm, or missing from a split, refused.
+  constexpr std::string_view kSplit = "split_";
+  const bool split = algorithm_name.rfind(kSplit, 0) == 0;
+  for (const std::optional<int64_t>& field :
+       {rms_norm_grid_x, rms_norm_grid_y, rms_norm_grid_z, rms_norm_block_x,
+        rms_norm_block_y, rms_norm_block_z, rms_norm_waves_per_eu,
+        rms_norm_tile_m, rms_norm_tile_n, rms_norm_pack_bytes}) {
+    if (!split && field) return error_code(Error::field_not_this_templates);
+    if (split && !field) return error_code(Error::field_missing);
+  }
+  if (split) {
+    // ---- THE CALL FROM TORCH, the norm's part: its state, the weight and the
+    // output it norms in place, its config's ints (the all-reduce checks its
+    // own). ----
+    if (state == 0) return error_code(Error::not_open);
+    CommsState& s = *reinterpret_cast<CommsState*>(state);
+    if (!weight.is_cuda() || !output.is_cuda())
+      return error_code(Error::not_on_device);
+    if (output.dim() != 2 || weight.dim() != 1 ||
+        weight.numel() != output.size(1))
+      return error_code(Error::shape_mismatch);
+    for (const int64_t v :
+         {*rms_norm_grid_x, *rms_norm_grid_y, *rms_norm_grid_z,
+          *rms_norm_block_x, *rms_norm_block_y, *rms_norm_block_z,
+          *rms_norm_waves_per_eu, *rms_norm_tile_m, *rms_norm_tile_n,
+          *rms_norm_pack_bytes})
+      if (v < std::numeric_limits<int>::min() ||
+          v > std::numeric_limits<int>::max())
+        return error_code(Error::field_out_of_range);
+    const void* weight_ptr = weight.data_ptr();
+    const int64_t weight_stride_n = weight.stride(0),
+                  weight_size_n = weight.size(0);
+    void* output_ptr = output.data_ptr();
+    const int64_t output_stride_m = output.stride(0),
+                  output_stride_n = output.stride(1);
+    const int64_t output_size_m = output.size(0),
+                  output_size_n = output.size(1);
+    const at::ScalarType dtype = output.scalar_type();
+    const at::ScalarType weight_dtype = weight.scalar_type();
+    const int64_t e = output.element_size();
+    const int64_t n = output_size_n;
+    const Dim3 rms_norm_grid{static_cast<int>(*rms_norm_grid_x),
+                             static_cast<int>(*rms_norm_grid_y),
+                             static_cast<int>(*rms_norm_grid_z)};
+    const Dim3 rms_norm_block{static_cast<int>(*rms_norm_block_x),
+                              static_cast<int>(*rms_norm_block_y),
+                              static_cast<int>(*rms_norm_block_z)};
+    const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+    // ---- PRECONDITIONS of the norm on rows, in order: its config, the call
+    // against it, its compiled kernel on this device. ----
+    // THE GRID: x alone, at least a block (it waits on no peer: any grid runs).
+    if (*rms_norm_grid_y != 1 || *rms_norm_grid_z != 1 || *rms_norm_grid_x < 1)
+      return error_code(Error::launch_out_of_range);
+    if (*rms_norm_tile_m < 1 || *rms_norm_tile_n < 1)
+      return error_code(Error::field_not_positive);
+    // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes), at least an
+    // element, whole packs a row.
+    if (*rms_norm_pack_bytes < 2 || *rms_norm_pack_bytes > kPackBytes ||
+        (*rms_norm_pack_bytes & (*rms_norm_pack_bytes - 1)) != 0 ||
+        *rms_norm_pack_bytes < e)
+      return error_code(Error::pack_out_of_range);
+    if (n * e % *rms_norm_pack_bytes != 0)
+      return error_code(Error::row_not_packs);
+    // THE WEIGHT read a pack at a time, a pack's worth of the output's elements
+    // a load: its address on such a load.
+    if (reinterpret_cast<uintptr_t>(weight_ptr) %
+            (kPackBytes / e * weight.element_size()) !=
+        0)
+      return error_code(Error::not_aligned);
+    // A LAYOUT THE PACKED LOADS CAN READ: the innermost stride 1, the output's
+    // rows on whole packs.
+    if (output_stride_n != 1 || weight_stride_n != 1)
+      return error_code(Error::inner_stride_not_one);
+    if (output_stride_m * e % *rms_norm_pack_bytes != 0)
+      return error_code(Error::row_stride_not_packs);
+    // THE INSTANCE: the norm compiled at this config, on this device, for this
+    // call (builds.py's kRmsNormInstances); a row wider than the tile its
+    // CHUNKED instance.
+    const bool chunked = n > *rms_norm_tile_n;
+    const int shared_memory_bytes = 0;
+    void* kernel = nullptr;
+    for (const auto& i : kRmsNormInstances)
+      if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
+          i.block_z == *rms_norm_block_z &&
+          i.waves_per_eu == *rms_norm_waves_per_eu &&
+          i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
+          i.quantization == Quantization::exact &&
+          i.pack_bytes == *rms_norm_pack_bytes &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.weight_dtype == weight_dtype && i.chunked == chunked)
+        kernel = i.kernel;
+    if (kernel == nullptr) return error_code(Error::not_built);
+    // THE KERNEL ON THIS DEVICE, as its compiler left it (it waits on no peer:
+    // no residency).
+    hipFuncAttributes attributes;
+    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (*rms_norm_block_x > attributes.maxThreadsPerBlock)
+      return error_code(Error::block_too_large);
+    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
+        s.device.lds_bytes)
+      return error_code(Error::lds_too_large);
+    if (static_cast<int64_t>(attributes.localSizeBytes) >
+        s.device.scratch_a_lane)
+      return error_code(Error::scratch_too_large);
+    // ---- THE ALL-REDUCE: its whole call, into the output (it refuses before
+    // it launches). ----
+    if (const ErrorCode refused = hip_custom_communicator_all_reduce(
+            state, input, output, algorithm_name.substr(kSplit.size()), grid_x,
+            grid_y, grid_z, block_x, block_y, block_z, waves_per_eu, tile_m,
+            tile_n, quantization_name, pack_bytes, quantize_from_bytes))
+      return refused;
+    // ---- THE NORM, on the sum in place: every element written by the thread
+    // that read it, after it read it. ----
+    const auto launch = [&]<typename T, typename W>() {
+      const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(kernel);
+      typed<<<dim3_of(rms_norm_grid), dim3_of(rms_norm_block),
+              shared_memory_bytes, stream>>>(
+          static_cast<const T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          static_cast<const W*>(weight_ptr), weight_stride_n,
+          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
+          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), eps);
+    };
+    if (dtype == at::ScalarType::BFloat16 &&
+        weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::BFloat16, float>();
+    else if (dtype == at::ScalarType::BFloat16)
+      launch.template operator()<c10::BFloat16, c10::BFloat16>();
+    else if (weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::Half, float>();
+    else
+      launch.template operator()<c10::Half, c10::Half>();
+    // POSTCONDITION: the launch went in.
+    if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
+    return std::nullopt;
+  }
   // ---- THE CALL FROM TORCH: its state, its tensors stripped to pointers and
   // strides, its config's ints. ----
   if (state == 0) return error_code(Error::not_open);
@@ -2655,126 +2809,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else
-    launch.template operator()<c10::Half, c10::Half>();
-  // POSTCONDITION: the launch went in.
-  if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
-  return std::nullopt;
-}
-
-// rms_norm: this rank's rows normed (the second kernel of an op Python
-// composes), at its config. rms_norm: out = rms_norm(inp, weight), vLLM's
-// roundings exactly, on this rank's rows; the weight `weight_dtype`, dtype or
-// f32. One function: what Python passes, its tensors stripped to pointers and
-// strides, the preconditions, the kernel's arguments, the launch, the
-// postcondition.
-ErrorCode hip_custom_communicator_rms_norm(
-    int64_t state, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
-  using namespace hip_custom_communicator;
-  // THE CALL FROM TORCH: its state, its tensors, its config's ints.
-  if (state == 0) return error_code(Error::not_open);
-  if (const std::optional<Error> e = norm_tensors(
-          input, nullptr, weight, output, nullptr, /*in_place=*/true))
-    return error_code(e);
-  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y,
-                 grid_z, block_x, block_y, block_z}))
-    return error_code(Error::field_out_of_range);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
-  const void* input_ptr = input.data_ptr();
-  const int64_t input_stride_m = input.stride(0);
-  const int64_t input_stride_n = input.stride(1);
-  const int64_t input_size_m = input.size(0);
-  const int64_t input_size_n = input.size(1);
-  const void* weight_ptr = weight.data_ptr();
-  const int64_t weight_stride_n = weight.stride(0);
-  const int64_t weight_size_n = weight.size(0);
-  void* output_ptr = output.data_ptr();
-  const int64_t output_stride_m = output.stride(0);
-  const int64_t output_stride_n = output.stride(1);
-  const int64_t output_size_m = output.size(0);
-  const int64_t output_size_n = output.size(1);
-  const at::ScalarType dtype = input.scalar_type();
-  const at::ScalarType weight_dtype = weight.scalar_type();
-  const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y),
-                  static_cast<int>(grid_z)};
-  const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y),
-                   static_cast<int>(block_z)};
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  // ---- PRECONDITIONS: the config, the call, then its instance. The first
-  // Error refuses the call; past this section the call runs. ----
-  if (quantization_name != "exact" && quantization_name != "int4")
-    return error_code(Error::no_such_quantization);
-  const RmsNormBuildConfig build{.block = block,
-                                 .waves_per_eu = static_cast<int>(waves_per_eu),
-                                 .tile_m = static_cast<int>(tile_m),
-                                 .tile_n = static_cast<int>(tile_n),
-                                 .quantization = quantization_name == "int4"
-                                                     ? Quantization::int4
-                                                     : Quantization::exact,
-                                 .pack_bytes = static_cast<int>(pack_bytes)};
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
-                  quantize_from_bytes, dtype, m, n))
-    return error_code(e);
-  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
-  // rows on whole packs of the build's.
-  if (output_stride_n != 1 || input_stride_n != 1)
-    return error_code(Error::inner_stride_not_one);
-  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
-    return error_code(Error::row_stride_not_packs);
-  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
-  const int shared_memory_bytes = 0;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  const bool chunked = n > build.tile_n;
-  void* kernel = nullptr;
-  // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kRmsNormInstances, a row each).
-  for (const auto& i : kRmsNormInstances)
-    if (i.algorithm == RmsNormAlgorithm::rows && i.block_x == build.block.x &&
-        i.block_y == build.block.y && i.block_z == build.block.z &&
-        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
-        i.tile_n == build.tile_n && i.tile_k == 1 &&
-        i.quantization == build.quantization &&
-        i.pack_bytes == build.pack_bytes && i.world == 0 &&
-        i.wave_size == s.device.wave_size && i.dtype == dtype &&
-        i.weight_dtype == weight_dtype && i.contiguous == false &&
-        i.chunked == chunked && i.tail == false &&
-        i.quantize_int4 == (build.quantization == Quantization::int4 &&
-                            build.pack_bytes == kPackBytes))
-      kernel = i.kernel;
-  if (kernel == nullptr) return error_code(Error::not_built);
-  if (const std::optional<Error> e =
-          check_kernel(s, kernel, grid, block, shared_memory_bytes, false))
-    return error_code(e);
-
-  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
-  // ----
-  // THE LAUNCH: the instance's kernel, at the call's dtypes.
-  const auto launch = [&]<typename T, typename W>() {
-    const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(kernel);
-    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
-        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
-        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        static_cast<const W*>(weight_ptr), weight_stride_n,
-        static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), eps);
-  };
-  if (dtype == at::ScalarType::BFloat16 &&
-      weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::BFloat16, float>();
-  else if (dtype == at::ScalarType::BFloat16)
-    launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else if (weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::Half, float>();
   else
     launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
