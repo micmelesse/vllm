@@ -10,7 +10,7 @@
 
 #include <type_traits>
 #include "common.cuh"
-#include "rms_norm.cuh"
+#include "rms_normalize.cuh"
 
 namespace hip_custom_communicator {
 
@@ -327,7 +327,7 @@ DINLINE void attn_res(
           const bool block = !decltype(last)::value || src < num_blocks;
           const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
           load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
-          // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
+          // This thread's share of each row's sum of squares, then of its dot with w (rms_normalize.cuh's
           // mask: packs past input_size_n count zero, multiplied in so nothing branches).
           float ss[ROWS], dw[ROWS];
 #pragma unroll
