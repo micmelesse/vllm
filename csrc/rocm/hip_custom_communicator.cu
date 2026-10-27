@@ -90,9 +90,8 @@ constexpr std::array<int, 3> kWorlds = {2, 4, 8};
 // =============================================================================
 
 // THE VOCABULARY, every type the tables and the handle name: why a call cannot
-// run (`Error`), what a caller asks for (`OpType`), and what is compiled in
-// (each op's build, its algorithm its op file's). `at::ScalarType` is
-// common.cuh's.
+// run (`Error`), and what is compiled in (each op's build, its algorithm its op
+// file's). `at::ScalarType` is common.cuh's.
 
 // WHY C++ REFUSED. C++ never raises: every function returns its Error as a
 // value (none: it ran), and Python names it by number from its mirror of this
@@ -134,25 +133,9 @@ enum class Error : int {
   not_open = 36,
 };
 
-// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses, or
-// a norm alone on this rank's rows (the second kernel of an op Python
-// composes). EACH OP IS ONE `__global__` TEMPLATE (its kernel, kOps), a family
-// of instances, one per set of template arguments; its ALGORITHM (its op file's
-// enum: a one-shot or a two-shot, pulled or pushed) is a template parameter and
-// its build's field, as its tile is.
-enum class OpType : int {
-  all_reduce = 0,
-  all_reduce_rms_norm = 1,
-  all_reduce_add_rms_norm = 2,
-  all_reduce_add_attn_res_rms_norm = 3,
-  rms_norm = 4,
-  add_rms_norm = 5,
-  add_attn_res_rms_norm = 6,
-};
-
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what
-// is compiled in (one of the builds its op lists, kOps: its algorithm first,
-// which of the op's kernel's bodies it is), and its
+// is compiled in (its algorithm first, which of its kernel's bodies it is), and
+// its
 // LAUNCH, what is chosen at each call. A tuned kernel holds both, a forced call
 // gives both, and select hands both to the launch; no field is ever 0 for "left
 // to someone else".
@@ -190,7 +173,6 @@ struct Named {
 
 // all_reduce: a tile a work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
-  static constexpr OpType op = OpType::all_reduce;
   static constexpr Named<AllReduceAlgorithm> algorithms[] = {
       {AllReduceAlgorithm::one_shot_pull, "one_shot_pull"},
       {AllReduceAlgorithm::one_shot_push, "one_shot_push"},
@@ -209,7 +191,6 @@ struct AllReduceBuildConfig {
 
 // all_reduce_rms_norm.
 struct AllReduceRmsNormBuildConfig {
-  static constexpr OpType op = OpType::all_reduce_rms_norm;
   static constexpr Named<AllReduceRmsNormAlgorithm> algorithms[] = {
       {AllReduceRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
       {AllReduceRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
@@ -226,7 +207,6 @@ struct AllReduceRmsNormBuildConfig {
 
 // all_reduce_add_rms_norm.
 struct AllReduceAddRmsNormBuildConfig {
-  static constexpr OpType op = OpType::all_reduce_add_rms_norm;
   static constexpr Named<AllReduceAddRmsNormAlgorithm> algorithms[] = {
       {AllReduceAddRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
       {AllReduceAddRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
@@ -243,7 +223,6 @@ struct AllReduceAddRmsNormBuildConfig {
 
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
 struct AllReduceAddAttnResRmsNormBuildConfig {
-  static constexpr OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   static constexpr Named<AllReduceAddAttnResRmsNormAlgorithm> algorithms[] = {
       {AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
       {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
@@ -261,7 +240,6 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
 
 // rms_norm (its kernel rms_norm_rows).
 struct RmsNormBuildConfig {
-  static constexpr OpType op = OpType::rms_norm;
   Dim3 block;
   int waves_per_eu;
   int tile_m;
@@ -273,7 +251,6 @@ struct RmsNormBuildConfig {
 
 // add_rms_norm (its kernel add_rms_norm_rows).
 struct AddRmsNormBuildConfig {
-  static constexpr OpType op = OpType::add_rms_norm;
   Dim3 block;
   int waves_per_eu;
   int tile_m;
@@ -286,7 +263,6 @@ struct AddRmsNormBuildConfig {
 // add_attn_res_rms_norm (its kernel add_attn_res_rms_norm_rows): TILE_K sources
 // a step.
 struct AddAttnResRmsNormBuildConfig {
-  static constexpr OpType op = OpType::add_attn_res_rms_norm;
   Dim3 block;
   int waves_per_eu;
   int tile_m;
@@ -390,36 +366,6 @@ using AddAttnResRmsNormRowsKernel =
 // declared here, so this file instantiates none of them; then the tables.
 #include "hip_custom_communicator_instances.inc"
 #include "hip_custom_communicator_builds.inc"
-
-// =============================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it) and its
-// weight's dtypes besides its input's.
-// =============================================================================
-
-// A NORM'S WEIGHT, besides its input's dtype: fp32.
-constexpr at::ScalarType kNormWeights[] = {at::ScalarType::Float};
-
-struct Op {
-  OpType type;
-  const char* name;
-  // The dtypes its weight may have besides its input's; none for an op with no
-  // weight.
-  std::span<const at::ScalarType> weights;
-};
-
-constexpr Op kOps[] = {
-    {OpType::all_reduce, "all_reduce", {}},
-    {OpType::all_reduce_rms_norm, "all_reduce_rms_norm", kNormWeights},
-    {OpType::all_reduce_add_rms_norm, "all_reduce_add_rms_norm", kNormWeights},
-    {OpType::all_reduce_add_attn_res_rms_norm,
-     "all_reduce_add_attn_res_rms_norm",
-     {}},
-    {OpType::rms_norm, "rms_norm", kNormWeights},
-    {OpType::add_rms_norm, "add_rms_norm", kNormWeights},
-    {OpType::add_attn_res_rms_norm, "add_attn_res_rms_norm", {}},
-};
-
-constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
 
 // THE INPUT TABLES: where an exact pull reads every rank's input in place, so a
 // captured call copies nothing. A table is `world` addresses, one pointer its
@@ -697,16 +643,6 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
          kInt4Group;
 }
 
-constexpr const Op& op(OpType t) { return kOps[static_cast<int>(t)]; }
-
-constexpr bool ops_in_order() {
-  for (int i = 0; i < kNumOps; ++i)
-    if (static_cast<int>(kOps[i].type) != i) return false;
-  return true;
-}
-
-static_assert(ops_in_order(), "kOps must list every OpType in its order");
-
 // =============================================================================
 // EACH OP'S KERNELS.
 // =============================================================================
@@ -784,18 +720,15 @@ constexpr int64_t partials_need(A algorithm, int64_t m, int64_t packs,
   }
 }
 
-// EVERY ALGORITHM OF EVERY KERNEL, `f` handed each with its kernel (a norm on
-// rows has none).
+// EVERY ALGORITHM OF EVERY KERNEL, `f` handed each (a norm on rows has none).
 template <typename F>
 constexpr void every_algorithm(F&& f) {
-  for (const auto& a : AllReduceBuildConfig::algorithms)
-    f(AllReduceBuildConfig::op, a.algorithm);
-  for (const auto& a : AllReduceRmsNormBuildConfig::algorithms)
-    f(AllReduceRmsNormBuildConfig::op, a.algorithm);
+  for (const auto& a : AllReduceBuildConfig::algorithms) f(a.algorithm);
+  for (const auto& a : AllReduceRmsNormBuildConfig::algorithms) f(a.algorithm);
   for (const auto& a : AllReduceAddRmsNormBuildConfig::algorithms)
-    f(AllReduceAddRmsNormBuildConfig::op, a.algorithm);
+    f(a.algorithm);
   for (const auto& a : AllReduceAddAttnResRmsNormBuildConfig::algorithms)
-    f(AllReduceAddAttnResRmsNormBuildConfig::op, a.algorithm);
+    f(a.algorithm);
 }
 
 // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its
@@ -911,15 +844,6 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
       return Error::staging_too_small;
     return std::nullopt;
   }
-}
-
-// THE WEIGHT a norm takes: its input's dtype, or one of its op's `weights`.
-constexpr std::optional<Error> weight_refused(OpType o, at::ScalarType dtype,
-                                              at::ScalarType weight_dtype) {
-  if (weight_dtype == dtype) return std::nullopt;
-  for (const at::ScalarType w : op(o).weights)
-    if (weight_dtype == w) return std::nullopt;
-  return Error::weight_not_built;
 }
 
 // A LAUNCH'S INPUT TABLE (INPUT TABLES): eager, the input copied into this
@@ -1276,7 +1200,7 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
           staging_bytes = int4_payload_bytes(max_rows, max_cols);
   for (const at::ScalarType d : kDtypes) {
     const int64_t packs = (max_cols * elem_bytes(d) + pack - 1) / pack;
-    every_algorithm([&](OpType, auto a) {
+    every_algorithm([&](auto a) {
       const int64_t need =
           partials_need(a, max_rows, packs, static_cast<int>(world), pack);
       if (need > partials_bytes) partials_bytes = need;
@@ -1423,19 +1347,27 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   // partials a call's bytes at most, its staging the whole call). ----
   std::vector<int64_t> capacity{max_rows, max_cols, partials_bytes,
                                 staging_bytes};
-  for (const auto& o : kOps) {
+  // EACH OP'S MOST BYTES A CALL, in Python's Op order: an all-reduce's the most
+  // its partials hold at its algorithms' widest keep a byte, at most its
+  // staging; a norm on rows', which keeps nothing, its staging.
+  const auto most_bytes = [&](const auto& algorithms) {
     int64_t per_byte = 0;
-    every_algorithm([&](OpType of, auto a) {
-      if (of != o.type) return;
-      per_byte =
-          std::max(per_byte,
-                   partials_need(a, 1, 1, static_cast<int>(world), kPackBytes) /
-                       kPackBytes);
-    });
-    capacity.push_back(
-        per_byte == 0 ? staging_bytes
-                      : std::min(partials_bytes / per_byte, staging_bytes));
-  }
+    for (const auto& a : algorithms)
+      per_byte = std::max(
+          per_byte, partials_need(a.algorithm, 1, 1, static_cast<int>(world),
+                                  kPackBytes) /
+                        kPackBytes);
+    return per_byte == 0 ? staging_bytes
+                         : std::min(partials_bytes / per_byte, staging_bytes);
+  };
+  capacity.push_back(most_bytes(AllReduceBuildConfig::algorithms));
+  capacity.push_back(most_bytes(AllReduceRmsNormBuildConfig::algorithms));
+  capacity.push_back(most_bytes(AllReduceAddRmsNormBuildConfig::algorithms));
+  capacity.push_back(
+      most_bytes(AllReduceAddAttnResRmsNormBuildConfig::algorithms));
+  capacity.push_back(staging_bytes);  // rms_norm
+  capacity.push_back(staging_bytes);  // add_rms_norm
+  capacity.push_back(staging_bytes);  // add_attn_res_rms_norm
   return {std::nullopt, reinterpret_cast<int64_t>(s), handle, s->device.arch,
           capacity};
 }
@@ -2062,9 +1994,6 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   if (const std::optional<Error> e = layout_refused(
           weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
     return error_code(e);
-  const OpType op = OpType::all_reduce_rms_norm;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype))
-    return error_code(e);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none).
   const int64_t partials_rows =
@@ -2259,9 +2188,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     return error_code(e);
   if (const std::optional<Error> e = layout_refused(
           weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
-  const OpType op = OpType::all_reduce_add_rms_norm;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype))
     return error_code(e);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none), at its row stride: the exact pull two-shot's row is its scale's pack
@@ -2722,9 +2648,6 @@ ErrorCode hip_custom_communicator_rms_norm(
   if (const std::optional<Error> e = layout_refused(
           weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
     return error_code(e);
-  const OpType op = OpType::rms_norm;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype))
-    return error_code(e);
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
@@ -2858,9 +2781,6 @@ ErrorCode hip_custom_communicator_add_rms_norm(
     return error_code(e);
   if (const std::optional<Error> e = layout_refused(
           weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
-  const OpType op = OpType::add_rms_norm;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype))
     return error_code(e);
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
