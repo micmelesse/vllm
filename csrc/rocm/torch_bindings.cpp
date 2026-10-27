@@ -1,9 +1,10 @@
 #include "core/registration.h"
 #include "rocm/ops.h"
 
-// Note on op signatures: The X_meta signatures are for the meta functions
-// corresponding to op X. They must be kept in sync with the signature for X.
-// Generally, only functions that return Tensors require a meta function.
+// Note on op signatures:
+// The X_meta signatures are for the meta functions corresponding to op X.
+// They must be kept in sync with the signature for X. Generally, only
+// functions that return Tensors require a meta function.
 //
 // See the following links for detailed docs on op registration and function
 // schemas.
@@ -27,8 +28,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
 
-  // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales, optional
-  // zero points [M/8, K/group_size] int32 for asymmetric quantization
+  // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales,
+  // optional zero points [M/8, K/group_size] int32 for asymmetric
+  // quantization
   rocm_ops.def(
       "wvSplitK_int4_g(Tensor in_a, Tensor in_b, Tensor in_scale, Tensor? "
       "in_zero_points, "
@@ -74,8 +76,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
 
-  // Custom attention op Compute the attention between an input query and the
-  // cached keys/values using PagedAttention.
+  // Custom attention op
+  // Compute the attention between an input query and the cached
+  // keys/values using PagedAttention.
   rocm_ops.def(
       "paged_attention(Tensor! out, Tensor exp_sums,                Tensor "
       "max_logits, "
@@ -94,17 +97,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // hip_custom_communicator.cu is built only with gfx950 in the arch list
   // (CMakeLists.txt); without it its ops are not registered.
 #ifndef VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR
-  // ROCm TP collectives. Only the ops that take tensors get a schema (the
-  // collectives also a device impl). THE REST TAKE NONE, and an op with no
-  // tensor argument has nothing for the dispatcher to select a backend from --
-  // a `kCPU` impl is then unreachable and the call raises "no fallback function
-  // is registered". So they are bound directly, which is what vLLM's
-  // quick-reduce does with its own handle ops, and their schema is INFERRED
-  // from the C++ signature: one source, nothing to keep in step (a hand-written
-  // schema that disagreed with its function failed the library load,
-  // 2026-10-14).
-  rocm_ops.def("hip_custom_communicator_build_info",
-               &hip_custom_communicator_build_info);
   // THE STATE AND EACH OP, every schema written out so Python passes arguments
   // by name (an inferred schema names none); a schema that disagrees with its
   // function fails the library load. The ops that take tensors have a device

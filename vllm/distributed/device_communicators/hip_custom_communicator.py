@@ -59,8 +59,8 @@ logger = init_logger(__name__)
 
 
 # ---- THE BUILD'S FACTS, as the communicator and its callers name them: the ops, the
-# Errors and fault places C++ answers with (number for number; a test holds them equal),
-# the build's contents (`build_info`), and whether a device runs it (`supported`). ----
+# Errors C++ answers with (number for number), and whether a device runs it
+# (`supported`). What is compiled is the tuned table's configs (builds.py). ----
 
 # EVERY OP, as C++ names them (`enum class Op`; a test holds them equal) and as its
 # method is named: the all-reduce, then each all-reduce and the ops it fuses, then each
@@ -136,15 +136,12 @@ class Error(IntEnum):
     grid_not_resident = 5
     staging_too_small = 6
     device_not_built = 7
-    device_not_tuned = 8
     weight_not_built = 9
     no_such_kernel = 10
-    threads_not_built = 11
-    tile_not_built = 12
+    not_built = 12
     launch_out_of_range = 13
     field_not_positive = 14
     field_not_this_templates = 15
-    waves_not_built = 16
     inner_stride_not_one = 17
     row_stride_not_packs = 18
     no_such_quantization = 19
@@ -259,20 +256,6 @@ _DTYPES: Mapping[str, torch.dtype] = {
 }
 
 
-# A BUILD'S FIELDS AS C++ LISTS THEM (build_info), in its order.
-_BUILD_FIELDS = (
-    "tile_m",
-    "tile_n",
-    "tile_k",
-    "block_x",
-    "block_y",
-    "block_z",
-    "waves_per_eu",
-    "quantization",
-    "pack_bytes",
-)
-
-
 @dataclass(frozen=True)
 class Build:
     """ONE BUILD OF AN OP'S KERNEL, what dispatch instantiates (C++'s BuildConfig): its
@@ -306,112 +289,6 @@ class Build:
             quantization=config.quantization,
             pack_bytes=config.pack_bytes,
         )
-
-
-@dataclass(frozen=True)
-class OpRecord:
-    """ONE OP AS BUILT (C++'s `kOps`): its kernel by name, the builds dispatch
-    instantiates, each its fields by name as the table holds them (algorithm, block_x,
-    block_y, block_z, waves_per_eu, its tile and its quantization; never the launch,
-    which a config gives itself), and what a call of it with nothing forced must be to
-    run, which `should` reads."""
-
-    kernel: str
-    builds: tuple["Build", ...]
-    dtypes: frozenset[torch.dtype]  # its input's
-    weight_dtypes: frozenset[torch.dtype]  # its weight's besides its input's; none
-    two_d: bool  # its input is [rows, cols], not any shape read as rows of the last
-
-
-@dataclass(frozen=True)
-class BuildInfo:
-    """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack bytes, its ops', errors' and fault places' names, and each op as built. What
-    a call may hold is a communicator's (`Capacity`)."""
-
-    dtypes: frozenset[torch.dtype]
-    worlds: frozenset[int]
-    pack_bytes: int
-    # C++'s `Op`, `Error` and `Where` members by name, each in its enum's order: an op
-    # crosses by name, an Error and a Where by number.
-    op_names: tuple[str, ...]
-    error_names: tuple[str, ...]
-    where_names: tuple[str, ...]
-    # Each op by name, in C++'s `OpType` order: its kernel, its builds (what a tuner
-    # searches) and its plain call.
-    ops: dict[str, OpRecord]
-
-
-@functools.cache
-def build_info() -> BuildInfo:
-    """The build's facts, read once: they are fixed when it is compiled."""
-    (
-        dtypes,
-        worlds,
-        pack,
-        ops,
-        errors,
-        where_names,
-        kernels,
-        kernel_ops,
-        field_names,
-        flat,
-        counts,
-        op_dtypes,
-        op_weights,
-        op_facts,
-        algorithms,
-    ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
-    assert list(kernel_ops) == list(ops), "an op's kernel out of the ops' order"
-    assert tuple(field_names) == _BUILD_FIELDS, f"C++'s build fields are {field_names}"
-    records: dict[str, OpRecord] = {}
-    at = at_dtype = at_weight = build = 0
-    width = len(field_names)
-    for op, kernel, count, facts in zip(
-        ops, kernels, counts, range(0, len(op_facts), 3)
-    ):
-        builds: list[Build] = []
-        for _ in range(count):
-            tile_m, tile_n, tile_k, block_x, block_y, block_z, waves, q, pack_bytes = (
-                flat[at : at + width]
-            )
-            builds.append(
-                Build(
-                    algorithm=algorithms[build],
-                    block_x=block_x,
-                    block_y=block_y,
-                    block_z=block_z,
-                    waves_per_eu=waves,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    tile_k=tile_k,
-                    quantization=_QUANTIZATIONS[q],
-                    pack_bytes=pack_bytes,
-                )
-            )
-            at += width
-            build += 1
-        num_dtypes, num_weights, two_d = op_facts[facts : facts + 3]
-        dtypes_in = op_dtypes[at_dtype : at_dtype + num_dtypes]
-        weights_in = op_weights[at_weight : at_weight + num_weights]
-        at_dtype += num_dtypes
-        at_weight += num_weights
-        records[op] = OpRecord(
-            kernel,
-            tuple(builds),
-            frozenset(_DTYPES[d] for d in dtypes_in),
-            frozenset(_DTYPES[d] for d in weights_in),
-            bool(two_d),
-        )
-    return BuildInfo(
-        frozenset(_DTYPES[d] for d in dtypes),
-        frozenset(worlds),
-        pack,
-        tuple(ops),
-        tuple(errors),
-        tuple(where_names),
-        records,
-    )
 
 
 @dataclass(frozen=True)
@@ -449,6 +326,14 @@ def problem_size() -> tuple[int, int] | None:
     return config.scheduler_config.max_num_batched_tokens, widest
 
 
+# WHAT THE KERNELS ARE COMPILED AT (builds.py's DTYPES and WEIGHT_DTYPE, the host's
+# kDtypes and kPackBytes): an input in a 16-bit dtype, a norm's weight in its input's
+# dtype or fp32, every config's pack at most the widest load's 16 bytes.
+_INPUT_DTYPES = (torch.float16, torch.bfloat16)
+_WEIGHT_DTYPES = (torch.float32,)
+_PACK_BYTES = 16
+
+
 def should(
     op: Op,
     input: torch.Tensor,
@@ -456,27 +341,23 @@ def should(
     weight: torch.Tensor | None = None,
 ) -> bool:
     """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
-    runs on an open communicator holding `capacity`: inside the op's record
-    (`build_info().ops`), whole packs a row, and inside what its exchange holds,
-    either the box it was sized for (rows and row width) or the op's most bytes.
-    Python alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
-    admits."""
-    built = build_info()
-    record = built.ops[op]
+    runs on an open communicator holding `capacity`: [rows, cols] in a dtype the
+    kernels are compiled at, a norm's weight in its dtype or fp32, whole packs a row,
+    and inside what its exchange holds, either the box it was sized for (rows and row
+    width) or the op's most bytes. Python alone, no C++ call, as vLLM's
+    `should_custom_ar`; C++ refuses no call this admits."""
     if (
-        input.dtype not in record.dtypes
+        input.dtype not in _INPUT_DTYPES
         or not input.is_contiguous()
         or input.numel() == 0
+        or input.dim() != 2
     ):
         return False
-    if input.dim() == 0 or (record.two_d and input.dim() != 2):
+    if weight is not None and weight.dtype not in (input.dtype, *_WEIGHT_DTYPES):
         return False
-    row = input.shape[-1]
-    if weight is not None and weight.dtype not in record.weight_dtypes | {input.dtype}:
-        return False
-    rows = input.numel() // row
+    rows, row = input.shape
     in_box = rows <= capacity.max_rows and row <= capacity.max_cols
-    return row * input.element_size() % built.pack_bytes == 0 and (
+    return row * input.element_size() % _PACK_BYTES == 0 and (
         in_box or input.numel() * input.element_size() <= capacity.max_bytes[op]
     )
 
@@ -538,6 +419,7 @@ class AllReduceConfig:
     """THE ALL-REDUCE'S CONFIG."""
 
     kernel: ClassVar[str] = "all_reduce"
+    op: ClassVar[Op] = "all_reduce"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceAlgorithm
@@ -562,6 +444,7 @@ class AllReduceRmsNormConfig:
     """THE ALL-REDUCE THEN RMSNORM'S CONFIG, one kernel."""
 
     kernel: ClassVar[str] = "all_reduce_rms_norm"
+    op: ClassVar[Op] = "all_reduce_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceRmsNormAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceRmsNormAlgorithm
@@ -586,6 +469,7 @@ class AllReduceAddRmsNormConfig:
     """THE ALL-REDUCE THEN ADD-RMSNORM'S CONFIG, one kernel."""
 
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
+    op: ClassVar[Op] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceAddRmsNormAlgorithm
@@ -611,6 +495,7 @@ class AllReduceAddAttnResRmsNormConfig:
     sources a step."""
 
     kernel: ClassVar[str] = "all_reduce_add_attn_res_rms_norm"
+    op: ClassVar[Op] = "all_reduce_add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(
         AllReduceAddAttnResRmsNormAlgorithm
     )
@@ -637,6 +522,7 @@ class RmsNormConfig:
     """THE RMSNORM ON THIS RANK'S ROWS' CONFIG."""
 
     kernel: ClassVar[str] = "rms_norm_rows"
+    op: ClassVar[Op] = "rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
@@ -661,6 +547,7 @@ class AddRmsNormConfig:
     """THE ADD-RMSNORM ON THIS RANK'S ROWS' CONFIG."""
 
     kernel: ClassVar[str] = "add_rms_norm_rows"
+    op: ClassVar[Op] = "add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
@@ -685,6 +572,7 @@ class AddAttnResRmsNormConfig:
     """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG: TILE_K sources a step."""
 
     kernel: ClassVar[str] = "add_attn_res_rms_norm_rows"
+    op: ClassVar[Op] = "add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     grid_x: int
@@ -791,8 +679,8 @@ def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
 
 
 def kernel_op(kernel: str) -> str | None:
-    """The op whose one kernel `kernel` is (build_info's), or None."""
-    return next((o for o, r in build_info().ops.items() if r.kernel == kernel), None)
+    """The op whose one kernel `kernel` is, or None."""
+    return _CONFIGS[kernel].op if kernel in _CONFIGS else None
 
 
 @dataclass(frozen=True)
@@ -867,7 +755,8 @@ class TunedConfigs:
         None where it has neither."""
         op = kernel_op(kernel)
         assert op is not None, f"no op's kernel is {kernel}"
-        builds = build_info().ops[op].builds
+        # ITS BUILDS: the table's configs of it (builds.py compiles exactly those).
+        builds = {Build.of(c) for c in self.configs if c.kernel == kernel}
 
         def takes(c: Config, moving: Quantization) -> bool:
             return (
@@ -919,23 +808,21 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
     `TunedTables`), parsed and checked, or None where the file holds none for it. A
     table that is not sound raises, naming the entry: its keys `_TABLE_KEYS`; every
     config its op's (qualified), every field `_CONFIG_KEYS` names in that order, read as
-    its op's config (`config_of_record`), a picked one a build its kernel lists (its
-    grid is C++'s to refuse at the call; a candidate, a config no pick names, need not
-    be built); every input one of `TUNED_OPS`, in a mode, at a built world, with a width
-    and tokens, tuned once; every pick one input's, its configs one kernel of the
-    input's op, or our all-reduce then the op's norm on rows, an exact input's moving
+    its op's config (`config_of_record`; builds.py compiles every config, and C++
+    refuses a config it did not, not_built); every input one of `TUNED_OPS`, in a
+    mode, at a world, with a width and tokens, tuned once; every pick one input's, its
+    configs one kernel of the input's op, or our all-reduce then the op's norm on rows,
+    an exact input's moving
     nothing quantized, a quantized one's all-reduce INT4; every tuned op an input in
-    each mode at every built world (the lookup reads one there)."""
+    each mode at every world the table tunes (the lookup reads one there)."""
     tables = json.loads(path.read_text())
     if arch not in tables:
         return None
     raw = tables[arch]
-    built = build_info()
     if list(raw) != list(_TABLE_KEYS):
         raise ValueError(
             f"the tuned table's keys are {list(raw)}, not {list(_TABLE_KEYS)}"
         )
-    picked = {j for k in raw["picks"] for j in k.get("configs", [])}
     configs: list[Config] = []
     for i, c in enumerate(raw["configs"]):
         where = f"the tuned table: configs[{i}]"
@@ -956,8 +843,6 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
             config = config_of_record(c)
         except ValueError as e:
             raise ValueError(f"{where}: {e}") from None
-        if i in picked and Build.of(config) not in built.ops[op].builds:
-            raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
         configs.append(config)
     picks: dict[TunedInput, Config | SplitConfig] = {}
     for i, k in enumerate(raw["picks"]):
@@ -977,8 +862,8 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
             raise ValueError(
                 f"{where}: {e.get('op')} is no tuned op of the communicator's"
             )
-        if e.get("mode") not in _MODES.values() or e.get("world") not in built.worlds:
-            raise ValueError(f"{where}: no such mode or world built: {e}")
+        if e.get("mode") not in _MODES.values() or not isinstance(e.get("world"), int):
+            raise ValueError(f"{where}: no such mode, or no world: {e}")
         if e.get("hidden", 0) < 1 or e.get("tokens", 0) < 1:
             raise ValueError(f"{where}: no width or no tokens")
         tuned = TunedInput(
@@ -1024,7 +909,7 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
             assert isinstance(second, AddAttnResRmsNormConfig), where
             picks[tuned] = AllReduceAddAttnResRmsNormSplitConfig(first, second)
     for name in TUNED_OPS:
-        for world in sorted(built.worlds):
+        for world in sorted({i.world for i in picks}):
             for mode in _MODES.values():
                 if not any(
                     i.op == name and i.world == world and i.mode == mode for i in picks
@@ -1280,7 +1165,7 @@ class HipCustomCommunicator:
             handle=handle,
             arch=arch,
             capacity=Capacity(
-                rows, cols, partials, staging, dict(zip(build_info().op_names, most))
+                rows, cols, partials, staging, dict(zip(get_args(Op), most))
             ),
             tuned_configs=tuned_configs,
         )

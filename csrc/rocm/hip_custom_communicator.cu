@@ -75,13 +75,6 @@ constexpr int exact = 0;
 constexpr int int4 = 1;
 }  // namespace Quantization
 
-// THE WAVE the kernels are compiled at: an ISA fact of the archs built (gfx9
-// runs 64-lane waves only; builds.py asserts every block whole waves), not a
-// query. Everything else about the device is asked at `open`
-// (DeviceProperties); which archs run is the build's (CMakeLists.txt) and the
-// tuned table's (a table an arch), not the host's.
-constexpr int kWaveSize = 64;
-
 // THE BUILD: a PACK is the widest load (global_load_dwordx4), the unit every
 // kernel loads, sums and stores, as in vLLM's and aiter's custom all-reduce;
 // the dtypes and worlds dispatch instantiates, and the check refuses the rest.
@@ -91,14 +84,6 @@ constexpr int kPackBytes = 16;
 constexpr std::array<at::ScalarType, 2> kDtypes = {at::ScalarType::Half,
                                                    at::ScalarType::BFloat16};
 constexpr std::array<int, 3> kWorlds = {2, 4, 8};
-
-// =============================================================================
-// THE FAULT SITES
-// =============================================================================
-
-// THE FAULT SITES' NAMES (common.cuh's Where, the status's `where`), for the
-// host's reports.
-constexpr int kWhereCount = 2;
 
 // =============================================================================
 // TYPES
@@ -121,15 +106,12 @@ enum class Error : int {
   grid_not_resident = 5,
   staging_too_small = 6,
   device_not_built = 7,
-  device_not_tuned = 8,
   weight_not_built = 9,
   no_such_kernel = 10,
-  threads_not_built = 11,
-  tile_not_built = 12,
+  not_built = 12,
   launch_out_of_range = 13,
   field_not_positive = 14,
   field_not_this_templates = 15,
-  waves_not_built = 16,
   inner_stride_not_one = 17,
   row_stride_not_packs = 18,
   no_such_quantization = 19,
@@ -151,8 +133,6 @@ enum class Error : int {
   ranks_disagree = 35,
   not_open = 36,
 };
-
-constexpr int kNumErrors = 37;
 
 // WHICH OP the caller asked for: an all-reduce, alone or with what it fuses, or
 // a norm alone on this rank's rows (the second kernel of an op Python
@@ -317,21 +297,6 @@ struct AddAttnResRmsNormBuildConfig {
   bool operator==(const AddAttnResRmsNormBuildConfig&) const = default;
 };
 
-// IN OpType'S ORDER: a build's index is its op.
-using BuildConfig =
-    std::variant<AllReduceBuildConfig, AllReduceRmsNormBuildConfig,
-                 AllReduceAddRmsNormBuildConfig,
-                 AllReduceAddAttnResRmsNormBuildConfig, RmsNormBuildConfig,
-                 AddRmsNormBuildConfig, AddAttnResRmsNormBuildConfig>;
-template <OpType OP>
-using build_t =
-    std::variant_alternative_t<static_cast<size_t>(OP), BuildConfig>;
-// A BUILD WITH AN ALGORITHM: every kernel's but a norm's on rows, whose one
-// algorithm the table names kRowsAlgorithm.
-template <typename B>
-concept HasAlgorithm = requires(B b) { b.algorithm; };
-constexpr std::string_view kRowsAlgorithm = "rows";
-
 // =============================================================================
 // THE COMMUNICATOR'S MEMORY
 // =============================================================================
@@ -363,120 +328,98 @@ constexpr std::string_view kRowsAlgorithm = "rows";
   } while (0)
 
 // =============================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it), its kernel,
-// what a call of it must be to run (which `build_info` hands Python's
-// `should`), and the builds its kernel is compiled at. What each runs at a size
-// is Python's (its tuned table), handed whole.
+// THE COMPILED KERNELS: every instance of every kernel, a row of its kernel's
+// table, which a launch looks its kernel up in.
 // =============================================================================
 
-// AN OP'S BUILDS, its BuildConfig each: what dispatch instantiates, what the
-// check accepts and what a tuner searches. The launch (the grid) is not a
-// build's: a config gives its own. tile_n counts the elements of a 16-bit
-// dtype, the only ones built. A build that spills shows in its code object (gp
-// report isa) and loses on the clock; none is ruled out by policy. GENERATED
-// FROM THE
-// TUNED TABLE (builds.py, at configure): each kernel's `kBuilds_<kernel>`, the
-// build half of every config the table lists (an INT4 config a build as any
-// other). The tune chooses them.
-#include "hip_custom_communicator_builds.inc"
-// EVERY KERNEL INSTANCE IS COMPILED IN ITS BUILD'S OWN FILE (builds.py):
-// declared here, so the launches below instantiate none of them in this file.
-#include "hip_custom_communicator_instances.inc"
+// A NORM ON ROWS' ONE ALGORITHM (the table's "rows"; its kernel has no
+// algorithm parameter).
+enum class RowsAlgorithm : int { rows };
 
-// A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly
-// these).
+// A COMPILED INSTANCE OF A KERNEL, a row of its table: the build it was
+// compiled at (a tuned config, its grid aside), the world (0 for a norm on
+// rows, which has none), its wave's lanes and its dtypes, which of the build's
+// instances it is (contiguous: the plain two-shots' contiguous walk; chunked: a
+// row wider than its tile; tail: an INT4 row with a short last group;
+// quantize_int4: what it moves), and its address. GENERATED (builds.py, at
+// configure), one table a kernel, `k<Kernel>Instances`: every row the table's
+// configs reach, so a config of the table is always a row, and a call finds its
+// kernel or is refused (not_built).
+template <typename ALGORITHM>
+struct Instance {
+  ALGORITHM algorithm;
+  int block_x, block_y, block_z, waves_per_eu, tile_m, tile_n, tile_k;
+  int quantization, pack_bytes;
+  int world, wave_size;
+  at::ScalarType dtype, weight_dtype;
+  bool contiguous, chunked, tail, quantize_int4;
+  void* kernel;
+};
+
+// EACH KERNEL'S TYPE at its dtypes, T the input's and W the weight's (a
+// kernel's parameters are the same at every build: any instance's type is every
+// instance's), what a launch casts a row's address to.
+template <typename T, typename W>
+using AllReduceKernel =
+    decltype(&all_reduce<AllReduceAlgorithm{}, false, T, 2, 1, 1, 64, 64, 16, 1,
+                         false, false>);
+template <typename T, typename W>
+using AllReduceRmsNormKernel =
+    decltype(&all_reduce_rms_norm<AllReduceRmsNormAlgorithm{}, false, T, W, 2,
+                                  1, 64, 64, 16, 1, false, false>);
+template <typename T, typename W>
+using AllReduceAddRmsNormKernel =
+    decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormAlgorithm{}, false, T,
+                                      W, 2, 1, 64, 64, 16, 1, false, false>);
+template <typename T, typename W>
+using AllReduceAddAttnResRmsNormKernel =
+    decltype(&all_reduce_add_attn_res_rms_norm<
+             AllReduceAddAttnResRmsNormAlgorithm{}, false, T, 2, 1, 1, 1, 64,
+             64, 16, 1, false, false>);
+template <typename T, typename W>
+using RmsNormRowsKernel =
+    decltype(&rms_norm_rows<T, W, 1, 1, 64, 64, 16, 1, false>);
+template <typename T, typename W>
+using AddRmsNormRowsKernel =
+    decltype(&add_rms_norm_rows<T, W, 1, 1, 64, 64, 16, 1, false>);
+template <typename T, typename W>
+using AddAttnResRmsNormRowsKernel =
+    decltype(&add_attn_res_rms_norm_rows<T, 1, 1, 1, 64, 64, 16, 1, false>);
+
+// EVERY KERNEL INSTANCE IS COMPILED IN ITS BUILD'S OWN FILE (builds.py):
+// declared here, so this file instantiates none of them; then the tables.
+#include "hip_custom_communicator_instances.inc"
+#include "hip_custom_communicator_builds.inc"
+
+// =============================================================================
+// THE OPS, in OpType's order: each one's name (as Python calls it) and its
+// weight's dtypes besides its input's.
+// =============================================================================
+
+// A NORM'S WEIGHT, besides its input's dtype: fp32.
 constexpr at::ScalarType kNormWeights[] = {at::ScalarType::Float};
 
 struct Op {
   OpType type;
   const char* name;
-  // Its kernel's name (the table's `kernel`).
-  const char* kernel;
-  // The dtypes its input may have.
-  std::span<const at::ScalarType> dtypes;
   // The dtypes its weight may have besides its input's; none for an op with no
   // weight.
   std::span<const at::ScalarType> weights;
-  // Whether its input is [rows, cols] as given (2-D), not any shape read as
-  // rows of its last dimension.
-  bool two_d;
-  // Its kernel's builds.
-  std::span<const BuildConfig> builds;
 };
-
-// AN OP, ITS NAME AND ITS KERNEL'S FROM TOKENS, so neither name can differ from
-// the enum's and the builds are its kernel's.
-#define HIP_CUSTOM_COMMUNICATOR_NAMED(o, k) OpType::o, #o, #k
-#define HIP_CUSTOM_COMMUNICATOR_BUILDS(k) kBuilds_##k
 
 constexpr Op kOps[] = {
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce, all_reduce),
-     kDtypes,
-     {},
-     true,
-     HIP_CUSTOM_COMMUNICATOR_BUILDS(all_reduce)},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm, all_reduce_rms_norm),
-     kDtypes, kNormWeights, true,
-     HIP_CUSTOM_COMMUNICATOR_BUILDS(all_reduce_rms_norm)},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm,
-                                   all_reduce_add_rms_norm),
-     kDtypes, kNormWeights, true,
-     HIP_CUSTOM_COMMUNICATOR_BUILDS(all_reduce_add_rms_norm)},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm,
-                                   all_reduce_add_attn_res_rms_norm),
-     kDtypes,
-     {},
-     true,
-     HIP_CUSTOM_COMMUNICATOR_BUILDS(all_reduce_add_attn_res_rms_norm)},
-    // THE NORMS ON THIS RANK'S ROWS (STANDARDS 3.2, *We win at the op level*):
-    // the second kernel of an op Python composes as two kernels of ours, our
-    // all-reduce and then this, on its own grid at its own occupancy.
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(rms_norm, rms_norm_rows), kDtypes,
-     kNormWeights, true, HIP_CUSTOM_COMMUNICATOR_BUILDS(rms_norm_rows)},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_rms_norm, add_rms_norm_rows), kDtypes,
-     kNormWeights, true, HIP_CUSTOM_COMMUNICATOR_BUILDS(add_rms_norm_rows)},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_attn_res_rms_norm,
-                                   add_attn_res_rms_norm_rows),
-     kDtypes,
-     {},
-     true,
-     HIP_CUSTOM_COMMUNICATOR_BUILDS(add_attn_res_rms_norm_rows)},
+    {OpType::all_reduce, "all_reduce", {}},
+    {OpType::all_reduce_rms_norm, "all_reduce_rms_norm", kNormWeights},
+    {OpType::all_reduce_add_rms_norm, "all_reduce_add_rms_norm", kNormWeights},
+    {OpType::all_reduce_add_attn_res_rms_norm,
+     "all_reduce_add_attn_res_rms_norm",
+     {}},
+    {OpType::rms_norm, "rms_norm", kNormWeights},
+    {OpType::add_rms_norm, "add_rms_norm", kNormWeights},
+    {OpType::add_attn_res_rms_norm, "add_attn_res_rms_norm", {}},
 };
 
-#undef HIP_CUSTOM_COMMUNICATOR_BUILDS
-#undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
-
-// AN INSTANCE OF AN OP'S KERNEL, every template argument a constant: its build
-// (B, as compiled: compiled_quantization), what the call picks (the world, the
-// dtypes, the layout's instance), and
-// THE MACHINE'S WAVE, the host's fact and no call's (HARDWARE), every kernel's
-// WAVE_SIZE. The template parameter of every launch (`kernel_pointer<I>`).
-template <typename B>
-struct Instance {
-  B build;
-  int world;
-  at::ScalarType dtype;
-  at::ScalarType weight_dtype;
-  bool contiguous;
-  bool chunked;
-  bool tail;
-  bool quantize_int4;
-  int wave_size = kWaveSize;
-};
-
-template <typename WRAPPED>
-struct type {
-  using t = WRAPPED;
-};
-
-template <int INT_VALUE>
-using constant = std::integral_constant<int, INT_VALUE>;
-
-template <auto LISTED_BUILD>
-struct build_constant {
-  static constexpr auto value = LISTED_BUILD;
-};
 
 // THE INPUT TABLES: where an exact pull reads every rank's input in place, so a
 // captured call copies nothing. A table is `world` addresses, one pointer its
@@ -583,10 +526,6 @@ using OpenWire =
                std::string, std::vector<int64_t>>;
 using GraphMetaWire = std::tuple<std::optional<int64_t>, std::vector<int64_t>,
                                  std::vector<int64_t>>;
-using BuildInfoWire =
-    std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
-               Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
-               Names, std::vector<int64_t>, Names>;
 // AN ERROR CODE ACROSS THE BOUNDARY: none when the call ran, else the Error's
 // number (a torch op returns no enum).
 using ErrorCode = std::optional<int64_t>;
@@ -597,20 +536,6 @@ using ErrorCode = std::optional<int64_t>;
 // =============================================================================
 
 namespace hip_custom_communicator {
-
-// A DTYPE BY THE NAME PYTHON'S BUILD INFO GIVES IT (its `_DTYPES`).
-constexpr const char* to_string(at::ScalarType d) {
-  switch (d) {
-    case at::ScalarType::Half:
-      return "f16";
-    case at::ScalarType::BFloat16:
-      return "bf16";
-    case at::ScalarType::Float:
-      return "f32";
-    default:
-      return "unknown";
-  }
-}
 
 // WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly
 // these.
@@ -627,147 +552,6 @@ constexpr bool dtype_built(at::ScalarType d) { return built_in(kDtypes, d); }
 constexpr bool world_built(int world) {
   return built_in(kWorlds, world);
 }  // numbered from 1
-
-constexpr const char* to_string(Where w) {
-  switch (w) {
-    case Where::start:
-      return "start";
-    case Where::peer_barrier:
-      return "peer_barrier";
-  }
-  return "?";
-}
-
-constexpr const char* to_string(Error e) {
-  switch (e) {
-    case Error::not_contiguous:
-      return "not_contiguous: the input is not contiguous";
-    case Error::dtype_not_built:
-      return "dtype_not_built: only float16 and bfloat16 are built";
-    case Error::world_not_built:
-      return "world_not_built: the world size is not 2, 4 or 8";
-    case Error::row_not_packs:
-      return "row_not_packs: the row is not whole packs of the config's "
-             "pack_bytes (a "
-             "build at a narrower pack takes it)";
-    case Error::partials_too_small:
-      return "partials_too_small: the two-shot's published sums, exact or "
-             "INT4, "
-             "exceed the partials";
-    case Error::grid_not_resident:
-      return "grid_not_resident: the grid exceeds the blocks the GPU holds "
-             "resident";
-    case Error::staging_too_small:
-      return "staging_too_small: the input this kernel publishes whole, exact "
-             "or INT4, exceeds the staging";
-    case Error::device_not_built:
-      return "device_not_built: this build holds no code for the device";
-    case Error::device_not_tuned:
-      return "device_not_tuned: the device is not the one select is calibrated "
-             "for";
-    case Error::weight_not_built:
-      return "weight_not_built: a norm's weight is in the call's dtype or fp32";
-    case Error::no_such_kernel:
-      return "no_such_kernel: the op has no kernel of that name and algorithm";
-    case Error::threads_not_built:
-      return "threads_not_built: no build of the template runs at that block "
-             "size";
-    case Error::waves_not_built:
-      return "waves_not_built: no build of the template at that block size has "
-             "those waves a EU";
-    case Error::tile_not_built:
-      return "tile_not_built: no build of the template has that TILE_M or "
-             "TILE_N";
-    case Error::launch_out_of_range:
-      return "launch_out_of_range: the grid is at least 1 and at most the "
-             "signals' "
-             "blocks (every block the device holds at once), over the one "
-             "dimension its "
-             "kernel indexes (x alone: y and z 1)";
-    case Error::field_not_positive:
-      return "field_not_positive: a forced config field is positive";
-    case Error::field_not_this_templates:
-      return "field_not_this_templates: a field its kernel does not have "
-             "(tile_k on "
-             "a kernel with no K, quantize_from_bytes on an exact build)";
-    case Error::inner_stride_not_one:
-      return "inner_stride_not_one: a buffer's innermost stride is not 1 (the "
-             "loads are packs)";
-    case Error::row_stride_not_packs:
-      return "row_stride_not_packs: a buffer's row stride is not whole packs "
-             "of the "
-             "config's pack_bytes (a build at a narrower pack takes it)";
-    case Error::no_such_quantization:
-      return "no_such_quantization: the quantization is exact or int4";
-    case Error::quantization_not_supported:
-      return "quantization_not_supported: INT4 is not supported for the "
-             "selected "
-             "kernel";
-    case Error::block_too_large:
-      return "block_too_large: the block has more threads than the compiled "
-             "kernel "
-             "takes (its launch bounds, hipFuncGetAttributes' "
-             "maxThreadsPerBlock)";
-    case Error::lds_too_large:
-      return "lds_too_large: the compiled kernel's LDS and the launch's "
-             "dynamic LDS "
-             "together are more than the device gives a block";
-    case Error::scratch_too_large:
-      return "scratch_too_large: the compiled kernel's scratch a lane is more "
-             "than "
-             "open's share of the device's scratch (hipExtLimitScratchMax) a "
-             "lane";
-    case Error::unfenced_too_small:
-      return "unfenced_too_small: a pushed one-shot's tile does not fit the "
-             "unfenced "
-             "region: a row of it past a slot's payload bytes, or its grid's "
-             "rows past a "
-             "bank's blocks (open's unfenced_slot_bytes, unfenced_blocks)";
-    case Error::pack_out_of_range:
-      return "pack_out_of_range: a config's pack_bytes is not 2, 4, 8 or 16 (a "
-             "load the "
-             "hardware has, up to its widest), or is less than an element of "
-             "the dtype";
-    case Error::hip_failed:
-      return "hip_failed: a HIP runtime call failed (an allocation, an IPC "
-             "handle, a copy, a "
-             "device query)";
-    case Error::not_on_device:
-      return "not_on_device: a tensor is not on the device";
-    case Error::shape_mismatch:
-      return "shape_mismatch: a tensor's shape is not the op's (an output or a "
-             "residual not the "
-             "input's, a weight not 1-D of the row, blocks not [tokens, "
-             "sources, hidden], "
-             "num_blocks past its sources)";
-    case Error::dtype_mismatch:
-      return "dtype_mismatch: the tensors' dtypes differ where the op takes "
-             "one";
-    case Error::not_aligned:
-      return "not_aligned: a weight or the blocks do not start at a pack";
-    case Error::inputs_overlap_outputs:
-      return "inputs_overlap_outputs: an input and an output share memory (not "
-             "as the same "
-             "tensor, where the op takes that)";
-    case Error::field_out_of_range:
-      return "field_out_of_range: a config field past an int";
-    case Error::view_past_region:
-      return "view_past_region: a view the launch would read or write ends "
-             "past its region "
-             "(the regions are sized from the largest call; a bug, refused "
-             "before it launches)";
-    case Error::tables_full:
-      return "tables_full: every input table slot is taken (a captured exact "
-             "pull a slot)";
-    case Error::ranks_disagree:
-      return "ranks_disagree: the ranks captured different numbers of in-place "
-             "launches";
-    case Error::not_open:
-      return "not_open: a call on no communicator state (closed, or never "
-             "opened)";
-  }
-  return "unknown";
-}
 
 // AN ALGORITHM'S PARTS, where a host decision needs only one: whether it is a
 // one-shot or a two-shot, and whether it pushes (only the plain all-reduce
@@ -801,87 +585,6 @@ constexpr int64_t volume(const Dim3& d) {
 
 // Whether `d` is x alone: y = z = 1, every kernel's today.
 constexpr bool x_alone(const Dim3& d) { return d.y == 1 && d.z == 1; }
-static_assert(build_t<OpType::all_reduce>::op == OpType::all_reduce &&
-                  build_t<OpType::all_reduce_rms_norm>::op ==
-                      OpType::all_reduce_rms_norm &&
-                  build_t<OpType::all_reduce_add_rms_norm>::op ==
-                      OpType::all_reduce_add_rms_norm &&
-                  build_t<OpType::all_reduce_add_attn_res_rms_norm>::op ==
-                      OpType::all_reduce_add_attn_res_rms_norm &&
-                  build_t<OpType::rms_norm>::op == OpType::rms_norm &&
-                  build_t<OpType::add_rms_norm>::op == OpType::add_rms_norm &&
-                  build_t<OpType::add_attn_res_rms_norm>::op ==
-                      OpType::add_attn_res_rms_norm,
-              "BuildConfig's alternatives are not in OpType's order");
-
-// THE FIELDS EVERY BUILD HAS. Its algorithm's name, as its kernel's
-// `algorithms` names it.
-constexpr std::string_view algorithm_name(const BuildConfig& b) {
-  return std::visit(
-      [](const auto& f) -> std::string_view {
-        if constexpr (HasAlgorithm<std::decay_t<decltype(f)>>) {
-          for (const auto& a : f.algorithms)
-            if (a.algorithm == f.algorithm) return a.name;
-          return "";
-        } else {
-          return kRowsAlgorithm;
-        }
-      },
-      b);
-}
-
-// Its algorithm's parts (is_one_shot, is_two_shot, is_push); a norm on rows is
-// none of them.
-constexpr bool is_one_shot(const BuildConfig& b) {
-  return std::visit(
-      [](const auto& f) {
-        if constexpr (HasAlgorithm<std::decay_t<decltype(f)>>)
-          return is_one_shot(f.algorithm);
-        else
-          return false;
-      },
-      b);
-}
-
-constexpr bool is_two_shot(const BuildConfig& b) {
-  return std::visit(
-      [](const auto& f) {
-        if constexpr (HasAlgorithm<std::decay_t<decltype(f)>>)
-          return is_two_shot(f.algorithm);
-        else
-          return false;
-      },
-      b);
-}
-
-constexpr bool is_push(const BuildConfig& b) {
-  return std::visit(
-      [](const auto& f) {
-        if constexpr (HasAlgorithm<std::decay_t<decltype(f)>>)
-          return is_push(f.algorithm);
-        else
-          return false;
-      },
-      b);
-}
-
-constexpr Dim3 block_of(const BuildConfig& b) {
-  return std::visit([](const auto& f) { return f.block; }, b);
-}
-
-constexpr int waves_of(const BuildConfig& b) {
-  return std::visit([](const auto& f) { return f.waves_per_eu; }, b);
-}
-
-// WHAT A BUILD'S INSTANCE IS COMPILED MOVING: its quantization, but an INT4
-// build at a pack narrower than the widest compiles its exact body (INT4's word
-// is a pack of 8 values, common.cuh's QUANTIZATION), which never runs: the call
-// is refused by name (quantization_not_supported), as an INT4 one-shot is.
-// builds.py's instances alike.
-template <typename B>
-constexpr int compiled_quantization(const B& b) {
-  return b.pack_bytes == kPackBytes ? b.quantization : Quantization::exact;
-}
 
 constexpr int elem_bytes(at::ScalarType d) {
   return d == at::ScalarType::Float ? 4 : 2;
@@ -995,7 +698,6 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 }
 
 constexpr const Op& op(OpType t) { return kOps[static_cast<int>(t)]; }
-constexpr const char* to_string(OpType t) { return op(t).name; }
 
 constexpr bool ops_in_order() {
   for (int i = 0; i < kNumOps; ++i)
@@ -1004,77 +706,6 @@ constexpr bool ops_in_order() {
 }
 
 static_assert(ops_in_order(), "kOps must list every OpType in its order");
-
-constexpr std::span<const BuildConfig> builds_of(OpType o) {
-  return op(o).builds;
-}
-
-constexpr bool every_op_built() {
-  for (const Op& o : kOps)
-    if (o.builds.empty()) return false;
-  return true;
-}
-
-static_assert(every_op_built(), "an op's kernel lists no builds");
-// EVERY BUILD OF AN OP IS ITS OWN TYPE (BuildConfig's index is its op).
-constexpr bool builds_their_ops() {
-  for (const Op& o : kOps)
-    for (const BuildConfig& b : o.builds)
-      if (std::visit([](const auto& f) { return f.op; }, b) != o.type)
-        return false;
-  return true;
-}
-
-static_assert(builds_their_ops(), "an op lists another op's build");
-
-// Whether op `o`'s kernel builds `b`.
-constexpr bool built(OpType o, const BuildConfig& b) {
-  for (const BuildConfig& listed : builds_of(o))
-    if (listed == b) return true;
-  return false;
-}
-
-// Whether two builds are of one op at one algorithm.
-constexpr bool same_algorithm(const BuildConfig& a, const BuildConfig& b) {
-  return a.index() == b.index() &&
-         std::visit(
-             [&b](const auto& f) {
-               using B = std::decay_t<decltype(f)>;
-               if constexpr (HasAlgorithm<B>)
-                 return f.algorithm == std::get<B>(b).algorithm;
-               else
-                 return true;
-             },
-             a);
-}
-
-// Whether any build of `o` is at `b`'s algorithm and block (and its waves a
-// EU): the check's names for a build that is not listed.
-constexpr bool built_at_block(OpType o, const BuildConfig& b) {
-  for (const BuildConfig& listed : builds_of(o))
-    if (same_algorithm(listed, b) && block_of(listed) == block_of(b))
-      return true;
-  return false;
-}
-
-constexpr bool built_at_waves(OpType o, const BuildConfig& b) {
-  for (const BuildConfig& listed : builds_of(o))
-    if (same_algorithm(listed, b) && block_of(listed) == block_of(b) &&
-        waves_of(listed) == waves_of(b))
-      return true;
-  return false;
-}
-
-// EVERY BUILD'S BLOCK IS x ALONE: every kernel indexes x alone (types.cuh's
-// Dim3), so a build with threads in y or z would launch threads it never uses.
-constexpr bool every_build_x_alone() {
-  for (const Op& o : kOps)
-    for (const BuildConfig& b : o.builds)
-      if (!x_alone(block_of(b))) return false;
-  return true;
-}
-
-static_assert(every_build_x_alone(), "a build's block indexes y or z");
 
 // =============================================================================
 // EACH OP'S KERNELS.
@@ -1225,7 +856,7 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
   // such build; INT4 AT A NARROWER PACK than the widest: the format's word is a
   // pack of 8 values (common.cuh's QUANTIZATION).
   const bool int4_build = build.quantization == Quantization::int4;
-  if constexpr (HasAlgorithm<B>) {
+  if constexpr (requires { build.algorithm; }) {
     if (int4_build &&
         ((!kPlain && is_one_shot(build.algorithm)) || pack != kPackBytes))
       return Error::quantization_not_supported;
@@ -1238,10 +869,7 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
     return Error::field_not_this_templates;
   // A BUILD THE KERNEL DOES NOT LIST, named by what differs: its block, its
   // waves, its tile.
-  if (!built_at_block(B::op, build)) return Error::threads_not_built;
-  if (!built_at_waves(B::op, build)) return Error::waves_not_built;
-  if (!built(B::op, build)) return Error::tile_not_built;
-  if constexpr (!HasAlgorithm<B>) {
+  if constexpr (!requires { build.algorithm; }) {
     return std::nullopt;  // a norm on rows reads no peer and no region
   } else {
     // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the call's
@@ -1292,197 +920,6 @@ constexpr std::optional<Error> weight_refused(OpType o, at::ScalarType dtype,
   for (const at::ScalarType w : op(o).weights)
     if (weight_dtype == w) return std::nullopt;
   return Error::weight_not_built;
-}
-
-// OVER THE BUILT LISTS (kWorlds, kDtypes), so what is compiled is what they
-// say.
-template <typename VISITOR, size_t... INDICES>
-bool by_world_in(int world, VISITOR& f, std::index_sequence<INDICES...>) {
-  constexpr auto& built = kWorlds;
-  return ((world == built[INDICES] && (f(constant<built[INDICES]>{}), true)) ||
-          ...);
-}
-
-template <typename VISITOR>
-bool by_world(int world, VISITOR&& f) {
-  return by_world_in(world, f, std::make_index_sequence<kWorlds.size()>{});
-}
-
-template <typename VISITOR, size_t... INDICES>
-bool by_dtype_in(at::ScalarType d, VISITOR& f,
-                 std::index_sequence<INDICES...>) {
-  constexpr auto& built = kDtypes;
-  return (
-      (d == built[INDICES] &&
-       (f(type<c10::impl::ScalarTypeToCPPTypeT<built[INDICES]>>{}), true)) ||
-      ...);
-}
-
-template <typename VISITOR>
-bool by_dtype(at::ScalarType d, VISITOR&& f) {
-  return by_dtype_in(d, f, std::make_index_sequence<kDtypes.size()>{});
-}
-
-// A norm's weight: T itself, or fp32.
-template <typename DTYPE, typename VISITOR>
-bool by_weight(at::ScalarType weight, at::ScalarType dtype, VISITOR&& f) {
-  if (weight == dtype) {
-    f(type<DTYPE>{});
-    return true;
-  }
-  if (weight == at::ScalarType::Float) {
-    f(type<float>{});
-    return true;
-  }
-  return false;
-}
-
-// AN OP'S BUILD, compiled in: the one of op OP's builds (kOps) `b` is, and only
-// those. f is handed it as build_constant<B>, B its op's build, every field a
-// constant expression.
-template <OpType OP, size_t BUILD_INDEX>
-constexpr build_t<OP> listed_build =
-    std::get<build_t<OP>>(builds_of(OP)[BUILD_INDEX]);
-template <OpType OP, typename VISITOR, size_t... INDICES>
-bool by_build_in(const BuildConfig& b, VISITOR& f,
-                 std::index_sequence<INDICES...>) {
-  return ((b == builds_of(OP)[INDICES] &&
-           (f(build_constant<listed_build<OP, INDICES>>{}), true)) ||
-          ...);
-}
-
-template <OpType OP, typename VISITOR>
-bool by_build(const BuildConfig& b, VISITOR&& f) {
-  return by_build_in<OP>(b, f,
-                         std::make_index_sequence<builds_of(OP).size()>{});
-}
-
-// OP `OP`'S INSTANCE for a call, compiled in: its build, the world, the dtypes,
-// and which of the build's instances the call runs (contiguous, chunked, with a
-// tail, quantizing). `f` is handed the Instance as its template argument, every
-// field a constant. Whether the build compiled that instance (a call validated
-// first always finds it).
-template <OpType OP, typename F>
-bool with_instance(const build_t<OP>& build, int world, at::ScalarType dtype,
-                   at::ScalarType weight_dtype, bool contiguous, bool chunked,
-                   bool tail, bool quantize_int4, F&& f) {
-  bool found = false;
-  by_world(world, [&](auto world_constant) {
-    by_dtype(dtype, [&](auto dtype_constant) {
-      using T = typename decltype(dtype_constant)::t;
-      // Only the norms instantiate a separate weight dtype.
-      const auto weight = [&](auto w) {
-        using W = typename decltype(w)::t;
-        by_build<OP>(BuildConfig{build}, [&](auto b) {
-          constexpr build_t<OP> B = decltype(b)::value;
-          constexpr int WORLD = decltype(world_constant)::value;
-          const auto layout = [&]<bool CONTIGUOUS, bool CHUNKED, bool TAIL,
-                                  bool QUANTIZE_INT4>() {
-            constexpr Instance<build_t<OP>> I = [=] {
-              build_t<OP> compiled = B;
-              compiled.quantization = compiled_quantization(B);
-              return Instance<build_t<OP>>{compiled,
-                                           WORLD,
-                                           c10::CppTypeToScalarType<T>::value,
-                                           c10::CppTypeToScalarType<W>::value,
-                                           CONTIGUOUS,
-                                           CHUNKED,
-                                           TAIL,
-                                           QUANTIZE_INT4};
-            }();
-            f.template operator()<I>();
-            found = true;
-          };
-          // THE INSTANCES a build has: contiguous or strided (the plain
-          // two-shots), chunked or not (the norms and AttnRes), with a tail or
-          // not (the INT4 two-shots), and the plain all-reduce's INT4 build
-          // quantizing (its INT4 body) or passing the call exact (its exact
-          // body); a fused op's INT4 build always quantizes.
-          constexpr bool kTwoShot = is_two_shot(BuildConfig{B});
-          const auto tailed = [&]<bool CONTIGUOUS, bool CHUNKED>() {
-            constexpr bool kInt4 =
-                compiled_quantization(B) == Quantization::int4;
-            if constexpr (kInt4 && OP == OpType::all_reduce) {
-              if (!quantize_int4)
-                layout.template operator()<CONTIGUOUS, CHUNKED, false, false>();
-              else if (tail)
-                layout.template operator()<CONTIGUOUS, CHUNKED, true, true>();
-              else
-                layout.template operator()<CONTIGUOUS, CHUNKED, false, true>();
-            } else if constexpr (kInt4 && kTwoShot) {
-              if (tail)
-                layout.template operator()<CONTIGUOUS, CHUNKED, true, true>();
-              else
-                layout.template operator()<CONTIGUOUS, CHUNKED, false, true>();
-            } else
-              layout.template operator()<CONTIGUOUS, CHUNKED, false, kInt4>();
-          };
-          if constexpr (OP == OpType::all_reduce && kTwoShot) {
-            if (contiguous)
-              tailed.template operator()<true, false>();
-            else
-              tailed.template operator()<false, false>();
-          } else if constexpr (OP != OpType::all_reduce) {
-            if (chunked)
-              tailed.template operator()<false, true>();
-            else
-              tailed.template operator()<false, false>();
-          } else
-            tailed.template operator()<false, false>();
-        });
-      };
-      if constexpr (OP == OpType::all_reduce_rms_norm ||
-                    OP == OpType::all_reduce_add_rms_norm ||
-                    OP == OpType::rms_norm || OP == OpType::add_rms_norm)
-        by_weight<T>(weight_dtype, dtype, weight);
-      else
-        weight(type<T>{});
-    });
-  });
-  return found;
-}
-
-// AN INSTANCE'S KERNEL: every kernel's template arguments, the one list of them
-// (builds.py reads it to write the instances).
-template <Instance I>
-const void* kernel_pointer() {
-  constexpr auto B = I.build;
-  using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-  using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-  if constexpr (B.op == OpType::all_reduce)
-    return reinterpret_cast<const void*>(
-        all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n,
-                   B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu,
-                   I.contiguous, I.tail>);
-  if constexpr (B.op == OpType::all_reduce_rms_norm)
-    return reinterpret_cast<const void*>(
-        all_reduce_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world,
-                            B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
-                            B.waves_per_eu, I.chunked, I.tail>);
-  if constexpr (B.op == OpType::rms_norm)
-    return reinterpret_cast<const void*>(
-        rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size,
-                      B.pack_bytes, B.waves_per_eu, I.chunked>);
-  if constexpr (B.op == OpType::all_reduce_add_rms_norm)
-    return reinterpret_cast<const void*>(
-        all_reduce_add_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world,
-                                B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
-                                B.waves_per_eu, I.chunked, I.tail>);
-  if constexpr (B.op == OpType::add_rms_norm)
-    return reinterpret_cast<const void*>(
-        add_rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size,
-                          B.pack_bytes, B.waves_per_eu, I.chunked>);
-  if constexpr (B.op == OpType::all_reduce_add_attn_res_rms_norm)
-    return reinterpret_cast<const void*>(
-        all_reduce_add_attn_res_rms_norm<B.algorithm, I.quantize_int4, T,
-                                         I.world, B.tile_m, B.tile_n, B.tile_k,
-                                         B.block.x, I.wave_size, B.pack_bytes,
-                                         B.waves_per_eu, I.chunked, I.tail>);
-  if constexpr (B.op == OpType::add_attn_res_rms_norm)
-    return reinterpret_cast<const void*>(
-        add_attn_res_rms_norm_rows<T, B.tile_m, B.tile_n, B.tile_k, B.block.x,
-                                   I.wave_size, B.pack_bytes, B.waves_per_eu,
-                                   I.chunked>);
 }
 
 // A LAUNCH'S INPUT TABLE (INPUT TABLES): eager, the input copied into this
@@ -1761,70 +1198,6 @@ std::optional<Error> attn_res_tensors(
 //    (or none) out.
 // =============================================================================
 
-// WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its
-// worlds, a pack's bytes, its ops, errors and fault places by name in their
-// enums' order (each error's name without its reason), which Python's `Op`,
-// `Error` and `Where` are held to, its templates, and each op's plain call,
-// which Python's `should` admits.
-BuildInfoWire hip_custom_communicator_build_info() {
-  using namespace hip_custom_communicator;
-  Names dtypes, ops, errors, where_names;
-  for (const at::ScalarType d : kDtypes) dtypes.push_back(to_string(d));
-  const std::vector<int64_t> worlds(kWorlds.begin(), kWorlds.end());
-  for (int i = 0; i < kNumOps; ++i)
-    ops.push_back(to_string(static_cast<OpType>(i)));
-  for (int i = 0; i < kNumErrors; ++i) {
-    const std::string s = to_string(static_cast<Error>(i));
-    errors.push_back(s.substr(0, s.find(':')));
-  }
-  for (int i = 1; i <= kWhereCount; ++i)
-    where_names.push_back(to_string(static_cast<Where>(i)));
-  // Each op's kernel, and its builds (what dispatch instantiates: the tuner's
-  // search space, each one a forcing can name), flat: a build's fields in
-  // `fields`' order, 0 where its op's BuildConfig has none (every field it has
-  // is set), its quantization its number; its block a field a dimension; and
-  // its algorithm's name, a build each (`algorithms`). The launch is not a
-  // build's: a forced call gives its own grid.
-  const Names fields = {"tile_m",       "tile_n",       "tile_k",
-                        "block_x",      "block_y",      "block_z",
-                        "waves_per_eu", "quantization", "pack_bytes"};
-  Names templates, template_ops, algorithms;
-  std::vector<int64_t> configs, counts;
-  for (const Op& o : kOps) {
-    templates.push_back(o.kernel);
-    template_ops.push_back(o.name);
-    for (const BuildConfig& b : o.builds) {
-      algorithms.emplace_back(algorithm_name(b));
-      std::visit(
-          [&](const auto& f) {
-            int64_t k = 1;  // a kernel with no K: its identity
-            if constexpr (requires { f.tile_k; }) k = f.tile_k;
-            configs.insert(configs.end(), {f.tile_m, f.tile_n, k, f.block.x,
-                                           f.block.y, f.block.z, f.waves_per_eu,
-                                           f.quantization, f.pack_bytes});
-          },
-          b);
-    }
-    counts.push_back(static_cast<int64_t>(o.builds.size()));
-  }
-  // EACH OP'S PLAIN CALL (kOps, config.cuh), in `ops`' order: its dtypes and
-  // its weight's besides its input's, flat, and four ints an op: those two
-  // counts and two_d. What a call may hold is a communicator's
-  // (`hip_custom_communicator_capacity`), not the build's.
-  Names op_dtypes, op_weights;
-  std::vector<int64_t> op_facts;
-  for (const Op& o : kOps) {
-    for (const at::ScalarType d : o.dtypes) op_dtypes.push_back(to_string(d));
-    for (const at::ScalarType d : o.weights) op_weights.push_back(to_string(d));
-    op_facts.insert(op_facts.end(),
-                    {static_cast<int64_t>(o.dtypes.size()),
-                     static_cast<int64_t>(o.weights.size()), o.two_d});
-  }
-  return {dtypes,      worlds,    kPackBytes,   ops,      errors,
-          where_names, templates, template_ops, fields,   configs,
-          counts,      op_dtypes, op_weights,   op_facts, algorithms};
-}
-
 // =============================================================================
 // THE STATE, AS A HANDLE: the CommsState, made by `open` and handed to Python
 // as its address (an int, as vLLM's custom all-reduce hands its own), passed
@@ -1863,13 +1236,11 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
       name.substr(0, name.find(':'));  // gfx950:sramecc+:xnack-
   if (hipSetDevice(static_cast<int>(device)) != hipSuccess)
     return {error_code(Error::hip_failed), 0, {}, "", {}};
+  // THE BUILD RUNS HERE where the device has our code object: a compiled
+  // kernel's attributes answer exactly then.
   hipFuncAttributes attrs;
-  const hipError_t found = hipFuncGetAttributes(
-      &attrs,
-      reinterpret_cast<const void*>(
-          all_reduce<AllReduceAlgorithm::one_shot_pull, false, c10::BFloat16, 2,
-                     1, kWaveSize * traits<c10::BFloat16, kPackBytes>::N,
-                     kWaveSize, kWaveSize, kPackBytes, 1, false, false>));
+  const hipError_t found =
+      hipFuncGetAttributes(&attrs, kAllReduceInstances[0].kernel);
   (void)hipGetLastError();
   if (found != hipSuccess)
     return {error_code(Error::device_not_built), 0, {}, "", {}};
@@ -2369,22 +1740,6 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (input_stride_m * e % pack_bytes != 0 ||
       output_stride_m * e % pack_bytes != 0)
     return error_code(Error::row_stride_not_packs);
-  // A BUILD THE KERNEL LISTS, named by what differs: its block, its waves, its
-  // tile.
-  const AllReduceBuildConfig build{
-      .algorithm = algorithm,
-      .block = block,
-      .waves_per_eu = static_cast<int>(waves_per_eu),
-      .tile_m = static_cast<int>(tile_m),
-      .tile_n = static_cast<int>(tile_n),
-      .quantization = int4_config ? Quantization::int4 : Quantization::exact,
-      .pack_bytes = static_cast<int>(pack_bytes)};
-  if (!built_at_block(OpType::all_reduce, build))
-    return error_code(Error::threads_not_built);
-  if (!built_at_waves(OpType::all_reduce, build))
-    return error_code(Error::waves_not_built);
-  if (!built(OpType::all_reduce, build))
-    return error_code(Error::tile_not_built);
   // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization
   // is int4 and the call's bytes reach its quantize_from_bytes, else exact (the
   // kernel's one template parameter).
@@ -2398,11 +1753,23 @@ ErrorCode hip_custom_communicator_all_reduce(
                           output_stride_m == n * output_stride_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::all_reduce>(
-          build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail,
-          quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this config, on this device, for this
+  // call (builds.py's kAllReduceInstances, a row each); a config the table did
+  // not build is refused here.
+  for (const auto& i : kAllReduceInstances)
+    if (i.algorithm == algorithm && i.block_x == block_x &&
+        i.block_y == block_y && i.block_z == block_z &&
+        i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
+        i.tile_n == tile_n &&
+        i.quantization ==
+            (int4_config ? Quantization::int4 : Quantization::exact) &&
+        i.pack_bytes == pack_bytes && i.world == s.world &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.contiguous == contiguous && i.tail == tail &&
+        i.quantize_int4 == quantize_int4)
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
   // and the LDS at the launch; the scratch only when the dispatch runs,
   // aborting the queue and the process with it (the tune's crashes, 2026-10-24:
@@ -2589,44 +1956,35 @@ ErrorCode hip_custom_communicator_all_reduce(
     }
     peer_inputs_size = s.world, peer_inputs_stride_n = 1;
   }
-  with_instance<OpType::all_reduce>(
-      build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail,
-      quantize_int4, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n,
-                   B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu,
-                   I.contiguous, I.tail>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                reinterpret_cast<const T* const*>(peer_inputs),
-                peer_inputs_size, peer_inputs_stride_m, peer_inputs_stride_n,
-                static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
-                s.world, partials_stride_m, partials_stride_n,
-                static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n),
-                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-                staging_stride_n, static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n),
-                s.symmetric.unfenced_ptr_array, s.world, unfenced_stride_slot,
-                unfenced_stride_m, unfenced_stride_n,
-                static_cast<int>(unfenced_size_slot),
-                static_cast<int>(unfenced_size_m),
-                static_cast<int>(unfenced_size_n), s.unfenced_epochs,
-                s.unfenced_epoch_words, int64_t{1},
-                static_cast<int>(s.symmetric.unfenced_blocks),
-                static_cast<int>(s.unfenced_epoch_words),
-                s.symmetric.signals_ptr_array, s.world,
-                s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-                int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
-                s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
-                s.timeout_ticks);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
+        peer_inputs_stride_m, peer_inputs_stride_n, static_cast<T*>(output_ptr),
+        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+        static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
+        s.world, partials_stride_m, partials_stride_n,
+        static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
+        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+        staging_stride_n, static_cast<int>(staging_size_m),
+        static_cast<int>(staging_size_n), s.symmetric.unfenced_ptr_array,
+        s.world, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
+        static_cast<int>(unfenced_size_n), s.unfenced_epochs,
+        s.unfenced_epoch_words, int64_t{1},
+        static_cast<int>(s.symmetric.unfenced_blocks),
+        static_cast<int>(s.unfenced_epoch_words), s.symmetric.signals_ptr_array,
+        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
+  };
+  if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -2716,19 +2074,28 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
                   (n * elem_bytes(dtype))
             : 0;
   const int shared_memory_bytes = 0;
-  const bool contiguous = input_stride_m == n * input_stride_n &&
-                          output_stride_m == n * output_stride_n;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = build.quantization == Quantization::int4 &&
                     int4_tail(algorithm, m, n, s.world);
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::all_reduce_rms_norm>(
-          build, s.world, dtype, weight_dtype, contiguous, chunked, tail,
-          /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kAllReduceRmsNormInstances, a row each).
+  for (const auto& i : kAllReduceRmsNormInstances)
+    if (i.algorithm == build.algorithm && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == 1 &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == s.world &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == weight_dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == tail &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, true))
     return error_code(e);
@@ -2770,37 +2137,35 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
       return error_code(e);
   const int table_size = in_place ? s.world : 0;
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
-  with_instance<OpType::all_reduce_rms_norm>(
-      build, s.world, dtype, weight_dtype, contiguous, chunked, tail,
-      /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        all_reduce_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world,
-                            B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
-                            B.waves_per_eu, I.chunked, I.tail>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                reinterpret_cast<const T* const*>(table), table_size,
-                table_stride_m, table_stride_n,
-                static_cast<const W*>(weight_ptr), weight_stride_n,
-                static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-                output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
-                s.world, partials_stride_m, partials_stride_n,
-                static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n),
-                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-                staging_stride_n, static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
-                int64_t{s.world}, s.status_device, int64_t{1},
-                int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed = reinterpret_cast<AllReduceRmsNormKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        reinterpret_cast<const T* const*>(table), table_size, table_stride_m,
+        table_stride_n, static_cast<const W*>(weight_ptr), weight_stride_n,
+        static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
+        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+        static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
+        s.world, partials_stride_m, partials_stride_n,
+        static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
+        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+        staging_stride_n, static_cast<int>(staging_size_m),
+        static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
+  };
+  if (dtype == at::ScalarType::BFloat16 &&
+      weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::BFloat16, float>();
+  else if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else if (weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::Half, float>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -2920,8 +2285,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
                   (partials_stride_m * elem_bytes(dtype))
             : 0;
   const int shared_memory_bytes = 0;
-  const bool contiguous = input_stride_m == n * input_stride_n &&
-                          output_stride_m == n * output_stride_n;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
@@ -2932,12 +2295,23 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   if (algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull && !scale_slot &&
       (m + s.world - 1) / s.world > s.max_rows)
     return error_code(Error::partials_too_small);
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::all_reduce_add_rms_norm>(
-          build, s.world, dtype, weight_dtype, contiguous, chunked, tail,
-          /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kAllReduceAddRmsNormInstances, a row each).
+  for (const auto& i : kAllReduceAddRmsNormInstances)
+    if (i.algorithm == build.algorithm && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == 1 &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == s.world &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == weight_dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == tail &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, true))
     return error_code(e);
@@ -2984,45 +2358,43 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       return error_code(e);
   const int table_size = in_place ? s.world : 0;
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
-  with_instance<OpType::all_reduce_add_rms_norm>(
-      build, s.world, dtype, weight_dtype, contiguous, chunked, tail,
-      /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        all_reduce_add_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world,
-                                B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
-                                B.waves_per_eu, I.chunked, I.tail>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                reinterpret_cast<const T* const*>(table), table_size,
-                table_stride_m, table_stride_n,
-                static_cast<const T*>(residual_ptr), residual_stride_m,
-                residual_stride_n, static_cast<int>(residual_size_m),
-                static_cast<int>(residual_size_n),
-                static_cast<const W*>(weight_ptr), weight_stride_n,
-                static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-                output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n),
-                static_cast<T*>(residual_output_ptr), residual_output_stride_m,
-                residual_output_stride_n,
-                static_cast<int>(residual_output_size_m),
-                static_cast<int>(residual_output_size_n),
-                s.symmetric.partials_ptr_array, s.world, partials_stride_m,
-                partials_stride_n, static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
-                s.world, scales_stride_m, static_cast<int>(scales_size_m),
-                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-                staging_stride_n, static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
-                int64_t{s.world}, s.status_device, int64_t{1},
-                int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed =
+        reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        reinterpret_cast<const T* const*>(table), table_size, table_stride_m,
+        table_stride_n, static_cast<const T*>(residual_ptr), residual_stride_m,
+        residual_stride_n, static_cast<int>(residual_size_m),
+        static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
+        weight_stride_n, static_cast<int>(weight_size_n),
+        static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+        static_cast<T*>(residual_output_ptr), residual_output_stride_m,
+        residual_output_stride_n, static_cast<int>(residual_output_size_m),
+        static_cast<int>(residual_output_size_n),
+        s.symmetric.partials_ptr_array, s.world, partials_stride_m,
+        partials_stride_n, static_cast<int>(partials_size_m),
+        static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
+        s.world, scales_stride_m, static_cast<int>(scales_size_m),
+        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+        staging_stride_n, static_cast<int>(staging_size_m),
+        static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
+  };
+  if (dtype == at::ScalarType::BFloat16 &&
+      weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::BFloat16, float>();
+  else if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else if (weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::Half, float>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -3171,19 +2543,28 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       n > build.tile_n
           ? static_cast<int>(build.tile_m * (num_blocks + 1) * sizeof(float))
           : 0;
-  const bool contiguous = input_stride_m == n * input_stride_n &&
-                          output_stride_m == n * output_stride_n;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = build.quantization == Quantization::int4 &&
                     int4_tail(algorithm, m, n, s.world);
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::all_reduce_add_attn_res_rms_norm>(
-          build, s.world, dtype, dtype, contiguous, chunked, tail,
-          /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kAllReduceAddAttnResRmsNormInstances, a row each).
+  for (const auto& i : kAllReduceAddAttnResRmsNormInstances)
+    if (i.algorithm == build.algorithm && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == build.tile_k &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == s.world &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == tail &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, true))
     return error_code(e);
@@ -3225,58 +2606,48 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       return error_code(e);
   const int table_size = in_place ? s.world : 0;
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
-  with_instance<OpType::all_reduce_add_attn_res_rms_norm>(
-      build, s.world, dtype, dtype, contiguous, chunked, tail,
-      /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        all_reduce_add_attn_res_rms_norm<B.algorithm, I.quantize_int4, T,
-                                         I.world, B.tile_m, B.tile_n, B.tile_k,
-                                         B.block.x, I.wave_size, B.pack_bytes,
-                                         B.waves_per_eu, I.chunked, I.tail>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                reinterpret_cast<const T* const*>(table), table_size,
-                table_stride_m, table_stride_n,
-                static_cast<const T*>(prefix_ptr), prefix_stride_m,
-                prefix_stride_n, static_cast<int>(prefix_size_m),
-                static_cast<int>(prefix_size_n),
-                static_cast<const T*>(blocks_ptr), blocks_stride_m,
-                blocks_stride_r, blocks_stride_n,
-                static_cast<int>(blocks_size_m),
-                static_cast<int>(blocks_size_r),
-                static_cast<int>(blocks_size_n),
-                static_cast<const T*>(norm_weight_ptr), norm_weight_stride_n,
-                static_cast<int>(norm_weight_size_n),
-                static_cast<const T*>(qk_weight_ptr), qk_weight_stride_n,
-                static_cast<int>(qk_weight_size_n),
-                static_cast<const T*>(output_norm_weight_ptr),
-                output_norm_weight_stride_n,
-                static_cast<int>(output_norm_weight_size_n),
-                static_cast<T*>(prefix_output_ptr), prefix_output_stride_m,
-                prefix_output_stride_n, static_cast<int>(prefix_output_size_m),
-                static_cast<int>(prefix_output_size_n),
-                static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n),
-                static_cast<T*>(block_output_ptr), block_output_stride_m,
-                block_output_stride_n, static_cast<int>(block_output_size_m),
-                static_cast<int>(block_output_size_n),
-                s.symmetric.partials_ptr_array, s.world, partials_stride_m,
-                partials_stride_n, static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n),
-                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-                staging_stride_n, static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
-                int64_t{s.world}, s.status_device, int64_t{1},
-                int64_t{kStatusFields}, s.rank, s.timeout_ticks, num_blocks,
-                eps, output_eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed =
+        reinterpret_cast<AllReduceAddAttnResRmsNormKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        reinterpret_cast<const T* const*>(table), table_size, table_stride_m,
+        table_stride_n, static_cast<const T*>(prefix_ptr), prefix_stride_m,
+        prefix_stride_n, static_cast<int>(prefix_size_m),
+        static_cast<int>(prefix_size_n), static_cast<const T*>(blocks_ptr),
+        blocks_stride_m, blocks_stride_r, blocks_stride_n,
+        static_cast<int>(blocks_size_m), static_cast<int>(blocks_size_r),
+        static_cast<int>(blocks_size_n), static_cast<const T*>(norm_weight_ptr),
+        norm_weight_stride_n, static_cast<int>(norm_weight_size_n),
+        static_cast<const T*>(qk_weight_ptr), qk_weight_stride_n,
+        static_cast<int>(qk_weight_size_n),
+        static_cast<const T*>(output_norm_weight_ptr),
+        output_norm_weight_stride_n,
+        static_cast<int>(output_norm_weight_size_n),
+        static_cast<T*>(prefix_output_ptr), prefix_output_stride_m,
+        prefix_output_stride_n, static_cast<int>(prefix_output_size_m),
+        static_cast<int>(prefix_output_size_n), static_cast<T*>(output_ptr),
+        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+        static_cast<int>(output_size_n), static_cast<T*>(block_output_ptr),
+        block_output_stride_m, block_output_stride_n,
+        static_cast<int>(block_output_size_m),
+        static_cast<int>(block_output_size_n), s.symmetric.partials_ptr_array,
+        s.world, partials_stride_m, partials_stride_n,
+        static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
+        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+        staging_stride_n, static_cast<int>(staging_size_m),
+        static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, num_blocks,
+        eps, output_eps);
+  };
+  if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -3357,36 +2728,49 @@ ErrorCode hip_custom_communicator_rms_norm(
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::rms_norm>(
-          build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked,
-          /*tail=*/false, /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kRmsNormRowsInstances, a row each).
+  for (const auto& i : kRmsNormRowsInstances)
+    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == 1 &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == 0 &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == weight_dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == false &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, false))
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
   // ----
-  with_instance<OpType::rms_norm>(
-      build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked,
-      /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size,
-                      B.pack_bytes, B.waves_per_eu, I.chunked>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                static_cast<const W*>(weight_ptr), weight_stride_n,
-                static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-                output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n), eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed = reinterpret_cast<RmsNormRowsKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const W*>(weight_ptr), weight_stride_n,
+        static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
+        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+        static_cast<int>(output_size_n), eps);
+  };
+  if (dtype == at::ScalarType::BFloat16 &&
+      weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::BFloat16, float>();
+  else if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else if (weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::Half, float>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -3481,43 +2865,54 @@ ErrorCode hip_custom_communicator_add_rms_norm(
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::add_rms_norm>(
-          build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked,
-          /*tail=*/false, /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kAddRmsNormRowsInstances, a row each).
+  for (const auto& i : kAddRmsNormRowsInstances)
+    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == 1 &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == 0 &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == weight_dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == false &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, false))
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
   // ----
-  with_instance<OpType::add_rms_norm>(
-      build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked,
-      /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        using W = c10::impl::ScalarTypeToCPPTypeT<I.weight_dtype>;
-        add_rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size,
-                          B.pack_bytes, B.waves_per_eu, I.chunked>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                static_cast<const T*>(residual_ptr), residual_stride_m,
-                residual_stride_n, static_cast<int>(residual_size_m),
-                static_cast<int>(residual_size_n),
-                static_cast<const W*>(weight_ptr), weight_stride_n,
-                static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-                output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n),
-                static_cast<T*>(residual_output_ptr), residual_output_stride_m,
-                residual_output_stride_n,
-                static_cast<int>(residual_output_size_m),
-                static_cast<int>(residual_output_size_n), eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed = reinterpret_cast<AddRmsNormRowsKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const T*>(residual_ptr), residual_stride_m,
+        residual_stride_n, static_cast<int>(residual_size_m),
+        static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
+        weight_stride_n, static_cast<int>(weight_size_n),
+        static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+        static_cast<T*>(residual_output_ptr), residual_output_stride_m,
+        residual_output_stride_n, static_cast<int>(residual_output_size_m),
+        static_cast<int>(residual_output_size_n), eps);
+  };
+  if (dtype == at::ScalarType::BFloat16 &&
+      weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::BFloat16, float>();
+  else if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else if (weight_dtype == at::ScalarType::Float)
+    launch.template operator()<c10::Half, float>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
@@ -3656,56 +3051,61 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
                  : 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
-  const void* kernel = nullptr;
-  if (!with_instance<OpType::add_attn_res_rms_norm>(
-          build, s.world, dtype, dtype, /*contiguous=*/false, chunked,
-          /*tail=*/false, /*quantize_int4=*/false,
-          [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
-    return error_code(Error::tile_not_built);
+  void* kernel = nullptr;
+  // THE INSTANCE: the kernel compiled at this build, on this device, for this
+  // call (builds.py's kAddAttnResRmsNormRowsInstances, a row each).
+  for (const auto& i : kAddAttnResRmsNormRowsInstances)
+    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
+        i.block_y == build.block.y && i.block_z == build.block.z &&
+        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
+        i.tile_n == build.tile_n && i.tile_k == build.tile_k &&
+        i.quantization == build.quantization &&
+        i.pack_bytes == build.pack_bytes && i.world == 0 &&
+        i.wave_size == s.device.wave_size && i.dtype == dtype &&
+        i.weight_dtype == dtype && i.contiguous == false &&
+        i.chunked == chunked && i.tail == false &&
+        i.quantize_int4 == (build.quantization == Quantization::int4 &&
+                            build.pack_bytes == kPackBytes))
+      kernel = i.kernel;
+  if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
           check_kernel(s, kernel, grid, block, shared_memory_bytes, false))
     return error_code(e);
 
   // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
   // ----
-  with_instance<OpType::add_attn_res_rms_norm>(
-      build, s.world, dtype, dtype, /*contiguous=*/false, chunked,
-      /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-        constexpr auto B = I.build;
-        using T = c10::impl::ScalarTypeToCPPTypeT<I.dtype>;
-        add_attn_res_rms_norm_rows<T, B.tile_m, B.tile_n, B.tile_k, B.block.x,
-                                   I.wave_size, B.pack_bytes, B.waves_per_eu,
-                                   I.chunked>
-            <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
-                static_cast<const T*>(input_ptr), input_stride_m,
-                input_stride_n, static_cast<int>(input_size_m),
-                static_cast<int>(input_size_n),
-                static_cast<const T*>(prefix_ptr), prefix_stride_m,
-                prefix_stride_n, static_cast<int>(prefix_size_m),
-                static_cast<int>(prefix_size_n),
-                static_cast<const T*>(blocks_ptr), blocks_stride_m,
-                blocks_stride_r, blocks_stride_n,
-                static_cast<int>(blocks_size_m),
-                static_cast<int>(blocks_size_r),
-                static_cast<int>(blocks_size_n),
-                static_cast<const T*>(norm_weight_ptr), norm_weight_stride_n,
-                static_cast<int>(norm_weight_size_n),
-                static_cast<const T*>(qk_weight_ptr), qk_weight_stride_n,
-                static_cast<int>(qk_weight_size_n),
-                static_cast<const T*>(output_norm_weight_ptr),
-                output_norm_weight_stride_n,
-                static_cast<int>(output_norm_weight_size_n),
-                static_cast<T*>(prefix_output_ptr), prefix_output_stride_m,
-                prefix_output_stride_n, static_cast<int>(prefix_output_size_m),
-                static_cast<int>(prefix_output_size_n),
-                static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
-                static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n),
-                static_cast<T*>(block_output_ptr), block_output_stride_m,
-                block_output_stride_n, static_cast<int>(block_output_size_m),
-                static_cast<int>(block_output_size_n), num_blocks, eps,
-                output_eps);
-      });
+  // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  const auto launch = [&]<typename T, typename W>() {
+    const auto typed =
+        reinterpret_cast<AddAttnResRmsNormRowsKernel<T, W>>(kernel);
+    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const T*>(prefix_ptr), prefix_stride_m, prefix_stride_n,
+        static_cast<int>(prefix_size_m), static_cast<int>(prefix_size_n),
+        static_cast<const T*>(blocks_ptr), blocks_stride_m, blocks_stride_r,
+        blocks_stride_n, static_cast<int>(blocks_size_m),
+        static_cast<int>(blocks_size_r), static_cast<int>(blocks_size_n),
+        static_cast<const T*>(norm_weight_ptr), norm_weight_stride_n,
+        static_cast<int>(norm_weight_size_n),
+        static_cast<const T*>(qk_weight_ptr), qk_weight_stride_n,
+        static_cast<int>(qk_weight_size_n),
+        static_cast<const T*>(output_norm_weight_ptr),
+        output_norm_weight_stride_n,
+        static_cast<int>(output_norm_weight_size_n),
+        static_cast<T*>(prefix_output_ptr), prefix_output_stride_m,
+        prefix_output_stride_n, static_cast<int>(prefix_output_size_m),
+        static_cast<int>(prefix_output_size_n), static_cast<T*>(output_ptr),
+        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
+        static_cast<int>(output_size_n), static_cast<T*>(block_output_ptr),
+        block_output_stride_m, block_output_stride_n,
+        static_cast<int>(block_output_size_m),
+        static_cast<int>(block_output_size_n), num_blocks, eps, output_eps);
+  };
+  if (dtype == at::ScalarType::BFloat16)
+    launch.template operator()<c10::BFloat16, c10::BFloat16>();
+  else
+    launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;

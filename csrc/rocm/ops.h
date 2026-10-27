@@ -58,21 +58,7 @@ void paged_attention(
 // connected to its peers, its captured inputs registered, closed and freed; and
 // each op once, on the state, its tensors and values, then its config's fields
 // as plain values. EVERY ERROR IS A VALUE: each returns the Error's number it
-// was refused for, or none (hip_custom_communicator.cu); none raises. The
-// build's dtypes by name, its worlds, a pack's bytes, its ops', errors' and
-// fault places' names in their enums' order, and each op's kernel's name, op
-// and BuildConfigs (flat, a build's fields in the names' order, 0 where its
-// op's BuildConfig has none, with each op's count), and each op's plain call
-// (its dtypes and its weight's besides its input's, flat, and four ints an op),
-// and each build's algorithm by name.
-std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
-           std::vector<std::string>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<std::string>,
-           std::vector<int64_t>, std::vector<int64_t>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<int64_t>,
-           std::vector<std::string>>
-hip_custom_communicator_build_info();
+// was refused for, or none (hip_custom_communicator.cu); none raises.
 std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,
            std::vector<int64_t>>
 hip_custom_communicator_open(int64_t rank, int64_t world, int64_t device,
