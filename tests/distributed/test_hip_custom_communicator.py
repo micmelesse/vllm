@@ -548,15 +548,16 @@ def tuned_table_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, p
             )
             assert not comm.disabled, comm.lifecycle
             try:
-                for op in [
-                    "all_reduce",
-                    "all_reduce_rms_norm",
-                    "all_reduce_add_rms_norm",
-                    "all_reduce_add_attn_res_rms_norm",
+                # The norm op's picks with a residual and without.
+                for op, residual in [
+                    ("all_reduce", None),
+                    ("all_reduce_add_rms_norm", False),
+                    ("all_reduce_add_rms_norm", True),
+                    ("all_reduce_add_attn_res_rms_norm", None),
                 ]:
                     for num_tokens in [1, MAX_TOKENS]:
-                        launches = comm.tuned(op, num_tokens, HIDDEN)
-                        assert launches, (op, quantization, num_tokens)
+                        launches = comm.tuned(op, num_tokens, HIDDEN, residual)
+                        assert launches, (op, residual, quantization, num_tokens)
             finally:
                 comm.close()
 

@@ -4,7 +4,8 @@
 """THE BUILDS, FROM THE TUNED TABLES: what the compile instantiates is the build half
 of every config the tables of the archs built list (`hip_custom_communicator.json`, a
 table an arch: its `configs`, each its op, its `kernel`, its `algorithm`, its block,
-waves, tile, quantization and pack; the grid is the launch's, never compiled), each
+waves, tile, quantization and pack, and a norm kernel's `residual`; the grid is the
+launch's, never compiled), each
 kernel's builds in the order the tables first name them. THE BUILD MAKES WHAT IT IS
 TOLD (Michael, October 25): nothing is left out and nothing added; what an algorithm
 cannot do at a call is refused by name at the call (`hip_custom_communicator.cu`),
@@ -64,14 +65,18 @@ QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
 # table's "rows" (its own enum in the host).
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
-    "all_reduce_rms_norm": "AllReduceRmsNormKernelAlgorithm",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormKernelAlgorithm",
     "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormAlgorithm",
-    "rms_norm": "RmsNormAlgorithm",
     "add_rms_norm": "AddRmsNormAlgorithm",
     "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
 }
-# EACH KERNEL'S TEMPLATE PARAMETERS, in its template's order (kernels/*.cuh): a build
+# THE NORM KERNELS' TEMPLATE WITHOUT A RESIDUAL: a norm kernel is two templates, by a
+# build's `residual`, the add-norm (its own name) or this, the norm.
+NO_RESIDUAL_TEMPLATES = {
+    "all_reduce_add_rms_norm": "all_reduce_rms_norm",
+    "add_rms_norm": "rms_norm",
+}
+# EACH TEMPLATE'S PARAMETERS, in its order (kernels/*.cuh): a build
 # field, an instance's (world, wave_size, contiguous, chunked, tail, quantize_int4),
 # or T and W, the input's and the weight's types.
 TEMPLATE_ARGS = {
@@ -126,11 +131,20 @@ class Build:
     tile_k: int
     quantization: str
     pack_bytes: int
+    residual: bool
+
+    def template_name(self) -> str:
+        """Its kernel's template: a norm kernel's by the residual (the add-norm with
+        one, else NO_RESIDUAL_TEMPLATES'), any other kernel's its own."""
+        if self.residual:
+            return self.kernel
+        return NO_RESIDUAL_TEMPLATES.get(self.kernel, self.kernel)
 
     def file_name(self) -> str:
         """The .hip file its instances are compiled in, named by the build."""
         return (
-            f"hip_custom_communicator_{self.kernel}_{self.algorithm}__{self.block_x}x"
+            f"hip_custom_communicator_{self.template_name()}_{self.algorithm}__"
+            f"{self.block_x}x"
             f"{self.block_y}x{self.block_z}_w{self.waves_per_eu}_t{self.tile_m}x"
             f"{self.tile_n}x{self.tile_k}_{self.quantization}_p{self.pack_bytes}.hip"
         )
@@ -171,8 +185,8 @@ class Instance:
             "chunked": str(self.chunked).lower(),
             "tail": str(self.tail).lower(),
         }
-        args = ", ".join(value[a] for a in TEMPLATE_ARGS[b.kernel].split())
-        return f"{b.kernel}<{args}>"
+        args = ", ".join(value[a] for a in TEMPLATE_ARGS[b.template_name()].split())
+        return f"{b.template_name()}<{args}>"
 
 
 @dataclass(frozen=True)
@@ -201,17 +215,25 @@ def parse_args(argv: list[str]) -> Command:
 
 def parse_table(path: Path) -> dict[str, list[Build]]:
     """EACH ARCH'S BUILDS in the tuned tables' file at `path`, in the order its configs
-    name them. A config of a kernel this file does not know, or with a tile_k where its
-    kernel has no K, is refused."""
+    name them. A config of a kernel this file does not know, a norm kernel's without
+    its `residual` or another kernel's with one, or with a tile_k where its template
+    has no K, is refused."""
     out: dict[str, list[Build]] = {}
     for arch, table in json.loads(path.read_text()).items():
         builds = out.setdefault(arch, [])
         for config in table["configs"]:
             kernel = config["kernel"]
-            if kernel not in TEMPLATE_ARGS:
+            if kernel not in ALGORITHM_ENUMS:
                 raise SystemExit(f"{path}: {arch}: no kernel {kernel}")
-            build = Build(kernel, *(config[f] for f in FIELDS))
-            if "tile_k" not in TEMPLATE_ARGS[kernel].split() and build.tile_k != 1:
+            if ("residual" in config) != (kernel in NO_RESIDUAL_TEMPLATES):
+                raise SystemExit(f"{path}: {arch}: {kernel}: residual is a norm's")
+            build = Build(
+                kernel,
+                *(config[f] for f in FIELDS),
+                residual=config.get("residual", False),
+            )
+            params = TEMPLATE_ARGS[build.template_name()].split()
+            if "tile_k" not in params and build.tile_k != 1:
                 raise SystemExit(f"{path}: {arch}: {build}: its kernel has no K")
             if build not in builds:
                 builds.append(build)
@@ -225,7 +247,7 @@ def instances(build: Build) -> list[Instance]:
     not (an INT4 two-shot), and the plain all-reduce's INT4 build quantizing or passing
     the call exact. An INT4 build at a narrower pack compiles its exact body (INT4's
     word is a pack of 8 values; the call is refused before it launches)."""
-    params = TEMPLATE_ARGS[build.kernel].split()
+    params = TEMPLATE_ARGS[build.template_name()].split()
     int4 = build.quantization == "int4" and build.pack_bytes == PACK_BYTES
     two_shot = build.algorithm in ("two_shot_pull", "two_shot_push")
     plain = build.kernel == "all_reduce"
@@ -319,7 +341,8 @@ def emit(generated: list[Generated], out: Path) -> None:
                 f".contiguous = {str(i.contiguous).lower()}, "
                 f".chunked = {str(i.chunked).lower()}, "
                 f".tail = {str(i.tail).lower()}, "
-                f".quantize_int4 = {str(i.quantize_int4).lower()},\n"
+                f".quantize_int4 = {str(i.quantize_int4).lower()}, "
+                f".residual = {str(b.residual).lower()},\n"
                 f"     .kernel = reinterpret_cast<void*>(&{i.template()})}},"
             )
         tables += ["};", ""]

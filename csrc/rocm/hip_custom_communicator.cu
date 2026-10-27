@@ -190,23 +190,8 @@ struct AllReduceBuildConfig {
   bool operator==(const AllReduceBuildConfig&) const = default;
 };
 
-// all_reduce_rms_norm.
-struct AllReduceRmsNormBuildConfig {
-  static constexpr Named<AllReduceRmsNormKernelAlgorithm> algorithms[] = {
-      {AllReduceRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceRmsNormKernelAlgorithm::two_shot_pull, "two_shot_pull"},
-      {AllReduceRmsNormKernelAlgorithm::two_shot_push, "two_shot_push"}};
-  AllReduceRmsNormKernelAlgorithm algorithm;
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
-};
-
-// all_reduce_add_rms_norm.
+// all_reduce_add_rms_norm (its kernels all_reduce_rms_norm and
+// all_reduce_add_rms_norm, by the residual).
 struct AllReduceAddRmsNormBuildConfig {
   static constexpr Named<AllReduceAddRmsNormKernelAlgorithm> algorithms[] = {
       {AllReduceAddRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
@@ -237,17 +222,6 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int quantization = Quantization::exact;  // a Quantization
   int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
-};
-
-// add_rms_norm (its kernel add_rms_norm).
-struct AddRmsNormBuildConfig {
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AddRmsNormBuildConfig&) const = default;
 };
 
 // add_attn_res_rms_norm (its kernel add_attn_res_rms_norm): TILE_K sources a
@@ -301,8 +275,8 @@ struct AddAttnResRmsNormBuildConfig {
 // ALL_REDUCE_ADD_RMS_NORM'S ALGORITHMS, the op's (what the tuner picks among):
 // a fused kernel's body (the norm kernel's or the add-norm kernel's, by the
 // residual), or a SPLIT, our all-reduce kernel at that body then the norm (or
-// add-norm) on rows. The kernels' own enums are their bodies alone
-// (AllReduceRmsNormKernelAlgorithm, AllReduceAddRmsNormKernelAlgorithm).
+// add-norm) on rows. The kernels' own enum is their bodies alone
+// (AllReduceAddRmsNormKernelAlgorithm).
 enum class AllReduceAddRmsNormAlgorithm : int {
   one_shot_pull,
   two_shot_pull,
@@ -315,8 +289,8 @@ enum class AllReduceAddRmsNormAlgorithm : int {
 };
 
 // EACH NORM ON ROWS' ONE ALGORITHM, its op's own (the table's "rows"; its
-// kernel has no algorithm parameter).
-enum class RmsNormAlgorithm : int { rows };
+// kernel has no algorithm parameter): add_rms_norm's both kernels' (rms_norm
+// and add_rms_norm, by the residual).
 enum class AddRmsNormAlgorithm : int { rows };
 enum class AddAttnResRmsNormAlgorithm : int { rows };
 
@@ -325,10 +299,11 @@ enum class AddAttnResRmsNormAlgorithm : int { rows };
 // rows, which has none), its wave's lanes and its dtypes, which of the build's
 // instances it is (contiguous: the plain two-shots' contiguous walk; chunked: a
 // row wider than its tile; tail: an INT4 row with a short last group;
-// quantize_int4: what it moves), and its address. GENERATED (builds.py, at
-// configure), one table a kernel, `k<Kernel>Instances`: every row the table's
-// configs reach, so a config of the table is always a row, and a call finds its
-// kernel or is refused (not_built).
+// quantize_int4: what it moves; residual: which of a norm op's two kernels, the
+// add-norm or the norm), and its address. GENERATED (builds.py, at configure),
+// one table a kernel, `k<Kernel>Instances`: every row the table's configs
+// reach, so a config of the table is always a row, and a call finds its kernel
+// or is refused (not_built).
 template <typename ALGORITHM>
 struct Instance {
   ALGORITHM algorithm;
@@ -336,7 +311,7 @@ struct Instance {
   int quantization, pack_bytes;
   int world, wave_size;
   at::ScalarType dtype, weight_dtype;
-  bool contiguous, chunked, tail, quantize_int4;
+  bool contiguous, chunked, tail, quantize_int4, residual;
   void* kernel;
 };
 
@@ -349,8 +324,8 @@ using AllReduceKernel =
                          false, false>);
 template <typename T, typename W>
 using AllReduceRmsNormKernel =
-    decltype(&all_reduce_rms_norm<AllReduceRmsNormKernelAlgorithm{}, false, T,
-                                  W, 2, 1, 64, 64, 16, 1, false, false>);
+    decltype(&all_reduce_rms_norm<AllReduceAddRmsNormKernelAlgorithm{}, false,
+                                  T, W, 2, 1, 64, 64, 16, 1, false, false>);
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},
@@ -600,10 +575,6 @@ inline std::optional<Error> check_kernel(const CommsState& s,
 // THREADS) groups a thread; the tile does not size the payload, so any build
 // sizes alike).
 constexpr bool slices_columns(AllReduceAlgorithm) { return false; }
-constexpr bool slices_columns(AllReduceRmsNormKernelAlgorithm a) {
-  return a == AllReduceRmsNormKernelAlgorithm::two_shot_push;
-}
-
 constexpr bool slices_columns(AllReduceAddRmsNormKernelAlgorithm a) {
   return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
 }
@@ -613,10 +584,6 @@ constexpr bool slices_columns(AllReduceAddAttnResRmsNormAlgorithm a) {
 }
 
 constexpr bool int4_groups_a_thread(AllReduceAlgorithm) { return false; }
-constexpr bool int4_groups_a_thread(AllReduceRmsNormKernelAlgorithm a) {
-  return a == AllReduceRmsNormKernelAlgorithm::two_shot_pull;
-}
-
 constexpr bool int4_groups_a_thread(AllReduceAddRmsNormKernelAlgorithm a) {
   return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
 }
@@ -732,7 +699,6 @@ constexpr int64_t partials_need(A algorithm, int64_t m, int64_t packs,
 template <typename F>
 constexpr void every_algorithm(F&& f) {
   for (const auto& a : AllReduceBuildConfig::algorithms) f(a.algorithm);
-  for (const auto& a : AllReduceRmsNormBuildConfig::algorithms) f(a.algorithm);
   for (const auto& a : AllReduceAddRmsNormBuildConfig::algorithms)
     f(a.algorithm);
   for (const auto& a : AllReduceAddAttnResRmsNormBuildConfig::algorithms)
@@ -1896,7 +1862,7 @@ ErrorCode hip_custom_communicator_all_reduce(
   return std::nullopt;
 }
 
-// all_reduce_rms_norm: at its config. One function: what Python passes, its
+// all_reduce_add_rms_norm: at its config. One function: what Python passes, its
 // tensors stripped to pointers and strides, the preconditions, the kernel's
 // arguments, the launch, the postcondition.
 ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
@@ -1976,24 +1942,19 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push_split;
   else
     return error_code(Error::no_such_kernel);
-  // WHAT IT LAUNCHES: the fused kernel's body (in the norm kernel's enum and
-  // the add-norm kernel's), or the split's all-reduce's.
+  // WHAT IT LAUNCHES: the fused kernel's body, or the split's all-reduce's.
   bool split = false;
-  AllReduceRmsNormKernelAlgorithm algorithm{};
-  AllReduceAddRmsNormKernelAlgorithm add_algorithm{};
+  AllReduceAddRmsNormKernelAlgorithm algorithm{};
   AllReduceAlgorithm all_reduce_algorithm{};
   switch (op_algorithm) {
     case AllReduceAddRmsNormAlgorithm::one_shot_pull:
-      algorithm = AllReduceRmsNormKernelAlgorithm::one_shot_pull;
-      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot_pull;
+      algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot_pull;
       break;
     case AllReduceAddRmsNormAlgorithm::two_shot_pull:
-      algorithm = AllReduceRmsNormKernelAlgorithm::two_shot_pull;
-      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
+      algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
       break;
     case AllReduceAddRmsNormAlgorithm::two_shot_push:
-      algorithm = AllReduceRmsNormKernelAlgorithm::two_shot_push;
-      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
+      algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
       break;
     case AllReduceAddRmsNormAlgorithm::one_shot_pull_split:
       split = true, all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
@@ -2091,7 +2052,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     return error_code(Error::pack_out_of_range);
   if (int4_config &&
       (pack_bytes != kPackBytes ||
-       (!split && algorithm == AllReduceRmsNormKernelAlgorithm::one_shot_pull)))
+       (!split &&
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)))
     return error_code(Error::quantization_not_supported);
   // THE CALL'S DTYPE BUILT (the world is: open refuses the rest), and its
   // elements whole packs: at least an element a pack, whole packs a row (an
@@ -2375,32 +2337,19 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
                  residual_output_stride_m * e % *rms_norm_pack_bytes != 0)))
       return error_code(Error::row_stride_not_packs);
     // THE INSTANCE: the norm compiled at this config, on this device, for this
-    // call (builds.py's kRmsNormInstances, or kAddRmsNormInstances with a
-    // residual); a row wider than the tile its CHUNKED instance.
+    // call (builds.py's kAddRmsNormInstances: with a residual the add-norm,
+    // else the norm); a row wider than the tile its CHUNKED instance.
     const bool rms_norm_chunked = n > *rms_norm_tile_n;
-    if (add) {
-      for (const auto& i : kAddRmsNormInstances)
-        if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
-            i.block_z == *rms_norm_block_z &&
-            i.waves_per_eu == *rms_norm_waves_per_eu &&
-            i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
-            i.quantization == Quantization::exact &&
-            i.pack_bytes == *rms_norm_pack_bytes &&
-            i.wave_size == s.device.wave_size && i.dtype == dtype &&
-            i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
-          rms_norm_kernel = i.kernel;
-    } else {
-      for (const auto& i : kRmsNormInstances)
-        if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
-            i.block_z == *rms_norm_block_z &&
-            i.waves_per_eu == *rms_norm_waves_per_eu &&
-            i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
-            i.quantization == Quantization::exact &&
-            i.pack_bytes == *rms_norm_pack_bytes &&
-            i.wave_size == s.device.wave_size && i.dtype == dtype &&
-            i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
-          rms_norm_kernel = i.kernel;
-    }
+    for (const auto& i : kAddRmsNormInstances)
+      if (i.residual == add && i.block_x == *rms_norm_block_x &&
+          i.block_y == *rms_norm_block_y && i.block_z == *rms_norm_block_z &&
+          i.waves_per_eu == *rms_norm_waves_per_eu &&
+          i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
+          i.quantization == Quantization::exact &&
+          i.pack_bytes == *rms_norm_pack_bytes &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
+        rms_norm_kernel = i.kernel;
     if (rms_norm_kernel == nullptr) return error_code(Error::not_built);
     // THE KERNEL ON THIS DEVICE, as its compiler left it (it waits on no peer:
     // no residency).
@@ -2424,15 +2373,16 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // row wider than the tile, the build's CHUNKED instance; an INT4 row with a
     // tail, its TAIL instance (int4_tail).
     const bool pull =
-        algorithm != AllReduceRmsNormKernelAlgorithm::two_shot_push;
+        algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
     in_place = pull && !quantize_int4;
     const bool chunked = n > tile_n;
     const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
     // THE INSTANCE: the kernel compiled at this config, on this device, for
-    // this call (builds.py's kAllReduceRmsNormInstances, a row each); a config
-    // the table did not build, or a weight dtype no build has, is refused here.
-    for (const auto& i : kAllReduceRmsNormInstances)
-      if (i.algorithm == algorithm && i.block_x == block_x &&
+    // this call (builds.py's kAllReduceAddRmsNormInstances, its norm's rows); a
+    // config the table did not build, or a weight dtype no build has, is
+    // refused here.
+    for (const auto& i : kAllReduceAddRmsNormInstances)
+      if (!i.residual && i.algorithm == algorithm && i.block_x == block_x &&
           i.block_y == block_y && i.block_z == block_z &&
           i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
           i.tile_n == tile_n &&
@@ -2479,7 +2429,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // whole (an eager call's host copy). ----
     const bool groups_a_thread =
         quantize_int4 &&
-        algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_pull;
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
     const int64_t row =
         groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
     const int64_t owned_rows = (m + s.world - 1) / s.world;
@@ -2488,9 +2438,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     staging_size_n = row;
     partials_stride_m = row, partials_stride_n = 1,
     partials_size_m =
-        algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_pull ? owned_rows
-        : algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_push ? m
-                                                                      : 0,
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull
+            ? owned_rows
+        : algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push ? m
+                                                                         : 0,
     partials_size_n = row;
     // WHAT THE REGIONS MUST HOLD: its input whole; INT4, the payloads (the
     // pull's its staged rows' and its owned rows', the push's the call's).
@@ -2508,15 +2459,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // ---- THE FUSED ADD-NORM KERNEL (a residual) ----
     // WHAT THE CALL PICKS: in place, the exact pull; a row wider than the tile,
     // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance.
-    in_place =
-        add_algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push &&
-        !quantize_int4;
+    in_place = algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push &&
+               !quantize_int4;
     const bool chunked = n > tile_n;
-    const bool tail = quantize_int4 && int4_tail(add_algorithm, m, n, s.world);
+    const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
     // THE INSTANCE: the kernel compiled at this config, on this device, for
-    // this call (builds.py's kAllReduceAddRmsNormInstances, a row each).
+    // this call (builds.py's kAllReduceAddRmsNormInstances, its add-norm's
+    // rows).
     for (const auto& i : kAllReduceAddRmsNormInstances)
-      if (i.algorithm == add_algorithm && i.block_x == block_x &&
+      if (i.residual && i.algorithm == algorithm && i.block_x == block_x &&
           i.block_y == block_y && i.block_z == block_z &&
           i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
           i.tile_n == tile_n &&
@@ -2557,9 +2508,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // slots: scale_slot_row, so every row's scale is aligned at any pack), INT4
     // the row alone, its scales in the scales region (max_rows rows). ----
     const bool pull_two_shot =
-        add_algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
     const bool push_two_shot =
-        add_algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
     const bool groups_a_thread = quantize_int4 && pull_two_shot;
     const bool scale_slot = pull_two_shot && !quantize_int4;
     const int64_t row =

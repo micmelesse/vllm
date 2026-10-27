@@ -14,16 +14,8 @@
 
 namespace hip_custom_communicator {
 
-// THE ALL-REDUCE-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it
-// has.
-enum class AllReduceRmsNormKernelAlgorithm {
-  one_shot_pull,
-  two_shot_pull,
-  two_shot_push
-};
-
-// THE ALL-REDUCE-ADD-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it
-// has.
+// THE ALL-REDUCE-(ADD-)RMSNORM'S ALGORITHMS: both kernels' ALGORITHM (the norm
+// and the add-norm, one op by its residual), exactly the bodies they have.
 enum class AllReduceAddRmsNormKernelAlgorithm {
   one_shot_pull,
   two_shot_pull,
@@ -82,10 +74,10 @@ enum class AllReduceAddRmsNormKernelAlgorithm {
 
 // =============================================================================
 // all_reduce_rms_norm: THE ALL-REDUCE THEN RMSNORM, ONE KERNEL: its ALGORITHM
-// (AllReduceRmsNormKernelAlgorithm) is a template parameter, each algorithm its
-// own body under `if constexpr`.
+// (AllReduceAddRmsNormKernelAlgorithm) is a template parameter, each algorithm
+// its own body under `if constexpr`.
 // =============================================================================
-template <AllReduceRmsNormKernelAlgorithm ALGORITHM, bool QUANTIZE_INT4,
+template <AllReduceAddRmsNormKernelAlgorithm ALGORITHM, bool QUANTIZE_INT4,
           typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           int WAVES_PER_EU, bool CHUNKED, bool TAIL>
@@ -111,7 +103,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_writer, uint32_t* __restrict__ status_ptr,
         int64_t status_stride_field, int status_size_field, int rank,
         uint64_t timeout_ticks, float eps) {
-  if constexpr (ALGORITHM == AllReduceRmsNormKernelAlgorithm::one_shot_pull) {
+  if constexpr (ALGORITHM ==
+                AllReduceAddRmsNormKernelAlgorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_rms_norm, above).
     // EXACT ALONE: an INT4 build of it compiles this exact body, which never
     // runs (the host refuses an INT4 call of it by name,
@@ -139,9 +132,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                    Until::started, 0);
 
     for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its chunks
-      // in two passes, the scale's and the norm's, every chunk's values read
-      // again in the second.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // chunks in two passes, the scale's and the norm's, every chunk's values
+      // read again in the second.
       if constexpr (CHUNKED) {
         const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
           DTYPE peers[WORLD][1][kPacks][kPackElems];
@@ -241,7 +234,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::read, 1);
   } else if constexpr (ALGORITHM ==
-                       AllReduceRmsNormKernelAlgorithm::two_shot_pull) {
+                       AllReduceAddRmsNormKernelAlgorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot_rms_norm, above).
     if constexpr (!QUANTIZE_INT4) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -330,8 +323,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // PING-PONG: two buffers that trade roles each row, so no row copies its
       // packs into the other (a copy cost 32 moves a row at one pack a thread:
       // ISA 2026-10-01T00-58-37Z).
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its chunks
-      // in two passes, every peer's read again in the second; no ping-pong.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // chunks in two passes, every peer's read again in the second; no
+      // ping-pong.
       if constexpr (CHUNKED) {
         for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
           const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
@@ -667,8 +661,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_rms_norm, above).
-    static_assert(ALGORITHM == AllReduceRmsNormKernelAlgorithm::two_shot_push,
-                  "all_reduce_rms_norm: no body for this algorithm");
+    static_assert(
+        ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::two_shot_push,
+        "all_reduce_rms_norm: no body for this algorithm");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns):
     // any tile at any block, the row's columns past the pass masked
@@ -705,8 +700,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks);
 
     for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its chunks
-      // of the partials (the whole sum, every rank's columns) in two passes.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // chunks of the partials (the whole sum, every rank's columns) in two
+      // passes.
       if constexpr (CHUNKED) {
         const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
           DTYPE own[1][kPacks][kPackElems];
@@ -854,9 +850,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                    Until::started, 0);
 
     for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its chunks
-      // in two passes, the scale's and the norm's, every chunk's values read
-      // again in the second.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // chunks in two passes, the scale's and the norm's, every chunk's values
+      // read again in the second.
       if constexpr (CHUNKED) {
         // The sum and the residual (`added`, the new residual, for the second
         // pass to write).
@@ -1115,9 +1111,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // PING-PONG: two buffers that trade roles each row, so no row copies its
       // packs into the other (a copy cost 32 moves a row at one pack a thread:
       // ISA 2026-10-01T00-58-37Z).
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its scale
-      // over its chunks, then the new residual written chunk by chunk, every
-      // peer's read again; no ping-pong.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // scale over its chunks, then the new residual written chunk by chunk,
+      // every peer's read again; no ping-pong.
       if constexpr (CHUNKED) {
         for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
           const auto values = [&](int c, float (&s)[1][kPacks][kPackElems],
@@ -1592,9 +1588,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks);
 
     for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its chunks
-      // of the partials and the residual in two passes, the second writing the
-      // new residual.
+      // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): its
+      // chunks of the partials and the residual in two passes, the second
+      // writing the new residual.
       if constexpr (CHUNKED) {
         const auto values = [&](int c, float (&s)[1][kPacks][kPackElems],
                                 DTYPE(&added)[1][kPacks][kPackElems]) {
@@ -1750,8 +1746,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t * TILE_M;
-    // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): the tile's
-    // rows' chunks in two passes.
+    // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): the
+    // tile's rows' chunks in two passes.
     if constexpr (CHUNKED) {
       const auto values = [&](int c, float (&s)[TILE_M][kPacks][kPackElems]) {
         DTYPE x[TILE_M][kPacks][kPackElems];
@@ -1852,8 +1848,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t * TILE_M;
-    // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): the tile's
-    // rows' chunks in two passes, the second writing the new residual.
+    // A ROW WIDER THAN THE TILE (rms_normalize.cuh's NormPart::wide): the
+    // tile's rows' chunks in two passes, the second writing the new residual.
     if constexpr (CHUNKED) {
       const auto values = [&](int c, float (&s)[TILE_M][kPacks][kPackElems],
                               DTYPE(&added)[TILE_M][kPacks][kPackElems]) {
