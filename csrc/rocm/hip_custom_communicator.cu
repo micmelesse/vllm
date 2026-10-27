@@ -1471,17 +1471,6 @@ bool on_device(std::initializer_list<const torch::Tensor*> ts) {
     if (!t->is_cuda()) return false;
   return true;
 }
-// A COLLECTIVE'S TENSOR AS [rows, cols]: its last dimension a row, every
-// dimension before it the rows. A view, so its strides are the tensor's own;
-// none where those dimensions cannot merge.
-std::optional<torch::Tensor> as_rows(const torch::Tensor& t) {
-  if (t.dim() == 0) return std::nullopt;
-  try {
-    return t.view({-1, t.size(-1)});
-  } catch (const c10::Error&) {
-    return std::nullopt;
-  }
-}
 }
 ErrorCode error_code(std::optional<Error> e) {
   return e ? ErrorCode(static_cast<int64_t>(*e)) : std::nullopt;
