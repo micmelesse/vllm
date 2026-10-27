@@ -502,58 +502,67 @@ struct InputTables {
   std::map<std::vector<char>, char*> opened;
 };
 
+// THE SYMMETRIC MEMORY (the standard term: OpenSHMEM's symmetric heap,
+// NVSHMEM's, PyTorch's SymmetricMemory): the buffers every rank allocates
+// alike, the same sizes and layout, and exchanges, every peer opening every
+// other's over legacy HIP IPC. Allocated by `open` (each region its own
+// uncached allocation, its IPC handle in open's answer), its peers opened and
+// its device arrays written by `connect`, the peers closed by `close_peers`,
+// freed by `free`. Nothing else is exchanged.
+struct SymmetricMemory {
+  // THE LAYOUT, the same on every rank (open says why each is what it is): the
+  // signals' blocks (a parity's slots, every block the device holds at once),
+  // the unfenced region's blocks and a row's payload bytes.
+  int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0;
+  // THE REGIONS' BYTES: the staging's, the largest call's input or payload; the
+  // partials', the most any two-shot keeps.
+  int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
+          scales_bytes = 0, unfenced_bytes = 0;
+  // THE REGIONS, OWNED: the signals (the barrier flags), the staging (what this
+  // rank publishes: an eager call's copy, an INT4 payload, a pushed two-shot's
+  // inbox), the partials (its share's sums), the scales (the add-RMSNorm pull's
+  // INT4 row scales), the unfenced region (the pushed one-shot's inbox).
+  uint32_t* signals = nullptr;
+  char* staging = nullptr;
+  char* partials = nullptr;
+  float* scales = nullptr;
+  char* unfenced = nullptr;
+  // EACH REGION'S DEVICE ARRAY of every rank's address of it (OWNED, this
+  // rank's alone, written by connect): what every launch hands its kernel.
+  uint32_t* const* signals_ptr_array = nullptr;
+  char* const* staging_ptr_array = nullptr;
+  char* const* partials_ptr_array = nullptr;
+  float* const* scales_ptr_array = nullptr;
+  char* const* unfenced_ptr_array = nullptr;
+  // BORROWED: every peer's regions as connect opened them, for close_peers.
+  std::vector<char*> peers;
+};
+
 // THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (this
 // rank, the world, the device, the largest call, a wait's bound), what open
-// asked of the device and decided (the regions' sizes, the layout), its buffers
-// (each its own allocation, OWNED), the peers' regions as this process opened
-// them (BORROWED), and the input tables. Made by `open`, completed by
-// `connect`, released by `close_peers` then `free`; Python holds it as a
-// handle. A launch reads it, and a captured in-place launch reserves its table
-// slot in it: its one mutation during a call.
+// asked of the device, the symmetric memory, this rank's own buffers (the
+// pushed one-shot's epochs, the status), and the input tables. Made by `open`,
+// completed by `connect`, released by `close_peers` then `free`; Python holds
+// it as a handle. A launch reads it, and a captured in-place launch reserves
+// its table slot in it: its one mutation during a call.
 struct CommsState {
   int rank = 0;
   int world = 0;
   int device = 0;
   int64_t max_rows = 0;
   uint64_t timeout_ticks = 0;
-  // THE REGIONS' BYTES: the staging's, the largest call's input or payload; the
-  // partials', the most any two-shot keeps.
-  int64_t staging_bytes = 0, partials_bytes = 0;
   // THE DEVICE'S LIMITS a launch is checked against (open asks them once): a
   // block's LDS, its compute units, the threads a CU holds, and a lane's
   // scratch (open's share of the device's).
   int64_t lds_bytes = 0, compute_units = 0, threads_a_cu = 0,
           scratch_a_lane = 0;
-  // THE LAYOUT OPEN DECIDED, the same on every rank (open says why each is what
-  // it is): the signals' blocks (a parity's slots, every block the device holds
-  // at once), the unfenced region's blocks and a row's payload bytes, and a
-  // block's epoch's int32 words.
-  int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0,
-          unfenced_epoch_words = 0;
-  // THE EXCHANGE'S REGIONS, OWNED, each its own allocation exported to the
-  // peers by its IPC handle: the signals (the barrier flags), the staging (what
-  // this rank publishes: an eager call's copy, an INT4 payload, a pushed
-  // two-shot's inbox), the partials (its share's sums), the scales (the
-  // add-RMSNorm pull's INT4 row scales), the unfenced region (the pushed
-  // one-shot's inbox).
-  uint32_t* signals = nullptr;
-  char* staging = nullptr;
-  char* partials = nullptr;
-  float* scales = nullptr;
-  char* unfenced = nullptr;
-  // EACH REGION'S DEVICE ARRAY of every rank's address of it (OWNED, written by
-  // connect): what every launch hands its kernel.
-  uint32_t* const* signals_ptr_array = nullptr;
-  char* const* staging_ptr_array = nullptr;
-  char* const* partials_ptr_array = nullptr;
-  float* const* scales_ptr_array = nullptr;
-  char* const* unfenced_ptr_array = nullptr;
-  // OWNED: the pushed one-shot's epochs (rank-local), and a kernel's fault
-  // record, written before it traps.
+  SymmetricMemory symmetric;
+  // OWNED, this rank's alone: the pushed one-shot's epochs (a block's
+  // `unfenced_epoch_words` int32 words), and a kernel's fault record, written
+  // before it traps.
   int32_t* unfenced_epochs = nullptr;
+  int64_t unfenced_epoch_words = 0;
   uint32_t* status_device = nullptr;
-  // BORROWED: every peer region opened by connect, for close_peers.
-  std::vector<char*> peer_regions;
   InputTables input_tables;
 };
 
@@ -1489,9 +1498,9 @@ inline std::optional<Error> input_table(CommsState& s, const void* input,
     return std::nullopt;
   }
   const int64_t row = n * elem_bytes;
-  if (m * row > s.staging_bytes) return Error::staging_too_small;
-  HIP_CHECK(hipMemcpy2DAsync(s.staging, static_cast<size_t>(row), input,
-                             static_cast<size_t>(stride_m * elem_bytes),
+  if (m * row > s.symmetric.staging_bytes) return Error::staging_too_small;
+  HIP_CHECK(hipMemcpy2DAsync(s.symmetric.staging, static_cast<size_t>(row),
+                             input, static_cast<size_t>(stride_m * elem_bytes),
                              static_cast<size_t>(row), static_cast<size_t>(m),
                              hipMemcpyDeviceToDevice, stream));
   table = tables;
@@ -1949,21 +1958,25 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   s->device = static_cast<int>(device);
   s->max_rows = max_rows;
   s->timeout_ticks = static_cast<uint64_t>(timeout_seconds * khz * 1000);
-  s->staging_bytes = staging_bytes;
-  s->partials_bytes = partials_bytes;
   s->lds_bytes = lds;
   s->compute_units = cus;
   s->threads_a_cu = threads_a_cu;
   s->scratch_a_lane = static_cast<int64_t>(scratch) /
                       (int64_t{cus} * threads_a_cu) / scratch_shares;
-  s->max_blocks = max_blocks;
-  s->unfenced_blocks = unfenced_blocks;
-  s->unfenced_slot_bytes = unfenced_slot_bytes;
+  SymmetricMemory& symmetric = s->symmetric;
+  symmetric.max_blocks = max_blocks;
+  symmetric.unfenced_blocks = unfenced_blocks;
+  symmetric.unfenced_slot_bytes = unfenced_slot_bytes;
+  symmetric.signals_bytes = signals_bytes;
+  symmetric.staging_bytes = staging_bytes;
+  symmetric.partials_bytes = partials_bytes;
+  symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
+  symmetric.unfenced_bytes = unfenced_bytes;
   s->unfenced_epoch_words = unfenced_epoch_words;
   s->input_tables.slots = input_table_slots;
 
   // ---- THE BUFFERS, each its own allocation, zeroed before any stream can use
-  // it; freed by `free`. THE EXCHANGE'S REGIONS are
+  // it; freed by `free`. THE SYMMETRIC MEMORY'S REGIONS are
   // hipExtMallocWithFlags(hipDeviceMallocUncached), exported with
   // hipIpcGetMemHandle, opened by each peer with hipIpcOpenMemHandle: the
   // convention of every IPC communicator on ROCm (vLLM's custom all-reduce and
@@ -1986,16 +1999,16 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
     buffer = static_cast<std::remove_reference_t<decltype(buffer)>>(p);
   };
   const int64_t ptr_array_bytes = world * int64_t{sizeof(char*)};
-  allocate(s->signals, signals_bytes, true);
-  allocate(s->staging, staging_bytes, true);
-  allocate(s->partials, partials_bytes, true);
-  allocate(s->scales, max_rows * int64_t{sizeof(float)}, true);
-  allocate(s->unfenced, unfenced_bytes, true);
-  allocate(s->signals_ptr_array, ptr_array_bytes, false);
-  allocate(s->staging_ptr_array, ptr_array_bytes, false);
-  allocate(s->partials_ptr_array, ptr_array_bytes, false);
-  allocate(s->scales_ptr_array, ptr_array_bytes, false);
-  allocate(s->unfenced_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.signals, symmetric.signals_bytes, true);
+  allocate(symmetric.staging, symmetric.staging_bytes, true);
+  allocate(symmetric.partials, symmetric.partials_bytes, true);
+  allocate(symmetric.scales, symmetric.scales_bytes, true);
+  allocate(symmetric.unfenced, symmetric.unfenced_bytes, true);
+  allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.partials_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(s->unfenced_epochs,
            unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
            false);
@@ -2005,11 +2018,11 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   // THE REGIONS' IPC HANDLES, their bytes, in connect's order: the signals, the
   // staging, the partials, the scales, the unfenced region.
   std::vector<int64_t> handle;
-  for (const void* region : {static_cast<const void*>(s->signals),
-                             static_cast<const void*>(s->staging),
-                             static_cast<const void*>(s->partials),
-                             static_cast<const void*>(s->scales),
-                             static_cast<const void*>(s->unfenced)}) {
+  for (const void* region : {static_cast<const void*>(symmetric.signals),
+                             static_cast<const void*>(symmetric.staging),
+                             static_cast<const void*>(symmetric.partials),
+                             static_cast<const void*>(symmetric.scales),
+                             static_cast<const void*>(symmetric.unfenced)}) {
     hipIpcMemHandle_t h{};
     made =
         made && hipIpcGetMemHandle(&h, const_cast<void*>(region)) == hipSuccess;
@@ -2044,10 +2057,11 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   return {std::nullopt, reinterpret_cast<int64_t>(s), handle, arch, capacity};
 }
 
-// CONNECT: every peer's regions opened from their IPC handles (`handles`: a
-// rank's five, as open answered them, rank after rank; this rank's ignored),
-// then each region's device array written (every rank's address of it), and the
-// eager input table, slot 0: every rank's staging.
+// CONNECT: the symmetric memory joined: every peer's regions opened from their
+// IPC handles (`handles`: a rank's five, as open answered them, rank after
+// rank; this rank's ignored), then each region's device array written (every
+// rank's address of it), and the eager input table, slot 0: every rank's
+// staging.
 ErrorCode hip_custom_communicator_connect(int64_t state,
                                           const std::vector<int64_t>& handles) {
   using namespace hip_custom_communicator;
@@ -2058,12 +2072,15 @@ ErrorCode hip_custom_communicator_connect(int64_t state,
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
   if (handles.size() != s.world * kRegions * kHandleBytes)
     return error_code(Error::world_not_built);
-  char* const own[kRegions] = {reinterpret_cast<char*>(s.signals), s.staging,
-                               s.partials, reinterpret_cast<char*>(s.scales),
-                               s.unfenced};
+  SymmetricMemory& symmetric = s.symmetric;
+  char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
+                               symmetric.staging, symmetric.partials,
+                               reinterpret_cast<char*>(symmetric.scales),
+                               symmetric.unfenced};
   const void* const arrays[kRegions] = {
-      s.signals_ptr_array, s.staging_ptr_array, s.partials_ptr_array,
-      s.scales_ptr_array, s.unfenced_ptr_array};
+      symmetric.signals_ptr_array, symmetric.staging_ptr_array,
+      symmetric.partials_ptr_array, symmetric.scales_ptr_array,
+      symmetric.unfenced_ptr_array};
   std::vector<char*> staging(s.world);
   for (int region = 0; region < kRegions; ++region) {
     std::vector<char*> addresses(s.world);
@@ -2083,7 +2100,7 @@ ErrorCode hip_custom_communicator_connect(int64_t state,
         return error_code(Error::hip_failed);
       }
       addresses[r] = static_cast<char*>(base);
-      s.peer_regions.push_back(addresses[r]);
+      symmetric.peers.push_back(addresses[r]);
     }
     if (hipMemcpy(const_cast<void*>(arrays[region]), addresses.data(),
                   s.world * sizeof(char*),
@@ -2189,7 +2206,7 @@ ErrorCode hip_custom_communicator_close_peers(int64_t state) {
   if (state == 0) return error_code(Error::not_open);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   std::optional<Error> first;
-  std::vector<char*> borrowed = s.peer_regions;
+  std::vector<char*> borrowed = s.symmetric.peers;
   for (const auto& [key, base] : s.input_tables.opened)
     borrowed.push_back(base);
   for (char* base : borrowed)
@@ -2197,7 +2214,7 @@ ErrorCode hip_custom_communicator_close_peers(int64_t state) {
       (void)hipGetLastError();
       first = first.value_or(Error::hip_failed);
     }
-  s.peer_regions.clear();
+  s.symmetric.peers.clear();
   s.input_tables.opened.clear();
   return error_code(first);
 }
@@ -2210,19 +2227,20 @@ ErrorCode hip_custom_communicator_free(int64_t state) {
   if (state == 0) return error_code(Error::not_open);
   auto* s = reinterpret_cast<CommsState*>(state);
   std::optional<Error> first;
-  for (const void* p : {static_cast<const void*>(s->signals),
-                        static_cast<const void*>(s->staging),
-                        static_cast<const void*>(s->partials),
-                        static_cast<const void*>(s->scales),
-                        static_cast<const void*>(s->unfenced),
-                        static_cast<const void*>(s->signals_ptr_array),
-                        static_cast<const void*>(s->staging_ptr_array),
-                        static_cast<const void*>(s->partials_ptr_array),
-                        static_cast<const void*>(s->scales_ptr_array),
-                        static_cast<const void*>(s->unfenced_ptr_array),
-                        static_cast<const void*>(s->unfenced_epochs),
-                        static_cast<const void*>(s->status_device),
-                        static_cast<const void*>(s->input_tables.device)})
+  for (const void* p :
+       {static_cast<const void*>(s->symmetric.signals),
+        static_cast<const void*>(s->symmetric.staging),
+        static_cast<const void*>(s->symmetric.partials),
+        static_cast<const void*>(s->symmetric.scales),
+        static_cast<const void*>(s->symmetric.unfenced),
+        static_cast<const void*>(s->symmetric.signals_ptr_array),
+        static_cast<const void*>(s->symmetric.staging_ptr_array),
+        static_cast<const void*>(s->symmetric.partials_ptr_array),
+        static_cast<const void*>(s->symmetric.scales_ptr_array),
+        static_cast<const void*>(s->symmetric.unfenced_ptr_array),
+        static_cast<const void*>(s->unfenced_epochs),
+        static_cast<const void*>(s->status_device),
+        static_cast<const void*>(s->input_tables.device)})
     if (p != nullptr && hipFree(const_cast<void*>(p)) != hipSuccess) {
       (void)hipGetLastError();
       first = first.value_or(Error::hip_failed);
@@ -2314,7 +2332,8 @@ ErrorCode hip_custom_communicator_all_reduce(
   // x alone (the kernel's one dimension), the block whole waves up to the
   // device's workgroup, the grid at most the blocks the signals have slots for,
   // the waves a EU the CU holds.
-  if (grid_y != 1 || grid_z != 1 || grid_x < 1 || grid_x > s.max_blocks)
+  if (grid_y != 1 || grid_z != 1 || grid_x < 1 ||
+      grid_x > s.symmetric.max_blocks)
     return error_code(Error::launch_out_of_range);
   if (tile_m < 1 || tile_n < 1) return error_code(Error::field_not_positive);
   // QUANTIZE_FROM_BYTES: an INT4 config's alone, and not negative.
@@ -2474,14 +2493,16 @@ ErrorCode hip_custom_communicator_all_reduce(
           quantize_int4
               ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
               : (tile_n * e + line_pack - 1) / line_pack;
-      if (row_lines > s.unfenced_slot_bytes / kLinePayloadBytes ||
-          grid_x * tile_m > s.unfenced_blocks)
+      if (row_lines > s.symmetric.unfenced_slot_bytes / kLinePayloadBytes ||
+          grid_x * tile_m > s.symmetric.unfenced_blocks)
         return error_code(Error::unfenced_too_small);
-      unfenced_stride_slot =
-          2 * s.unfenced_blocks * (s.unfenced_slot_bytes / e);
-      unfenced_stride_m = s.unfenced_slot_bytes / e, unfenced_stride_n = 1;
-      unfenced_size_slot = s.world, unfenced_size_m = 2 * s.unfenced_blocks,
-      unfenced_size_n = s.unfenced_slot_bytes / e;
+      unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
+                             (s.symmetric.unfenced_slot_bytes / e);
+      unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+      unfenced_stride_n = 1;
+      unfenced_size_slot = s.world,
+      unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
+      unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
       break;
     }
     case AllReduceAlgorithm::one_shot_push_staged: {
@@ -2517,9 +2538,9 @@ ErrorCode hip_custom_communicator_all_reduce(
           : ((partials_size_m - 1) * partials_stride_m +
              (partials_size_n - 1) * partials_stride_n + 1) *
                 e;
-  if (std::max(staging_need, staging_end) > s.staging_bytes)
+  if (std::max(staging_need, staging_end) > s.symmetric.staging_bytes)
     return error_code(Error::staging_too_small);
-  if (std::max(partials_need, partials_end) > s.partials_bytes)
+  if (std::max(partials_need, partials_end) > s.symmetric.partials_bytes)
     return error_code(Error::partials_too_small);
   // EVERY RANK'S INPUT, where the kernel reads it: in place through an input
   // table (the exact pull: `world` addresses), else in every rank's staging (no
@@ -2546,8 +2567,8 @@ ErrorCode hip_custom_communicator_all_reduce(
       peer_inputs_stride_m = input_stride_m;
       ++tables.next_slot;
     } else {
-      if (hipMemcpy2DAsync(s.staging, static_cast<size_t>(n * e), input_ptr,
-                           static_cast<size_t>(input_stride_m * e),
+      if (hipMemcpy2DAsync(s.symmetric.staging, static_cast<size_t>(n * e),
+                           input_ptr, static_cast<size_t>(input_stride_m * e),
                            static_cast<size_t>(n * e), static_cast<size_t>(m),
                            hipMemcpyDeviceToDevice, stream) != hipSuccess)
         return error_code(Error::hip_failed);
@@ -2573,23 +2594,26 @@ ErrorCode hip_custom_communicator_all_reduce(
                 peer_inputs_size, peer_inputs_stride_m, peer_inputs_stride_n,
                 static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
                 static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n), s.partials_ptr_array, s.world,
-                partials_stride_m, partials_stride_n,
+                static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
+                s.world, partials_stride_m, partials_stride_n,
                 static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n), s.staging_ptr_array, s.world,
-                staging_stride_m, staging_stride_n,
-                static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.unfenced_ptr_array, s.world,
-                unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+                static_cast<int>(partials_size_n),
+                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+                staging_stride_n, static_cast<int>(staging_size_m),
+                static_cast<int>(staging_size_n),
+                s.symmetric.unfenced_ptr_array, s.world, unfenced_stride_slot,
+                unfenced_stride_m, unfenced_stride_n,
                 static_cast<int>(unfenced_size_slot),
                 static_cast<int>(unfenced_size_m),
                 static_cast<int>(unfenced_size_n), s.unfenced_epochs,
                 s.unfenced_epoch_words, int64_t{1},
-                static_cast<int>(s.unfenced_blocks),
-                static_cast<int>(s.unfenced_epoch_words), s.signals_ptr_array,
-                s.world, s.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-                int64_t{2}, s.max_blocks, int64_t{s.world}, s.status_device,
-                int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
+                static_cast<int>(s.symmetric.unfenced_blocks),
+                static_cast<int>(s.unfenced_epoch_words),
+                s.symmetric.signals_ptr_array, s.world,
+                s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+                int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
+                s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
+                s.timeout_ticks);
       });
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
@@ -2656,8 +2680,9 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(true, s.world, s.staging_bytes, s.partials_bytes,
-                  s.max_blocks, build, grid, quantize_from_bytes, dtype, m, n))
+          refused(true, s.world, s.symmetric.staging_bytes,
+                  s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
+                  grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
           layout_refused(dtype, build.pack_bytes,
@@ -2716,9 +2741,11 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   in_place = !is_push(algorithm) && build.quantization == Quantization::exact;
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
-                 partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+                 partials_stride_n, elem_bytes(dtype),
+                 s.symmetric.partials_bytes) ||
       !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n,
-                 staging_stride_n, elem_bytes(dtype), s.staging_bytes))
+                 staging_stride_n, elem_bytes(dtype),
+                 s.symmetric.staging_bytes))
     return error_code(Error::view_past_region);
   // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input
   // in place (an exact pull), or none where it reads the staging.
@@ -2750,17 +2777,17 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
                 static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
                 output_stride_m, output_stride_n,
                 static_cast<int>(output_size_m),
-                static_cast<int>(output_size_n), s.partials_ptr_array, s.world,
-                partials_stride_m, partials_stride_n,
+                static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
+                s.world, partials_stride_m, partials_stride_n,
                 static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n), s.staging_ptr_array, s.world,
-                staging_stride_m, staging_stride_n,
-                static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.signals_ptr_array, s.world,
-                s.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-                int64_t{2}, s.max_blocks, int64_t{s.world}, s.status_device,
-                int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks,
-                eps);
+                static_cast<int>(partials_size_n),
+                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+                staging_stride_n, static_cast<int>(staging_size_m),
+                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
+                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
+                int64_t{s.world}, s.status_device, int64_t{1},
+                int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
       });
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
@@ -2842,8 +2869,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(true, s.world, s.staging_bytes, s.partials_bytes,
-                  s.max_blocks, build, grid, quantize_from_bytes, dtype, m, n))
+          refused(true, s.world, s.symmetric.staging_bytes,
+                  s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
+                  grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
           layout_refused(dtype, build.pack_bytes,
@@ -2925,9 +2953,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   in_place = !is_push(algorithm) && build.quantization == Quantization::exact;
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
-                 partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+                 partials_stride_n, elem_bytes(dtype),
+                 s.symmetric.partials_bytes) ||
       !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n,
-                 staging_stride_n, elem_bytes(dtype), s.staging_bytes) ||
+                 staging_stride_n, elem_bytes(dtype),
+                 s.symmetric.staging_bytes) ||
       !view_fits(1, 0, scales_size_m, scales_stride_m, 1, 1, 4,
                  s.max_rows * int64_t{sizeof(float)}))
     return error_code(Error::view_past_region);
@@ -2968,18 +2998,18 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
                 static_cast<T*>(residual_output_ptr), residual_output_stride_m,
                 residual_output_stride_n,
                 static_cast<int>(residual_output_size_m),
-                static_cast<int>(residual_output_size_n), s.partials_ptr_array,
-                s.world, partials_stride_m, partials_stride_n,
-                static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n), s.scales_ptr_array, s.world,
-                scales_stride_m, static_cast<int>(scales_size_m),
-                s.staging_ptr_array, s.world, staging_stride_m,
+                static_cast<int>(residual_output_size_n),
+                s.symmetric.partials_ptr_array, s.world, partials_stride_m,
+                partials_stride_n, static_cast<int>(partials_size_m),
+                static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
+                s.world, scales_stride_m, static_cast<int>(scales_size_m),
+                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
                 staging_stride_n, static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.signals_ptr_array, s.world,
-                s.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-                int64_t{2}, s.max_blocks, int64_t{s.world}, s.status_device,
-                int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks,
-                eps);
+                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
+                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
+                int64_t{s.world}, s.status_device, int64_t{1},
+                int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
       });
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
@@ -3085,8 +3115,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(true, s.world, s.staging_bytes, s.partials_bytes,
-                  s.max_blocks, build, grid, quantize_from_bytes, dtype, m, n))
+          refused(true, s.world, s.symmetric.staging_bytes,
+                  s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
+                  grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
           layout_refused(dtype, build.pack_bytes,
@@ -3165,9 +3196,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   in_place = !is_push(algorithm) && build.quantization == Quantization::exact;
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
-                 partials_stride_n, elem_bytes(dtype), s.partials_bytes) ||
+                 partials_stride_n, elem_bytes(dtype),
+                 s.symmetric.partials_bytes) ||
       !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n,
-                 staging_stride_n, elem_bytes(dtype), s.staging_bytes))
+                 staging_stride_n, elem_bytes(dtype),
+                 s.symmetric.staging_bytes))
     return error_code(Error::view_past_region);
   // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input
   // in place (an exact pull), or none where it reads the staging.
@@ -3219,17 +3252,18 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
                 static_cast<int>(output_size_n),
                 static_cast<T*>(block_output_ptr), block_output_stride_m,
                 block_output_stride_n, static_cast<int>(block_output_size_m),
-                static_cast<int>(block_output_size_n), s.partials_ptr_array,
-                s.world, partials_stride_m, partials_stride_n,
-                static_cast<int>(partials_size_m),
-                static_cast<int>(partials_size_n), s.staging_ptr_array, s.world,
-                staging_stride_m, staging_stride_n,
-                static_cast<int>(staging_size_m),
-                static_cast<int>(staging_size_n), s.signals_ptr_array, s.world,
-                s.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-                int64_t{2}, s.max_blocks, int64_t{s.world}, s.status_device,
-                int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks,
-                num_blocks, eps, output_eps);
+                static_cast<int>(block_output_size_n),
+                s.symmetric.partials_ptr_array, s.world, partials_stride_m,
+                partials_stride_n, static_cast<int>(partials_size_m),
+                static_cast<int>(partials_size_n),
+                s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+                staging_stride_n, static_cast<int>(staging_size_m),
+                static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+                s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
+                int64_t{1}, int64_t{2}, s.symmetric.max_blocks,
+                int64_t{s.world}, s.status_device, int64_t{1},
+                int64_t{kStatusFields}, s.rank, s.timeout_ticks, num_blocks,
+                eps, output_eps);
       });
   // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
@@ -3294,7 +3328,7 @@ ErrorCode hip_custom_communicator_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.max_blocks, build, grid,
+          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
@@ -3416,7 +3450,7 @@ ErrorCode hip_custom_communicator_add_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.max_blocks, build, grid,
+          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
@@ -3575,7 +3609,7 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.max_blocks, build, grid,
+          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
   if (const std::optional<Error> e =
