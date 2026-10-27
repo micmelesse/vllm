@@ -1713,11 +1713,11 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
 
 namespace hip_custom_communicator {
 
-// THE COMMUNICATOR'S STATE, what every op's call reads and none changes: this rank and the world,
+// WHAT EVERY LAUNCH READS, and none changes: this rank and the world,
 // its buffers (Python's: allocated, exchanged and freed there) and their regions' sizes, how long a
 // kernel waits on a peer, and whether each launch is checked after it runs. Made once at open,
 // held by Python as a handle, freed at close.
-struct CommsState {
+struct LaunchState {
   int rank;
   int world;
   char* shared_buffer;
@@ -1742,7 +1742,7 @@ inline dim3 dim3_of(const Dim3& d) {
 // =================================================================================================
 
 inline std::optional<Error> all_reduce(
-    const CommsState& s, int64_t table_slot, const void* input,
+    const LaunchState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, DType dtype, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
@@ -1991,7 +1991,7 @@ inline std::optional<Error> all_reduce(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_rms_norm(
-    const CommsState& s, int64_t table_slot, const void* input,
+    const LaunchState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
     int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n,
@@ -2175,7 +2175,7 @@ inline std::optional<Error> all_reduce_rms_norm(
 // fused_add_rms_norm(all_reduce(inp), residual, weight), vLLM's roundings
 // exactly.
 inline std::optional<Error> all_reduce_add_rms_norm(
-    const CommsState& s, int64_t table_slot, const void* input,
+    const LaunchState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* residual, int64_t residual_stride_m, int64_t residual_stride_n,
     int64_t residual_size_m, int64_t residual_size_n, const void* weight, int64_t weight_stride_n,
@@ -2399,7 +2399,7 @@ inline std::optional<Error> all_reduce_add_rms_norm(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
-    const CommsState& s, int64_t table_slot,
+    const LaunchState& s, int64_t table_slot,
     const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
     int64_t input_size_n, const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
     int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m,
@@ -2629,7 +2629,7 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
 // rms_norm: out = rms_norm(inp, weight), vLLM's roundings exactly, on this rank's rows; the
 // weight `weight_dtype`, dtype or f32.
 inline std::optional<Error> rms_norm(
-    const CommsState& s, const void* input, int64_t input_stride_m,
+    const LaunchState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* weight,
     int64_t weight_stride_n, int64_t weight_size_n, void* output, int64_t output_stride_m,
     int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n, DType dtype,
@@ -2718,7 +2718,7 @@ inline std::optional<Error> rms_norm(
 // add_rms_norm: out, residual_out = fused_add_rms_norm(inp, residual, weight), vLLM's roundings
 // exactly, on this rank's rows.
 inline std::optional<Error> add_rms_norm(
-    const CommsState& s, const void* input, int64_t input_stride_m,
+    const LaunchState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* residual,
     int64_t residual_stride_m, int64_t residual_stride_n, int64_t residual_size_m,
     int64_t residual_size_n, const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
@@ -2820,7 +2820,7 @@ inline std::optional<Error> add_rms_norm(
 // add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each of this rank's rows
 // (all_reduce_add_attn_res_rms_norm's, its input the sum), `num_blocks` sources.
 inline std::optional<Error> add_attn_res_rms_norm(
-    const CommsState& s, const void* input,
+    const LaunchState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, int64_t prefix_size_m,
     int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,

@@ -33,12 +33,13 @@
 
 // =================================================================================
 // THE TORCH OP BOUNDARY. Nothing crosses but values and handles: Python owns the communicator's
-// memory (three buffers a rank: shared, private, host) as addresses and its state (a plain struct)
-// as a handle, makes and frees each through the functions below, and hands each op its state, its
-// tensors and its config's values. C++ keeps nothing between calls Python holds no handle to.
+// memory (three buffers a rank: shared, private, host) as addresses and its launch state (a plain
+// struct) as a handle, makes and frees each through the functions below, and hands each op its
+// launch state, its tensors and its config's values. C++ keeps nothing between calls Python holds
+// no handle to.
 // =================================================================================
 
-// EACH OP TAKES ITS COMMUNICATOR'S STATE (a handle, below), its tensors and values, then its
+// EACH OP TAKES ITS LAUNCH STATE (a handle, below), its tensors and values, then its
 // config's fields as plain values, its op's own (an algorithm where its kernel has several, tile_k
 // where it has K). Nothing is picked here: Python fills what a caller leaves out and hands its
 // table's pick the same way; the API checks it.
@@ -428,20 +429,20 @@ void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
 }  // namespace
 
 // =================================================================================================
-// THE STATE, AS A HANDLE: the API's CommsState, made here and handed to Python as its address (an
+// THE LAUNCH STATE, AS A HANDLE: the API's LaunchState, made here and handed to Python as its address (an
 // int, as vLLM's custom all-reduce hands its own), passed back to every op's call, and freed here
 // when Python closes. C++ keeps nothing else between calls.
 // =================================================================================================
 
-// THE COMMUNICATOR'S STATE (the API's CommsState), made once its buffers are: its handle.
-int64_t hip_custom_communicator_state(int64_t rank, int64_t world, int64_t shared_buffer,
+// THE COMMUNICATOR'S STATE (the API's LaunchState), made once its buffers are: its handle.
+int64_t hip_custom_communicator_launch_state(int64_t rank, int64_t world, int64_t shared_buffer,
                                       int64_t private_buffer, int64_t status_device,
                                       int64_t timeout_ticks, int64_t max_rows,
                                       int64_t staging_bytes, int64_t partials_bytes,
                                       bool checked_after_launch) {
   TORCH_CHECK(world >= 1 && rank >= 0 && rank < world,
               "hip_custom_communicator: rank ", rank, " is not one of world ", world, "'s");
-  return reinterpret_cast<int64_t>(new hip_custom_communicator::CommsState{
+  return reinterpret_cast<int64_t>(new hip_custom_communicator::LaunchState{
       .rank = narrowed(rank),
       .world = narrowed(world),
       .shared_buffer = reinterpret_cast<char*>(shared_buffer),
@@ -453,8 +454,8 @@ int64_t hip_custom_communicator_state(int64_t rank, int64_t world, int64_t share
       .partials_bytes = partials_bytes,
       .checked_after_launch = checked_after_launch});
 }
-void hip_custom_communicator_free_state(int64_t state) {
-  delete reinterpret_cast<hip_custom_communicator::CommsState*>(state);
+void hip_custom_communicator_free_launch_state(int64_t state) {
+  delete reinterpret_cast<hip_custom_communicator::LaunchState*>(state);
 }
 
 namespace {
@@ -469,8 +470,8 @@ Answer hip_custom_communicator_all_reduce(int64_t state, int64_t table_slot, tor
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   check_device({&input, &output});
   TORCH_CHECK(output.sizes() == input.sizes(),
               "output and input must have the same shape");
@@ -535,8 +536,8 @@ Answer hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t table_
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
       s, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
@@ -556,8 +557,8 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t ta
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
       s, table_slot, input.data_ptr(), input.stride(0), input.stride(1),
@@ -663,8 +664,8 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, i
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks);
@@ -697,8 +698,8 @@ Answer hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, tor
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true);
   const auto got = hip_custom_communicator::rms_norm(
       s, input.data_ptr(), input.stride(0), input.stride(1),
@@ -719,8 +720,8 @@ Answer hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true);
   const auto got = hip_custom_communicator::add_rms_norm(
       s, input.data_ptr(), input.stride(0), input.stride(1),
@@ -748,8 +749,8 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tenso
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes) {
-  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's state");
-  const auto& s = *reinterpret_cast<const hip_custom_communicator::CommsState*>(state);
+  TORCH_CHECK(state != 0, "hip_custom_communicator: a call takes its communicator's launch state");
+  const auto& s = *reinterpret_cast<const hip_custom_communicator::LaunchState*>(state);
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks);

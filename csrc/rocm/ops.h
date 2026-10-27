@@ -54,8 +54,8 @@ void paged_attention(
 
 // ROCm TP collectives
 // (vllm/distributed/device_communicators/hip_custom_communicator). Python owns the communicator's
-// memory as addresses and its state and configs as handles, through these, and hands every op
-// its state, its config and its tensors.
+// memory as addresses and its launch state as a handle, through these, and hands every op its
+// launch state, its tensors and its config's values.
 std::vector<int64_t> hip_custom_communicator_layout(int64_t max_rows, int64_t max_cols,
                                                     int64_t world);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
@@ -98,13 +98,14 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>>
 hip_custom_communicator_build_info();
 
-// THE STATE, as a handle (the API's CommsState, Python's to free), made once the buffers are.
-int64_t hip_custom_communicator_state(int64_t rank, int64_t world, int64_t shared_buffer,
+// THE LAUNCH STATE, as a handle (the API's LaunchState, Python's to free), made once the buffers
+// are.
+int64_t hip_custom_communicator_launch_state(int64_t rank, int64_t world, int64_t shared_buffer,
     int64_t private_buffer, int64_t status_device, int64_t timeout_ticks, int64_t max_rows,
     int64_t staging_bytes, int64_t partials_bytes, bool checked_after_launch);
-void hip_custom_communicator_free_state(int64_t state);
+void hip_custom_communicator_free_launch_state(int64_t state);
 
-// Each op once, on its communicator's state (a handle, above), its tensors and values, then its
+// Each op once, on its launch state (a handle, above), its tensors and values, then its
 // config's fields as plain values, its op's own: an algorithm by name where its kernel has
 // several, the grid and the block, the waves a EU, the tile (tile_k where it has K), what it
 // moves ("exact" or "int4"), the pack, the bytes an INT4 build quantizes from. The norms on rows

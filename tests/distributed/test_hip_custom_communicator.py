@@ -64,7 +64,7 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
             max_rows=MAX_TOKENS,
             max_cols=HIDDEN,
         )
-        assert not comm.disabled, comm.state
+        assert not comm.disabled, comm.lifecycle
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -141,7 +141,7 @@ def all_reduce_rms_norm_ranks(
             max_rows=MAX_TOKENS,
             max_cols=HIDDEN,
         )
-        assert not comm.disabled, comm.state
+        assert not comm.disabled, comm.lifecycle
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -220,7 +220,7 @@ def all_reduce_add_rms_norm_ranks(
             max_rows=MAX_TOKENS,
             max_cols=HIDDEN,
         )
-        assert not comm.disabled, comm.state
+        assert not comm.disabled, comm.lifecycle
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -317,7 +317,7 @@ def all_reduce_add_attn_res_rms_norm_ranks(
             max_rows=MAX_TOKENS,
             max_cols=HIDDEN,
         )
-        assert not comm.disabled, comm.state
+        assert not comm.disabled, comm.lifecycle
         dtype = torch.bfloat16
         try:
             for num_tokens in NUM_TOKENS:
@@ -489,7 +489,7 @@ def refused_calls_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank,
             max_rows=MAX_TOKENS,
             max_cols=HIDDEN,
         )
-        assert not comm.disabled, comm.state
+        assert not comm.disabled, comm.lifecycle
         try:
             # Far past the largest call it was sized for: vLLM takes another path.
             past = torch.ones(

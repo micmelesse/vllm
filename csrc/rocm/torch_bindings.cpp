@@ -142,14 +142,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                &hip_custom_communicator_supported);
   rocm_ops.def("hip_custom_communicator_build_info",
                &hip_custom_communicator_build_info);
-  // THE STATE, made and freed. Its maker's schema is written out, so Python passes its fields by
+  // THE LAUNCH STATE, made and freed. Its maker's schema is written out, so Python passes its fields by
   // name (an inferred schema names none); a schema that disagrees with its function fails the
   // library load. The free takes its handle alone, inferred.
   rocm_ops.def(
-      "hip_custom_communicator_state(int rank, int world, int shared_buffer, int private_buffer, int status_device, int timeout_ticks, int max_rows, int staging_bytes, int partials_bytes, bool checked_after_launch) -> int",
-      &hip_custom_communicator_state);
-  rocm_ops.def("hip_custom_communicator_free_state",
-               &hip_custom_communicator_free_state);
+      "hip_custom_communicator_launch_state(int rank, int world, int shared_buffer, int private_buffer, int status_device, int timeout_ticks, int max_rows, int staging_bytes, int partials_bytes, bool checked_after_launch) -> int",
+      &hip_custom_communicator_launch_state);
+  rocm_ops.def("hip_custom_communicator_free_launch_state",
+               &hip_custom_communicator_free_launch_state);
 
   // EACH OP ONCE, on its communicator's state (a handle, above), its tensors and values, then its
   // config's fields. `eps` is a float in the schema because torch has no `double` there; the kernel
