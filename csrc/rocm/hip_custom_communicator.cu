@@ -1652,7 +1652,10 @@ ErrorCode hip_custom_communicator_all_reduce(
                          algorithm == AllReduceAlgorithm::two_shot_pull) &&
                         !quantize_int4;
   const int shared_memory_bytes = 0;
-  const bool contiguous = input_stride_m == n * input_stride_n &&
+  // CONTIGUOUS: a plain two-shot's contiguous walk (its one instance that
+  // varies by layout; every other algorithm's instance is the strided one).
+  const bool contiguous = is_two_shot(algorithm) &&
+                          input_stride_m == n * input_stride_n &&
                           output_stride_m == n * output_stride_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
@@ -2181,7 +2184,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     in_place = (all_reduce_algorithm == AllReduceAlgorithm::one_shot_pull ||
                 all_reduce_algorithm == AllReduceAlgorithm::two_shot_pull) &&
                !quantize_int4;
-    const bool contiguous = input_stride_m == n * input_stride_n &&
+    // CONTIGUOUS: a plain two-shot's contiguous walk (its one instance that
+    // varies by layout; every other algorithm's instance is the strided one).
+    const bool contiguous = is_two_shot(all_reduce_algorithm) &&
+                            input_stride_m == n * input_stride_n &&
                             output_stride_m == n * output_stride_n;
     // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
     const bool tail =
