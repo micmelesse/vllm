@@ -192,11 +192,11 @@ struct AllReduceBuildConfig {
 
 // all_reduce_rms_norm.
 struct AllReduceRmsNormBuildConfig {
-  static constexpr Named<AllReduceRmsNormAlgorithm> algorithms[] = {
-      {AllReduceRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
-      {AllReduceRmsNormAlgorithm::two_shot_push, "two_shot_push"}};
-  AllReduceRmsNormAlgorithm algorithm;
+  static constexpr Named<AllReduceRmsNormKernelAlgorithm> algorithms[] = {
+      {AllReduceRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
+      {AllReduceRmsNormKernelAlgorithm::two_shot_pull, "two_shot_pull"},
+      {AllReduceRmsNormKernelAlgorithm::two_shot_push, "two_shot_push"}};
+  AllReduceRmsNormKernelAlgorithm algorithm;
   Dim3 block;
   int waves_per_eu;
   int tile_m;
@@ -208,11 +208,11 @@ struct AllReduceRmsNormBuildConfig {
 
 // all_reduce_add_rms_norm.
 struct AllReduceAddRmsNormBuildConfig {
-  static constexpr Named<AllReduceAddRmsNormAlgorithm> algorithms[] = {
-      {AllReduceAddRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAddRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
-      {AllReduceAddRmsNormAlgorithm::two_shot_push, "two_shot_push"}};
-  AllReduceAddRmsNormAlgorithm algorithm;
+  static constexpr Named<AllReduceAddRmsNormKernelAlgorithm> algorithms[] = {
+      {AllReduceAddRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
+      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull, "two_shot_pull"},
+      {AllReduceAddRmsNormKernelAlgorithm::two_shot_push, "two_shot_push"}};
+  AllReduceAddRmsNormKernelAlgorithm algorithm;
   Dim3 block;
   int waves_per_eu;
   int tile_m;
@@ -298,6 +298,22 @@ struct AddAttnResRmsNormBuildConfig {
 // table, which a launch looks its kernel up in.
 // =============================================================================
 
+// ALL_REDUCE_ADD_RMS_NORM'S ALGORITHMS, the op's (what the tuner picks among):
+// a fused kernel's body (the norm kernel's or the add-norm kernel's, by the
+// residual), or a SPLIT, our all-reduce kernel at that body then the norm (or
+// add-norm) on rows. The kernels' own enums are their bodies alone
+// (AllReduceRmsNormKernelAlgorithm, AllReduceAddRmsNormKernelAlgorithm).
+enum class AllReduceAddRmsNormAlgorithm : int {
+  one_shot_pull,
+  two_shot_pull,
+  two_shot_push,
+  one_shot_pull_split,
+  one_shot_push_split,
+  one_shot_push_staged_split,
+  two_shot_pull_split,
+  two_shot_push_split,
+};
+
 // EACH NORM ON ROWS' ONE ALGORITHM, its op's own (the table's "rows"; its
 // kernel has no algorithm parameter).
 enum class RmsNormAlgorithm : int { rows };
@@ -333,12 +349,13 @@ using AllReduceKernel =
                          false, false>);
 template <typename T, typename W>
 using AllReduceRmsNormKernel =
-    decltype(&all_reduce_rms_norm<AllReduceRmsNormAlgorithm{}, false, T, W, 2,
-                                  1, 64, 64, 16, 1, false, false>);
+    decltype(&all_reduce_rms_norm<AllReduceRmsNormKernelAlgorithm{}, false, T,
+                                  W, 2, 1, 64, 64, 16, 1, false, false>);
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
-    decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormAlgorithm{}, false, T,
-                                      W, 2, 1, 64, 64, 16, 1, false, false>);
+    decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},
+                                      false, T, W, 2, 1, 64, 64, 16, 1, false,
+                                      false>);
 template <typename T, typename W>
 using AllReduceAddAttnResRmsNormKernel =
     decltype(&all_reduce_add_attn_res_rms_norm<
@@ -583,12 +600,12 @@ inline std::optional<Error> check_kernel(const CommsState& s,
 // THREADS) groups a thread; the tile does not size the payload, so any build
 // sizes alike).
 constexpr bool slices_columns(AllReduceAlgorithm) { return false; }
-constexpr bool slices_columns(AllReduceRmsNormAlgorithm a) {
-  return a == AllReduceRmsNormAlgorithm::two_shot_push;
+constexpr bool slices_columns(AllReduceRmsNormKernelAlgorithm a) {
+  return a == AllReduceRmsNormKernelAlgorithm::two_shot_push;
 }
 
-constexpr bool slices_columns(AllReduceAddRmsNormAlgorithm a) {
-  return a == AllReduceAddRmsNormAlgorithm::two_shot_push;
+constexpr bool slices_columns(AllReduceAddRmsNormKernelAlgorithm a) {
+  return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
 }
 
 constexpr bool slices_columns(AllReduceAddAttnResRmsNormAlgorithm a) {
@@ -596,12 +613,12 @@ constexpr bool slices_columns(AllReduceAddAttnResRmsNormAlgorithm a) {
 }
 
 constexpr bool int4_groups_a_thread(AllReduceAlgorithm) { return false; }
-constexpr bool int4_groups_a_thread(AllReduceRmsNormAlgorithm a) {
-  return a == AllReduceRmsNormAlgorithm::two_shot_pull;
+constexpr bool int4_groups_a_thread(AllReduceRmsNormKernelAlgorithm a) {
+  return a == AllReduceRmsNormKernelAlgorithm::two_shot_pull;
 }
 
-constexpr bool int4_groups_a_thread(AllReduceAddRmsNormAlgorithm a) {
-  return a == AllReduceAddRmsNormAlgorithm::two_shot_pull;
+constexpr bool int4_groups_a_thread(AllReduceAddRmsNormKernelAlgorithm a) {
+  return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
 }
 
 constexpr bool int4_groups_a_thread(AllReduceAddAttnResRmsNormAlgorithm a) {
@@ -703,7 +720,8 @@ constexpr int64_t partials_need(A algorithm, int64_t m, int64_t packs,
   } else {
     if (slices_columns(algorithm)) return m * packs * pack;
     const int64_t row_bytes =
-        std::is_same_v<A, AllReduceAddRmsNormAlgorithm> && !is_push(algorithm)
+        std::is_same_v<A, AllReduceAddRmsNormKernelAlgorithm> &&
+                !is_push(algorithm)
             ? scale_slot_row(packs * pack) + kScaleSlotBytes
             : packs * pack;
     return (m + world - 1) / world * row_bytes;
@@ -1887,7 +1905,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization_name, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes,
-    const std::optional<std::string>& all_reduce_algorithm_name,
     std::optional<int64_t> rms_norm_grid_x,
     std::optional<int64_t> rms_norm_grid_y,
     std::optional<int64_t> rms_norm_grid_z,
@@ -1929,18 +1946,69 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     if (v < std::numeric_limits<int>::min() ||
         v > std::numeric_limits<int>::max())
       return error_code(Error::field_out_of_range);
-  // THE ALGORITHM: one fused kernel's (one_shot_pull, two_shot_pull,
-  // two_shot_push), or SPLIT: our all-reduce kernel (at this config's fields,
-  // its body all_reduce_algorithm, its checks and views written out here as
-  // all_reduce's are), then the norm on this rank's rows in place on its output
-  // (at the rms_norm_ fields; with a residual, the add and the norm), back to
-  // back on the stream. Every refusal, either path's, before any launch.
-  // all_reduce_algorithm and the rms_norm_ fields are a split's alone: given to
-  // a fused algorithm, or missing from a split, refused.
-  const bool split = algorithm_name == "split";
-  if (all_reduce_algorithm_name.has_value() != split)
-    return error_code(split ? Error::field_missing
-                            : Error::field_not_this_templates);
+  // THE ALGORITHM, the op's (AllReduceAddRmsNormAlgorithm): one fused kernel's
+  // body, or `<body>_split`: our all-reduce kernel at that body (at this
+  // config's fields, its checks and views written out here as all_reduce's
+  // are), then the norm on this rank's rows in place on its output (at the
+  // rms_norm_ fields; with a residual, the add and the norm), back to back on
+  // the stream. Every refusal, either path's, before any launch. The rms_norm_
+  // fields are a split's alone: given to a fused algorithm, or missing from a
+  // split, refused.
+  AllReduceAddRmsNormAlgorithm op_algorithm;
+  if (algorithm_name == "one_shot_pull")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull;
+  else if (algorithm_name == "two_shot_pull")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull;
+  else if (algorithm_name == "two_shot_push")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push;
+  else if (algorithm_name == "one_shot_pull_split")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull_split;
+  else if (algorithm_name == "one_shot_push_split")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_push_split;
+  else if (algorithm_name == "one_shot_push_staged_split")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_push_staged_split;
+  else if (algorithm_name == "two_shot_pull_split")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull_split;
+  else if (algorithm_name == "two_shot_push_split")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push_split;
+  else
+    return error_code(Error::no_such_kernel);
+  // WHAT IT LAUNCHES: the fused kernel's body (in the norm kernel's enum and
+  // the add-norm kernel's), or the split's all-reduce's.
+  bool split = false;
+  AllReduceRmsNormKernelAlgorithm algorithm{};
+  AllReduceAddRmsNormKernelAlgorithm add_algorithm{};
+  AllReduceAlgorithm all_reduce_algorithm{};
+  switch (op_algorithm) {
+    case AllReduceAddRmsNormAlgorithm::one_shot_pull:
+      algorithm = AllReduceRmsNormKernelAlgorithm::one_shot_pull;
+      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot_pull;
+      break;
+    case AllReduceAddRmsNormAlgorithm::two_shot_pull:
+      algorithm = AllReduceRmsNormKernelAlgorithm::two_shot_pull;
+      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
+      break;
+    case AllReduceAddRmsNormAlgorithm::two_shot_push:
+      algorithm = AllReduceRmsNormKernelAlgorithm::two_shot_push;
+      add_algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
+      break;
+    case AllReduceAddRmsNormAlgorithm::one_shot_pull_split:
+      split = true, all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
+      break;
+    case AllReduceAddRmsNormAlgorithm::one_shot_push_split:
+      split = true, all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
+      break;
+    case AllReduceAddRmsNormAlgorithm::one_shot_push_staged_split:
+      split = true,
+      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
+      break;
+    case AllReduceAddRmsNormAlgorithm::two_shot_pull_split:
+      split = true, all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
+      break;
+    case AllReduceAddRmsNormAlgorithm::two_shot_push_split:
+      split = true, all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
+      break;
+  }
   for (const std::optional<int64_t>& field :
        {rms_norm_grid_x, rms_norm_grid_y, rms_norm_grid_z, rms_norm_block_x,
         rms_norm_block_y, rms_norm_block_z, rms_norm_waves_per_eu,
@@ -1992,36 +2060,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   // ---- PRECONDITIONS, every Error the call can be refused for, in this order:
   // the config alone; the call against the config; the compiled kernel on this
   // device; the regions. Past this section the call runs. ----
-  // THE CONFIG'S NAMES: the fused kernel's algorithm (the norm's kernel's or
-  // the add-norm's, by the residual), or the split's all-reduce's.
-  AllReduceRmsNormAlgorithm algorithm{};
-  AllReduceAddRmsNormAlgorithm add_algorithm{};
-  AllReduceAlgorithm all_reduce_algorithm{};
-  if (split) {
-    if (*all_reduce_algorithm_name == "one_shot_pull")
-      all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
-    else if (*all_reduce_algorithm_name == "one_shot_push")
-      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
-    else if (*all_reduce_algorithm_name == "one_shot_push_staged")
-      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
-    else if (*all_reduce_algorithm_name == "two_shot_pull")
-      all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
-    else if (*all_reduce_algorithm_name == "two_shot_push")
-      all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
-    else
-      return error_code(Error::no_such_kernel);
-  } else if (algorithm_name == "one_shot_pull") {
-    algorithm = AllReduceRmsNormAlgorithm::one_shot_pull;
-    add_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull;
-  } else if (algorithm_name == "two_shot_pull") {
-    algorithm = AllReduceRmsNormAlgorithm::two_shot_pull;
-    add_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull;
-  } else if (algorithm_name == "two_shot_push") {
-    algorithm = AllReduceRmsNormAlgorithm::two_shot_push;
-    add_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push;
-  } else {
-    return error_code(Error::no_such_kernel);
-  }
+  // THE CONFIG'S QUANTIZATION, by name.
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";
@@ -2049,7 +2088,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     return error_code(Error::pack_out_of_range);
   if (int4_config &&
       (pack_bytes != kPackBytes ||
-       (!split && algorithm == AllReduceRmsNormAlgorithm::one_shot_pull)))
+       (!split && algorithm == AllReduceRmsNormKernelAlgorithm::one_shot_pull)))
     return error_code(Error::quantization_not_supported);
   // THE CALL'S DTYPE BUILT (the world is: open refuses the rest), and its
   // elements whole packs: at least an element a pack, whole packs a row (an
@@ -2378,7 +2417,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // place, the exact pull, every rank's input read where its table says; a
     // row wider than the tile, the build's CHUNKED instance; an INT4 row with a
     // tail, its TAIL instance (int4_tail).
-    const bool pull = algorithm != AllReduceRmsNormAlgorithm::two_shot_push;
+    const bool pull =
+        algorithm != AllReduceRmsNormKernelAlgorithm::two_shot_push;
     in_place = pull && !quantize_int4;
     const bool chunked = n > tile_n;
     const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
@@ -2432,7 +2472,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // past them is refused, never cut into bands; every input fits the staging
     // whole (an eager call's host copy). ----
     const bool groups_a_thread =
-        quantize_int4 && algorithm == AllReduceRmsNormAlgorithm::two_shot_pull;
+        quantize_int4 &&
+        algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_pull;
     const int64_t row =
         groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
     const int64_t owned_rows = (m + s.world - 1) / s.world;
@@ -2441,9 +2482,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     staging_size_n = row;
     partials_stride_m = row, partials_stride_n = 1,
     partials_size_m =
-        algorithm == AllReduceRmsNormAlgorithm::two_shot_pull   ? owned_rows
-        : algorithm == AllReduceRmsNormAlgorithm::two_shot_push ? m
-                                                                : 0,
+        algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_pull ? owned_rows
+        : algorithm == AllReduceRmsNormKernelAlgorithm::two_shot_push ? m
+                                                                      : 0,
     partials_size_n = row;
     // WHAT THE REGIONS MUST HOLD: its input whole; INT4, the payloads (the
     // pull's its staged rows' and its owned rows', the push's the call's).
@@ -2461,8 +2502,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // ---- THE FUSED ADD-NORM KERNEL (a residual) ----
     // WHAT THE CALL PICKS: in place, the exact pull; a row wider than the tile,
     // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance.
-    in_place = add_algorithm != AllReduceAddRmsNormAlgorithm::two_shot_push &&
-               !quantize_int4;
+    in_place =
+        add_algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push &&
+        !quantize_int4;
     const bool chunked = n > tile_n;
     const bool tail = quantize_int4 && int4_tail(add_algorithm, m, n, s.world);
     // THE INSTANCE: the kernel compiled at this config, on this device, for
@@ -2509,9 +2551,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     // slots: scale_slot_row, so every row's scale is aligned at any pack), INT4
     // the row alone, its scales in the scales region (max_rows rows). ----
     const bool pull_two_shot =
-        add_algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull;
+        add_algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
     const bool push_two_shot =
-        add_algorithm == AllReduceAddRmsNormAlgorithm::two_shot_push;
+        add_algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
     const bool groups_a_thread = quantize_int4 && pull_two_shot;
     const bool scale_slot = pull_two_shot && !quantize_int4;
     const int64_t row =

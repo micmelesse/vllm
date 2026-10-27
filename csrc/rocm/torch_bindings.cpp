@@ -134,12 +134,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "esidual_output, float eps, str algorithm, int grid_x, int grid_y, "
       "int grid_z, int block_x, int block_y, int block_z, int waves_per_e"
       "u, int tile_m, int tile_n, str quantization, int pack_bytes, int? "
-      "quantize_from_bytes, str? all_reduce_algorithm=None, int? rms_norm"
-      "_grid_x=None, int? rms_norm_grid_y=None, int? rms_norm_grid_z=None"
-      ", int? rms_norm_block_x=None, int? rms_norm_block_y=None, int? rms"
-      "_norm_block_z=None, int? rms_norm_waves_per_eu=None, int? rms_norm"
-      "_tile_m=None, int? rms_norm_tile_n=None, int? rms_norm_pack_bytes="
-      "None) -> int?");
+      "quantize_from_bytes, int? rms_norm_grid_x=None, int? rms_norm_grid"
+      "_y=None, int? rms_norm_grid_z=None, int? rms_norm_block_x=None, in"
+      "t? rms_norm_block_y=None, int? rms_norm_block_z=None, int? rms_nor"
+      "m_waves_per_eu=None, int? rms_norm_tile_m=None, int? rms_norm_tile"
+      "_n=None, int? rms_norm_pack_bytes=None) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
   rocm_ops.def(

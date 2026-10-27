@@ -1548,8 +1548,8 @@ class HipCustomCommunicator:
                 )
 
         # ONE C++ CALL: the fused kernel at the config's algorithm, or the split
-        # (algorithm "split": the all-reduce at its config, its body
-        # all_reduce_algorithm, then the norm at the rms_norm_ fields).
+        # (algorithm `<the all-reduce's body>_split`: the all-reduce at its config,
+        # then the norm at the rms_norm_ fields).
         first = config.all_reduce if split else config
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             state=self.state.handle,
@@ -1559,7 +1559,9 @@ class HipCustomCommunicator:
             output=output,
             residual_output=residual_output,
             eps=eps,
-            algorithm="split" if split else config.algorithm,
+            algorithm=f"{config.all_reduce.algorithm}_split"
+            if split
+            else config.algorithm,
             grid_x=first.grid_x,
             grid_y=first.grid_y,
             grid_z=first.grid_z,
@@ -1572,7 +1574,6 @@ class HipCustomCommunicator:
             quantization=first.quantization,
             pack_bytes=first.pack_bytes,
             quantize_from_bytes=first.quantize_from_bytes,
-            all_reduce_algorithm=config.all_reduce.algorithm if split else None,
             rms_norm_grid_x=config.rows.grid_x if split else None,
             rms_norm_grid_y=config.rows.grid_y if split else None,
             rms_norm_grid_z=config.rows.grid_z if split else None,

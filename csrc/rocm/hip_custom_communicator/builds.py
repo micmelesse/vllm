@@ -64,8 +64,8 @@ QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
 # table's "rows" (its own enum in the host).
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
-    "all_reduce_rms_norm": "AllReduceRmsNormAlgorithm",
-    "all_reduce_add_rms_norm": "AllReduceAddRmsNormAlgorithm",
+    "all_reduce_rms_norm": "AllReduceRmsNormKernelAlgorithm",
+    "all_reduce_add_rms_norm": "AllReduceAddRmsNormKernelAlgorithm",
     "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormAlgorithm",
     "rms_norm": "RmsNormAlgorithm",
     "add_rms_norm": "AddRmsNormAlgorithm",

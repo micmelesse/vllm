@@ -88,7 +88,6 @@ std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes,
-    const std::optional<std::string>& all_reduce_algorithm,
     std::optional<int64_t> rms_norm_grid_x,
     std::optional<int64_t> rms_norm_grid_y,
     std::optional<int64_t> rms_norm_grid_z,

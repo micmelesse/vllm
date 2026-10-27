@@ -16,7 +16,7 @@ namespace hip_custom_communicator {
 
 // THE ALL-REDUCE-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it
 // has.
-enum class AllReduceRmsNormAlgorithm {
+enum class AllReduceRmsNormKernelAlgorithm {
   one_shot_pull,
   two_shot_pull,
   two_shot_push
@@ -24,7 +24,7 @@ enum class AllReduceRmsNormAlgorithm {
 
 // THE ALL-REDUCE-ADD-RMSNORM'S ALGORITHMS: its ALGORITHM, exactly the bodies it
 // has.
-enum class AllReduceAddRmsNormAlgorithm {
+enum class AllReduceAddRmsNormKernelAlgorithm {
   one_shot_pull,
   two_shot_pull,
   two_shot_push
@@ -82,10 +82,10 @@ enum class AllReduceAddRmsNormAlgorithm {
 
 // =============================================================================
 // all_reduce_rms_norm: THE ALL-REDUCE THEN RMSNORM, ONE KERNEL: its ALGORITHM
-// (AllReduceRmsNormAlgorithm) is a template parameter, each algorithm its own
-// body under `if constexpr`.
+// (AllReduceRmsNormKernelAlgorithm) is a template parameter, each algorithm its
+// own body under `if constexpr`.
 // =============================================================================
-template <AllReduceRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4,
+template <AllReduceRmsNormKernelAlgorithm ALGORITHM, bool QUANTIZE_INT4,
           typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           int WAVES_PER_EU, bool CHUNKED, bool TAIL>
@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_writer, uint32_t* __restrict__ status_ptr,
         int64_t status_stride_field, int status_size_field, int rank,
         uint64_t timeout_ticks, float eps) {
-  if constexpr (ALGORITHM == AllReduceRmsNormAlgorithm::one_shot_pull) {
+  if constexpr (ALGORITHM == AllReduceRmsNormKernelAlgorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_rms_norm, above).
     // EXACT ALONE: an INT4 build of it compiles this exact body, which never
     // runs (the host refuses an INT4 call of it by name,
@@ -240,7 +240,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                    signals_size_block, signals_size_writer, status_ptr,
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::read, 1);
-  } else if constexpr (ALGORITHM == AllReduceRmsNormAlgorithm::two_shot_pull) {
+  } else if constexpr (ALGORITHM ==
+                       AllReduceRmsNormKernelAlgorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot_rms_norm, above).
     if constexpr (!QUANTIZE_INT4) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -666,7 +667,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_rms_norm, above).
-    static_assert(ALGORITHM == AllReduceRmsNormAlgorithm::two_shot_push,
+    static_assert(ALGORITHM == AllReduceRmsNormKernelAlgorithm::two_shot_push,
                   "all_reduce_rms_norm: no body for this algorithm");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns):
@@ -788,10 +789,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 // =============================================================================
 // all_reduce_add_rms_norm: THE ALL-REDUCE THEN THE ADD AND RMSNORM, ONE KERNEL:
-// its ALGORITHM (AllReduceAddRmsNormAlgorithm) is a template parameter, each
-// algorithm its own body under `if constexpr`.
+// its ALGORITHM (AllReduceAddRmsNormKernelAlgorithm) is a template parameter,
+// each algorithm its own body under `if constexpr`.
 // =============================================================================
-template <AllReduceAddRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4,
+template <AllReduceAddRmsNormKernelAlgorithm ALGORITHM, bool QUANTIZE_INT4,
           typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           int WAVES_PER_EU, bool CHUNKED, bool TAIL>
@@ -824,7 +825,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_writer, uint32_t* __restrict__ status_ptr,
         int64_t status_stride_field, int status_size_field, int rank,
         uint64_t timeout_ticks, float eps) {
-  if constexpr (ALGORITHM == AllReduceAddRmsNormAlgorithm::one_shot_pull) {
+  if constexpr (ALGORITHM ==
+                AllReduceAddRmsNormKernelAlgorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_rms_norm, above).
     // EXACT ALONE: an INT4 build of it compiles this exact body, which never
     // runs (the host refuses an INT4 call of it by name,
@@ -993,7 +995,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::read, 1);
   } else if constexpr (ALGORITHM ==
-                       AllReduceAddRmsNormAlgorithm::two_shot_pull) {
+                       AllReduceAddRmsNormKernelAlgorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot_add_rms_norm, above).
     if constexpr (!QUANTIZE_INT4) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -1551,8 +1553,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_add_rms_norm, above).
-    static_assert(ALGORITHM == AllReduceAddRmsNormAlgorithm::two_shot_push,
-                  "all_reduce_add_rms_norm: no body for this algorithm");
+    static_assert(
+        ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::two_shot_push,
+        "all_reduce_add_rms_norm: no body for this algorithm");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns):
     // any tile at any block, the row's columns past the pass masked
