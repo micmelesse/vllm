@@ -52,17 +52,19 @@ void paged_attention(
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
 
-// ROCm TP collectives (vllm/distributed/device_communicators/hip_custom_communicator): the
-// communicator's state (C++'s CommsState, a handle Python holds) opened, connected to its peers,
-// its captured inputs registered, closed and freed; and each op once, on the state, its tensors and
-// values, then its config's fields as plain values. EVERY ERROR IS A VALUE: each returns the Error's
-// number it was refused for, or none (hip_custom_communicator.cu); none raises.
-// The build's dtypes by name, its worlds, a pack's bytes, its
-// ops', errors' and fault places' names in their enums' order, and each
-// op's kernel's name, op and BuildConfigs (flat, a build's fields in the names'
-// order, 0 where its op's BuildConfig has none, with each op's count),
-// and each op's plain call (its dtypes and its weight's besides its input's,
-// flat, and four ints an op), and each build's algorithm by name.
+// ROCm TP collectives
+// (vllm/distributed/device_communicators/hip_custom_communicator): the
+// communicator's state (C++'s CommsState, a handle Python holds) opened,
+// connected to its peers, its captured inputs registered, closed and freed; and
+// each op once, on the state, its tensors and values, then its config's fields
+// as plain values. EVERY ERROR IS A VALUE: each returns the Error's number it
+// was refused for, or none (hip_custom_communicator.cu); none raises. The
+// build's dtypes by name, its worlds, a pack's bytes, its ops', errors' and
+// fault places' names in their enums' order, and each op's kernel's name, op
+// and BuildConfigs (flat, a build's fields in the names' order, 0 where its
+// op's BuildConfig has none, with each op's count), and each op's plain call
+// (its dtypes and its weight's besides its input's, flat, and four ints an op),
+// and each build's algorithm by name.
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
@@ -73,59 +75,76 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
 hip_custom_communicator_build_info();
 std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,
            std::vector<int64_t>>
-hip_custom_communicator_open(int64_t rank,
-    int64_t world, int64_t device, int64_t max_rows, int64_t max_cols, double timeout_seconds);
-std::optional<int64_t> hip_custom_communicator_connect(int64_t state,
-    const std::vector<int64_t>& handles);
+hip_custom_communicator_open(int64_t rank, int64_t world, int64_t device,
+                             int64_t max_rows, int64_t max_cols,
+                             double timeout_seconds);
+std::optional<int64_t> hip_custom_communicator_connect(
+    int64_t state, const std::vector<int64_t>& handles);
 std::tuple<std::optional<int64_t>, std::vector<int64_t>, std::vector<int64_t>>
 hip_custom_communicator_graph_ipc_meta(int64_t state);
-std::optional<int64_t> hip_custom_communicator_register_graph_buffers(int64_t state,
-    const std::vector<int64_t>& handles, const std::vector<int64_t>& offsets);
+std::optional<int64_t> hip_custom_communicator_register_graph_buffers(
+    int64_t state, const std::vector<int64_t>& handles,
+    const std::vector<int64_t>& offsets);
 std::optional<int64_t> hip_custom_communicator_close_peers(int64_t state);
 std::optional<int64_t> hip_custom_communicator_free(int64_t state);
-std::optional<int64_t> hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input,
-    torch::Tensor& output, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(int64_t state,
-    torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output, double eps,
-    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
-    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+std::optional<int64_t> hip_custom_communicator_all_reduce(
+    int64_t state, torch::Tensor& input, torch::Tensor& output,
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
+    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
-    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps, const std::string& algorithm, int64_t grid_x,
-    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state,
-    torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
-    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input,
-    torch::Tensor& weight, torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
-    int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
-    torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
-    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
+std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(
+    int64_t state, torch::Tensor& input, torch::Tensor& weight,
+    torch::Tensor& output, double eps, const std::string& algorithm,
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-std::optional<int64_t> hip_custom_communicator_add_attn_res_rms_norm(int64_t state,
-    torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
+    int64_t state, torch::Tensor& input, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps, const std::string& algorithm,
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
+    int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+    int64_t state, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
-    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
-    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output, torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps, const std::string& algorithm, int64_t grid_x,
+    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
+    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+std::optional<int64_t> hip_custom_communicator_rms_norm(
+    int64_t state, torch::Tensor& input, torch::Tensor& weight,
+    torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
+    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+std::optional<int64_t> hip_custom_communicator_add_rms_norm(
+    int64_t state, torch::Tensor& input, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
+    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+std::optional<int64_t> hip_custom_communicator_add_attn_res_rms_norm(
+    int64_t state, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output, torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
+    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
+    const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
