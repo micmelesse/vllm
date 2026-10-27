@@ -58,9 +58,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-# ---- THE BUILD'S FACTS, as the communicator and its callers name them: the ops, the
-# Errors C++ answers with (number for number), and whether a device runs it
-# (`supported`). What is compiled is the tuned table's configs (builds.py). ----
+# ---- CONSTANTS: the names and numbers the module is built on. ----
+
 
 # EVERY OP, as C++ names them (`enum class Op`; a test holds them equal) and as its
 # method is named: the all-reduce, then each all-reduce and the ops it fuses, then each
@@ -74,6 +73,8 @@ Op = Literal[
     "add_rms_norm",
     "add_attn_res_rms_norm",
 ]
+
+
 # THE OPS A PLAIN CALL OF RUNS ITS TABLE'S PICK (the tuned table's ops), and each one's
 # norm on rows, which a pick of two kernels runs after our all-reduce.
 TUNED_OPS: tuple[Op, ...] = (
@@ -82,16 +83,23 @@ TUNED_OPS: tuple[Op, ...] = (
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
 )
+
+
 _ROWS: Mapping[Op, Op] = {
     "all_reduce_rms_norm": "rms_norm",
     "all_reduce_add_rms_norm": "add_rms_norm",
     "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
 }
 
+
 # WHAT CROSSES THE LINKS, C++'s `Quantization` by name (number for number): exact
 # values, or INT4. A communicator's setting for its plain calls, and a config's field.
 Quantization = Literal["exact", "int4"]
+
+
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
+
+
 # WHICH BODY OF AN OP'S ONE KERNEL a config runs, each op's by the names its build
 # gives them (C++'s `algorithms`, its op file's enum): a one-shot or a two-shot,
 # pulled or pushed. A norm on this rank's rows has one, which the table names "rows".
@@ -102,16 +110,26 @@ AllReduceAlgorithm = Literal[
     "two_shot_push",
     "one_shot_push_staged",
 ]
+
+
 AllReduceRmsNormAlgorithm = Literal["one_shot_pull", "two_shot_pull", "two_shot_push"]
+
+
 AllReduceAddRmsNormAlgorithm = Literal[
     "one_shot_pull", "two_shot_pull", "two_shot_push"
 ]
+
+
 AllReduceAddAttnResRmsNormAlgorithm = Literal[
     "one_shot_pull", "two_shot_pull", "two_shot_push"
 ]
+
+
 # THE ALGORITHMS THAT PUSH (their peers store into this rank's buffers): no input of
 # theirs is read in place.
 _PUSHED = ("one_shot_push", "two_shot_push", "one_shot_push_staged")
+
+
 # Any op's, by name: what a lookup across ops (`TunedTable.kernel_config`) asks.
 Algorithm = Literal[
     "one_shot_pull",
@@ -121,6 +139,115 @@ Algorithm = Literal[
     "one_shot_push_staged",
     "rows",
 ]
+
+
+# How long an abandon gives a device to finish its launches, a communicator.
+ABANDON_WAIT_S = 2.0
+
+
+# What the signal handlers cover: what a supervisor and a terminal send.
+_EXIT_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+_exit_hooks_installed = False
+
+
+SignalHandler = Callable[[int, FrameType | None], None] | int | None
+
+
+# C++'s `DType` names, as torch's dtypes.
+_DTYPES: Mapping[str, torch.dtype] = {
+    "f16": torch.float16,
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+}
+
+
+# WHAT THE KERNELS ARE COMPILED AT (builds.py's DTYPES and WEIGHT_DTYPE, the host's
+# kDtypes and kPackBytes): an input in a 16-bit dtype, a norm's weight in its input's
+# dtype or fp32, every config's pack at most the widest load's 16 bytes.
+_INPUT_DTYPES = (torch.float16, torch.bfloat16)
+
+
+_WEIGHT_DTYPES = (torch.float32,)
+
+
+_PACK_BYTES = 16
+
+
+# THE TUNED TABLES (`hip_custom_communicator.json`, beside this file, written by gd's
+# tune: gd's `TunedTables`), a table an arch, each tuned on its own: its `inputs` (the
+# input points tuned: the op, qualified `hip_custom_communicator.<op>`, the
+# communicator's mode, `exact` or `quantized`, the world, the width, the tokens and the
+# op's own arguments, which the lookup does not read), its `configs` (each its op and
+# its fields: what the build compiles there) and its `picks` (an input's index, and its
+# configs' in the order a plain call launches them: the op's one kernel, or our
+# all-reduce then the op's norm on rows). No format or version: it changes with this
+# file, in one commit. The arch's table is parsed and checked at open
+# (`parse_tuned_table`); a plain call launches its nearest input's pick
+# (`TunedTable.nearest`). Every tuned number is here, none in C++. A communicator
+# opened with another file's path runs that instead (the tuner's candidate).
+_TABLE = Path(__file__).with_name("hip_custom_communicator.json")
+
+
+_TABLE_KEYS = ("inputs", "configs", "picks")
+
+
+# AN OP AS THE TABLE NAMES IT, and the communicator's quantization as the table's input
+# names it (the mode the communicator was opened in).
+_QUALIFIED = "hip_custom_communicator."
+
+
+_MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
+
+
+# A TUNED INPUT'S DTYPE's element bytes, as the table names it.
+_DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
+
+
+# A CONFIG POINT'S FIELDS, in their order (the table's): the kernel, its algorithm,
+# its grid, its block and the block's waves a EU (__launch_bounds__), its
+# tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
+# op carries each; all but the kernel and the grid are its build.
+_CONFIG_KEYS = (
+    "kernel",
+    "algorithm",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+    "block_x",
+    "block_y",
+    "block_z",
+    "waves_per_eu",
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "quantization",
+    "pack_bytes",
+    "quantize_from_bytes",
+)
+
+
+# TORCH'S DEFAULT for a collective on a GPU process group (`default_pg_nccl_timeout`):
+# how long a kernel waits on a peer before it reports a fault, where the group does not
+# say its own.
+TORCH_COLLECTIVE_TIMEOUT_SECONDS = 600.0
+
+
+# A COMMUNICATOR'S LIFE: `__init__` -> open | disabled (its error); open <-> capturing;
+# capturing -> broken when a capture raises, and open or capturing -> broken when the
+# capture's registration fails (its error and detail); open, capturing or broken ->
+# abandoned when the process exits (`abandon_open`); any -> closed. Every call is
+# refused but in open and capturing; a broken one raises naming why.
+Status = Literal["disabled", "open", "capturing", "broken", "abandoned", "closed"]
+
+
+# EVERY COMMUNICATOR OPENED IN THIS PROCESS AND NOT YET COLLECTED, for the exit hook to
+# move to Abandoned.
+_open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet()
+
+
+# ---- TYPES: what the module's values are. ----
 
 
 class Error(IntEnum):
@@ -189,73 +316,6 @@ class CommunicatorError(RuntimeError):
         self.error = error
 
 
-# ---- ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"): a process should
-# not die holding its peers' memory open, nor free its own while they read it. So an
-# exit, SIGTERM and SIGINT tear every open communicator down ALONE (this class's
-# `abandon`): every wait told to leave, the device given a bounded wait, every
-# BORROWED peer IPC mapping closed, then our own buffers freed once the device finished.
-# It never waits on a peer: one may be dead. It is idempotent. ----
-
-# How long an abandon gives a device to finish its launches, a communicator.
-ABANDON_WAIT_S = 2.0
-# What the signal handlers cover: what a supervisor and a terminal send.
-_EXIT_SIGNALS = (signal.SIGTERM, signal.SIGINT)
-_exit_hooks_installed = False
-SignalHandler = Callable[[int, FrameType | None], None] | int | None
-
-
-def abandon_open(wait_s: float = ABANDON_WAIT_S) -> None:
-    """EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS torn down alone, borrowed peer
-    mappings first: for an exit, a signal, a harness about to kill this process.
-    Never waits on a peer; waits at most `wait_s` a communicator for its device. A
-    communicator abandoned here can still be `close()`d (it does what is left)."""
-    for communicator in list(_open_communicators):
-        communicator.abandon(wait_s)
-
-
-def _on_exit_signal(
-    previous: SignalHandler, signum: int, frame: FrameType | None
-) -> None:
-    """Abandon, then what was there before: the previous handler, or the default
-    action (re-raised with the default restored), or nothing when it was ignored.
-    Python runs this on the main thread between bytecodes, so a main thread stuck
-    in a C++ call (a synchronize) reaches it only when that returns; a harness that
-    must not wait calls `abandon_open` from its own thread."""
-    abandon_open()
-    if callable(previous):
-        previous(signum, frame)
-    elif previous != signal.SIG_IGN:
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-
-
-def _install_exit_hooks() -> None:
-    """Once a process, at the first open: atexit, and SIGTERM and SIGINT handlers
-    chained in front of whatever is there (from the main thread only: Python sets
-    handlers nowhere else)."""
-    global _exit_hooks_installed
-    if _exit_hooks_installed:
-        return
-    _exit_hooks_installed = True
-    atexit.register(abandon_open)
-    if threading.current_thread() is not threading.main_thread():
-        logger.warning(
-            "HipCustomCommunicator opened off the main thread: no SIGTERM/SIGINT "
-            "teardown (process exit still runs it)"
-        )
-        return
-    for sig in _EXIT_SIGNALS:
-        signal.signal(sig, functools.partial(_on_exit_signal, signal.getsignal(sig)))
-
-
-# C++'s `DType` names, as torch's dtypes.
-_DTYPES: Mapping[str, torch.dtype] = {
-    "f16": torch.float16,
-    "bf16": torch.bfloat16,
-    "f32": torch.float32,
-}
-
-
 @dataclass(frozen=True)
 class Build:
     """ONE BUILD OF AN OP'S KERNEL, what dispatch instantiates (C++'s BuildConfig): its
@@ -289,107 +349,6 @@ class Build:
             quantization=config.quantization,
             pack_bytes=config.pack_bytes,
         )
-
-
-def problem_size() -> tuple[int, int] | None:
-    """THE LARGEST CALL A MODEL'S COMMUNICATOR SERVES, from the server's config: every
-    all-reduce is at most a batch of tokens, `max_num_batched_tokens`, and a row is
-    at most the hidden size, the target's or a speculative draft model's (STANDARDS,
-    *A kernel's own buffers are sized from the problem it serves*). None where there
-    is no server config to say it (vLLM building its communicators in a test or a
-    tool): a communicator is never sized by a guess."""
-    from vllm.config import get_current_vllm_config_or_none
-
-    config = get_current_vllm_config_or_none()
-    if config is None or config.model_config is None:
-        return None
-    widest = config.model_config.get_hidden_size()
-    spec = config.speculative_config
-    draft = getattr(spec, "draft_model_config", None) if spec is not None else None
-    if draft is not None:
-        widest = max(widest, draft.get_hidden_size())
-    return config.scheduler_config.max_num_batched_tokens, widest
-
-
-# WHAT THE KERNELS ARE COMPILED AT (builds.py's DTYPES and WEIGHT_DTYPE, the host's
-# kDtypes and kPackBytes): an input in a 16-bit dtype, a norm's weight in its input's
-# dtype or fp32, every config's pack at most the widest load's 16 bytes.
-_INPUT_DTYPES = (torch.float16, torch.bfloat16)
-_WEIGHT_DTYPES = (torch.float32,)
-_PACK_BYTES = 16
-
-
-def should(
-    op: Op,
-    input: torch.Tensor,
-    max_rows: int,
-    max_cols: int,
-    weight: torch.Tensor | None = None,
-) -> bool:
-    """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
-    runs on an open communicator whose exchange was sized for `max_rows` rows of at most
-    `max_cols`: [rows, cols] in a dtype the kernels are compiled at, a norm's weight in
-    its dtype or fp32, whole packs a row, inside that box (C++ sized every region for
-    the box at every dtype, so a call inside it fits). Python alone, no C++ call, as
-    vLLM's `should_custom_ar`; C++ refuses no call this admits."""
-    if (
-        input.dtype not in _INPUT_DTYPES
-        or not input.is_contiguous()
-        or input.numel() == 0
-        or input.dim() != 2
-    ):
-        return False
-    if weight is not None and weight.dtype not in (input.dtype, *_WEIGHT_DTYPES):
-        return False
-    rows, row = input.shape
-    return (
-        row * input.element_size() % _PACK_BYTES == 0
-        and rows <= max_rows
-        and row <= max_cols
-    )
-
-
-# THE TUNED TABLES (`hip_custom_communicator.json`, beside this file, written by gd's
-# tune: gd's `TunedTables`), a table an arch, each tuned on its own: its `inputs` (the
-# input points tuned: the op, qualified `hip_custom_communicator.<op>`, the
-# communicator's mode, `exact` or `quantized`, the world, the width, the tokens and the
-# op's own arguments, which the lookup does not read), its `configs` (each its op and
-# its fields: what the build compiles there) and its `picks` (an input's index, and its
-# configs' in the order a plain call launches them: the op's one kernel, or our
-# all-reduce then the op's norm on rows). No format or version: it changes with this
-# file, in one commit. The arch's table is parsed and checked at open
-# (`parse_tuned_table`); a plain call launches its nearest input's pick
-# (`TunedTable.nearest`). Every tuned number is here, none in C++. A communicator
-# opened with another file's path runs that instead (the tuner's candidate).
-_TABLE = Path(__file__).with_name("hip_custom_communicator.json")
-_TABLE_KEYS = ("inputs", "configs", "picks")
-# AN OP AS THE TABLE NAMES IT, and the communicator's quantization as the table's input
-# names it (the mode the communicator was opened in).
-_QUALIFIED = "hip_custom_communicator."
-_MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
-# A TUNED INPUT'S DTYPE's element bytes, as the table names it.
-_DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
-# A CONFIG POINT'S FIELDS, in their order (the table's): the kernel, its algorithm,
-# its grid, its block and the block's waves a EU (__launch_bounds__), its
-# tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
-# op carries each; all but the kernel and the grid are its build.
-_CONFIG_KEYS = (
-    "kernel",
-    "algorithm",
-    "grid_x",
-    "grid_y",
-    "grid_z",
-    "block_x",
-    "block_y",
-    "block_z",
-    "waves_per_eu",
-    "tile_m",
-    "tile_n",
-    "tile_k",
-    "quantization",
-    "pack_bytes",
-    "quantize_from_bytes",
-)
 
 
 # EACH OP'S CONFIG, ONE CLASS AN OP, a field each (in `_CONFIG_KEYS`' order): its
@@ -581,6 +540,8 @@ Config = (
     | AddRmsNormConfig
     | AddAttnResRmsNormConfig
 )
+
+
 # EACH KERNEL'S CONFIG CLASS, by the kernel's name (the table's `kernel`).
 _CONFIGS: Mapping[str, type[Config]] = {
     c.kernel: c
@@ -625,33 +586,6 @@ SplitConfig = (
     | AllReduceAddRmsNormSplitConfig
     | AllReduceAddAttnResRmsNormSplitConfig
 )
-
-
-def config_of_record(c: Mapping[str, Any]) -> Config:
-    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as its
-    kernel's config: its algorithm one of the kernel's, and a field the class holds
-    (a norm on rows' algorithm, tile_k without K) the class's."""
-    cls = _CONFIGS[c["kernel"]]
-    if c["algorithm"] not in cls.algorithms:
-        raise ValueError(f"{c['kernel']} has no algorithm {c['algorithm']}")
-    own = {f.name for f in fields(cls)}
-    for k in ("algorithm", "tile_k"):
-        if k not in own and c[k] != getattr(cls, k):
-            raise ValueError(f"{c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}")
-    return cls(**{k: c[k] for k in _CONFIG_KEYS if k in own})
-
-
-def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
-    """WHAT A CONFIG AS THE TABLE HOLDS IT (`c`, `_CONFIG_KEYS`) FORCED ON `op` IS
-    REFUSED FOR, or None (a caller holding configs flat, gd's): another op's kernel or
-    an algorithm its kernel lacks, no_such_kernel; tile_k on a kernel without K,
-    field_not_this_templates."""
-    cls = _CONFIGS.get(c["kernel"])
-    if cls is None or c["kernel"] != op or c["algorithm"] not in cls.algorithms:
-        return Error.no_such_kernel
-    if "tile_k" not in {f.name for f in fields(cls)} and c["tile_k"] != cls.tile_k:
-        return Error.field_not_this_templates
-    return None
 
 
 @dataclass(frozen=True)
@@ -773,6 +707,121 @@ class TunedTable:
         return None
 
 
+@dataclass
+class Lifecycle:
+    """THE COMMUNICATOR'S LIFE: its status, and why where it is disabled or broken; the
+    lock every move of the status takes; one teardown at a time (close, and the exit
+    hook's abandon)."""
+
+    status: Status = "closed"
+    error: Error | None = None  # why: a disabled one's, a broken one's
+    detail: str = ""  # what left a broken one's peers half-done
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    teardown: threading.Lock = field(default_factory=threading.Lock)
+
+    def holds(self) -> bool:
+        """Whether it still holds peer mappings and buffers only `close()` releases:
+        what `__del__` warns about, read without a global lookup (collection can run at
+        interpreter shutdown, when globals are None)."""
+        return self.status in ("open", "capturing", "broken")
+
+
+@dataclass(frozen=True)
+class CommsState:
+    """THE STATE BETWEEN PYTHON AND C++: C++'s CommsState (`handle`: its memory, its
+    peers, its captured inputs), and what Python reads once at open: the device's arch
+    and the arch's tuned table."""
+
+    handle: int
+    arch: str
+    tuned_table: TunedTable
+
+
+@dataclass(frozen=True, eq=False)
+class Arguments:
+    """WHAT THE COMMUNICATOR WAS CONSTRUCTED WITH, every None filled (`__init__`): the
+    groups, the device, how long a kernel waits on a peer, the largest call served (rows
+    of at most `max_cols`), what the plain calls move, and the tuned tables' file. What
+    follows from them is a method each."""
+
+    cpu_group: ProcessGroup
+    device_group: ProcessGroup
+    device: torch.device
+    timeout_seconds: float
+    max_rows: int
+    max_cols: int
+    quantization: Quantization
+    tuned_path: Path
+
+    @functools.cached_property
+    def world(self) -> int:
+        return self.device_group.size()
+
+    @functools.cached_property
+    def rank(self) -> int:
+        return self.device_group.rank()
+
+
+# ---- HELPERS: free functions, each taking what it uses. ----
+
+
+def should(
+    op: Op,
+    input: torch.Tensor,
+    max_rows: int,
+    max_cols: int,
+    weight: torch.Tensor | None = None,
+) -> bool:
+    """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
+    runs on an open communicator whose exchange was sized for `max_rows` rows of at most
+    `max_cols`: [rows, cols] in a dtype the kernels are compiled at, a norm's weight in
+    its dtype or fp32, whole packs a row, inside that box (C++ sized every region for
+    the box at every dtype, so a call inside it fits). Python alone, no C++ call, as
+    vLLM's `should_custom_ar`; C++ refuses no call this admits."""
+    if (
+        input.dtype not in _INPUT_DTYPES
+        or not input.is_contiguous()
+        or input.numel() == 0
+        or input.dim() != 2
+    ):
+        return False
+    if weight is not None and weight.dtype not in (input.dtype, *_WEIGHT_DTYPES):
+        return False
+    rows, row = input.shape
+    return (
+        row * input.element_size() % _PACK_BYTES == 0
+        and rows <= max_rows
+        and row <= max_cols
+    )
+
+
+def config_of_record(c: Mapping[str, Any]) -> Config:
+    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as its
+    kernel's config: its algorithm one of the kernel's, and a field the class holds
+    (a norm on rows' algorithm, tile_k without K) the class's."""
+    cls = _CONFIGS[c["kernel"]]
+    if c["algorithm"] not in cls.algorithms:
+        raise ValueError(f"{c['kernel']} has no algorithm {c['algorithm']}")
+    own = {f.name for f in fields(cls)}
+    for k in ("algorithm", "tile_k"):
+        if k not in own and c[k] != getattr(cls, k):
+            raise ValueError(f"{c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}")
+    return cls(**{k: c[k] for k in _CONFIG_KEYS if k in own})
+
+
+def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
+    """WHAT A CONFIG AS THE TABLE HOLDS IT (`c`, `_CONFIG_KEYS`) FORCED ON `op` IS
+    REFUSED FOR, or None (a caller holding configs flat, gd's): another op's kernel or
+    an algorithm its kernel lacks, no_such_kernel; tile_k on a kernel without K,
+    field_not_this_templates."""
+    cls = _CONFIGS.get(c["kernel"])
+    if cls is None or c["kernel"] != op or c["algorithm"] not in cls.algorithms:
+        return Error.no_such_kernel
+    if "tile_k" not in {f.name for f in fields(cls)} and c["tile_k"] != cls.tile_k:
+        return Error.field_not_this_templates
+    return None
+
+
 def parse_tuned_table(path: Path, arch: str) -> TunedTable | None:
     """THE TUNED TABLE AT `path` ON `arch` (the file, a table an arch: gd's
     `TunedTables`), parsed and checked, or None where the file holds none for it. A
@@ -889,108 +938,191 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | None:
     return TunedTable(picks, tuple(configs))
 
 
-def configured_quantization() -> Quantization:
-    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks (exact by default:
-    INT4 is lossy, so opt-in)."""
-    import vllm.envs as envs
+def open_state(
+    cpu_group: ProcessGroup,
+    device_group: ProcessGroup,
+    device: torch.device,
+    max_rows: int,
+    max_cols: int,
+    timeout_seconds: float,
+    tuned_path: Path,
+) -> CommsState | Error:
+    """THE COMMUNICATOR'S STATE, OPENED (on `device`, this rank of `device_group`, its
+    exchange over `cpu_group`, sized for `max_rows` rows of at most `max_cols`, a wait
+    giving up after `timeout_seconds`, its table `tuned_path`'s), or the Error it cannot
+    open for (it is then disabled): C++'s state made
+    (the device supported, its buffers allocated), the tuned table read for its
+    arch, and every peer's regions opened, after the exchange over the CPU group (a
+    collective, so every rank must reach it).
 
-    asked = envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION
-    return "int4" if asked == "INT4" else "exact"
-
-
-def is_weak_contiguous(input: torch.Tensor) -> bool:
-    return input.is_contiguous() or (
-        input.storage().nbytes() - input.storage_offset() * input.element_size()
-        == input.numel() * input.element_size()
+    Eager, and before any capture: doing this inside a cudagraph capture is not
+    recoverable. An open that raises frees what it made, alone, and raises."""
+    # THE GROUPS: one world, this rank the same in both.
+    if (
+        cpu_group.size() != device_group.size()
+        or cpu_group.rank() != device_group.rank()
+    ):
+        return Error.groups_disagree
+    if torch.cuda.current_device() != device.index:
+        raise CommunicatorError(
+            Error.wrong_device,
+            f"the current device is {torch.cuda.current_device()}, not the "
+            f"communicator's {device.index}",
+        )
+    ops = torch.ops._rocm_C
+    error, handle, ipc_handle, arch = ops.hip_custom_communicator_open(
+        rank=device_group.rank(),
+        world=device_group.size(),
+        device=device.index,
+        max_rows=max_rows,
+        max_cols=max_cols,
+        timeout_seconds=timeout_seconds,
     )
-
-
-# TORCH'S DEFAULT for a collective on a GPU process group (`default_pg_nccl_timeout`):
-# how long a kernel waits on a peer before it reports a fault, where the group does not
-# say its own.
-TORCH_COLLECTIVE_TIMEOUT_SECONDS = 600.0
-
-
-def collective_timeout_seconds(group: ProcessGroup, device: torch.device) -> float:
-    """The group's own timeout, so a wait in our kernels gives up when every other
-    collective on the group would: torch's 10 minutes unless the group was made with
-    another. Read through torch's backend options, which are private, so where they
-    are not there it is torch's default."""
+    if error is not None:
+        return Error(error)
+    tuned_table = parse_tuned_table(tuned_path, arch)
+    if tuned_table is None:
+        ops.hip_custom_communicator_free(state=handle)
+        return Error.no_tuned_table
     try:
-        return group._get_backend(device).options._timeout.total_seconds()
-    except (AttributeError, RuntimeError):
-        return TORCH_COLLECTIVE_TIMEOUT_SECONDS
+        # THE EXCHANGE, one collective over the CPU group: every rank's regions' IPC
+        # handles, its host, its GPU and its pid.
+        props = torch.cuda.get_device_properties(device)
+        me = {
+            "handle": ipc_handle,
+            "host": socket.gethostname(),
+            "gpu": str(getattr(props, "uuid", "")),
+            "pid": os.getpid(),
+        }
+        everyone: list[Any] = [None] * device_group.size()
+        torch.distributed.all_gather_object(everyone, me, group=cpu_group)
+        # EVERY PEER'S GPU, where this process sees it (by its UUID), reachable from
+        # ours: a rank that cannot reach a peer's GPU is refused here, by name, not
+        # at its first call.
+        here = {
+            str(getattr(torch.cuda.get_device_properties(d), "uuid", "")): d
+            for d in range(torch.cuda.device_count())
+        }
+        for r, peer in enumerate(everyone):
+            d = here.get(peer["gpu"])
+            if r == device_group.rank() or d is None or d == device.index:
+                continue
+            if not torch.cuda.can_device_access_peer(device.index, d):
+                raise CommunicatorError(
+                    Error.peer_not_accessible,
+                    f"device {device.index} cannot access rank {r}'s device {d}",
+                )
+        for r, peer in enumerate(everyone):
+            if r == device_group.rank():
+                continue
+            if peer["host"] != me["host"]:
+                logger.warning(
+                    "HipCustomCommunicator open: rank %d is on another host", r
+                )
+            elif peer["gpu"] and peer["gpu"] == me["gpu"]:
+                logger.warning(
+                    "HipCustomCommunicator open: rank %d (pid %d) is on this "
+                    "rank's GPU",
+                    r,
+                    peer["pid"],
+                )
+        error = ops.hip_custom_communicator_connect(
+            state=handle, handles=[b for peer in everyone for b in peer["handle"]]
+        )
+        if error is not None:
+            raise CommunicatorError(Error(error), "opening the peers' regions")
+    except BaseException:
+        close_peers(handle)
+        free_state(handle)
+        raise
+    # THE EXIT HOOKS, once a process, at the first open: atexit, and SIGTERM and
+    # SIGINT handlers chained in front of whatever is there (from the main thread
+    # only: Python sets handlers nowhere else). A handler abandons, then runs what
+    # was there before: the previous handler, or the default action (re-raised with
+    # the default restored), or nothing when it was ignored. Python runs it on the
+    # main thread between bytecodes, so a main thread stuck in a C++ call (a
+    # synchronize) reaches it only when that returns; a harness that must not wait
+    # calls `abandon_open` from its own thread.
+    global _exit_hooks_installed
+    if not _exit_hooks_installed:
+        _exit_hooks_installed = True
+        atexit.register(abandon_open)
+        if threading.current_thread() is not threading.main_thread():
+            logger.warning(
+                "HipCustomCommunicator opened off the main thread: no SIGTERM/SIGINT "
+                "teardown (process exit still runs it)"
+            )
+        else:
+
+            def on_exit_signal(
+                previous: SignalHandler, signum: int, frame: FrameType | None
+            ) -> None:
+                abandon_open()
+                if callable(previous):
+                    previous(signum, frame)
+                elif previous != signal.SIG_IGN:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+
+            for sig in _EXIT_SIGNALS:
+                signal.signal(
+                    sig, functools.partial(on_exit_signal, signal.getsignal(sig))
+                )
+    logger.info(
+        "HipCustomCommunicator ready: exchange sized for %d rows of %d",
+        max_rows,
+        max_cols,
+    )
+    return CommsState(handle=handle, arch=arch, tuned_table=tuned_table)
 
 
-# ---- THE COMMUNICATOR. ----
+def close_peers(handle: int) -> None:
+    """EVERY BORROWED MAPPING of the state at `handle` closed (C++'s close_peers: the
+    peers' regions, their captured inputs); carries on past an error, logged. Three
+    callers: an open that raised, close, abandon."""
+    error = torch.ops._rocm_C.hip_custom_communicator_close_peers(state=handle)
+    if error is not None:
+        logger.error("HipCustomCommunicator: closing the peers: %s", Error(error).name)
 
 
-# A COMMUNICATOR'S LIFE: `__init__` -> open | disabled (its error); open <-> capturing;
-# capturing -> broken when a capture raises, and open or capturing -> broken when the
-# capture's registration fails (its error and detail); open, capturing or broken ->
-# abandoned when the process exits (`abandon_open`); any -> closed. Every call is
-# refused but in open and capturing; a broken one raises naming why.
-Status = Literal["disabled", "open", "capturing", "broken", "abandoned", "closed"]
+def free_state(handle: int) -> None:
+    """THE STATE AT `handle` freed, its own buffers with it (C++'s free), once no peer
+    has them open; an error is logged. Three callers: an open that raised, close,
+    abandon."""
+    error = torch.ops._rocm_C.hip_custom_communicator_free(state=handle)
+    if error is not None:
+        logger.error("HipCustomCommunicator: freeing: %s", Error(error).name)
 
 
-@dataclass
-class Lifecycle:
-    """THE COMMUNICATOR'S LIFE: its status, and why where it is disabled or broken; the
-    lock every move of the status takes; one teardown at a time (close, and the exit
-    hook's abandon)."""
-
-    status: Status = "closed"
-    error: Error | None = None  # why: a disabled one's, a broken one's
-    detail: str = ""  # what left a broken one's peers half-done
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    teardown: threading.Lock = field(default_factory=threading.Lock)
-
-    def holds(self) -> bool:
-        """Whether it still holds peer mappings and buffers only `close()` releases:
-        what `__del__` warns about, read without a global lookup (collection can run at
-        interpreter shutdown, when globals are None)."""
-        return self.status in ("open", "capturing", "broken")
+def barrier_within(group: ProcessGroup, seconds: float) -> bool:
+    """EVERY RANK OF `group` ARRIVED within `seconds`, or False (a peer that did not,
+    or a group that failed): never unbounded, a peer may be dead. close's two
+    handshakes."""
+    try:
+        torch.distributed.barrier(group=group, async_op=True).wait(
+            timedelta(seconds=seconds)
+        )
+    except RuntimeError:
+        return False
+    return True
 
 
-@dataclass(frozen=True)
-class CommsState:
-    """THE STATE BETWEEN PYTHON AND C++: C++'s CommsState (`handle`: its memory, its
-    peers, its captured inputs), and what Python reads once at open: the device's arch
-    and the arch's tuned table."""
-
-    handle: int
-    arch: str
-    tuned_table: TunedTable
+# ---- THE API: the communicator, and the exit hook. ----
 
 
-@dataclass(frozen=True, eq=False)
-class Arguments:
-    """WHAT THE COMMUNICATOR WAS CONSTRUCTED WITH, every None filled (`__init__`): the
-    groups, the device, how long a kernel waits on a peer, the largest call served (rows
-    of at most `max_cols`), what the plain calls move, and the tuned tables' file. What
-    follows from them is a method each."""
-
-    cpu_group: ProcessGroup
-    device_group: ProcessGroup
-    device: torch.device
-    timeout_seconds: float
-    max_rows: int
-    max_cols: int
-    quantization: Quantization
-    tuned_path: Path
-
-    @functools.cached_property
-    def world(self) -> int:
-        return self.device_group.size()
-
-    @functools.cached_property
-    def rank(self) -> int:
-        return self.device_group.rank()
-
-
-# EVERY COMMUNICATOR OPENED IN THIS PROCESS AND NOT YET COLLECTED, for the exit hook to
-# move to Abandoned.
-_open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet()
+# ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"): a process should not
+# die holding its peers' memory open, nor free its own while they read it. So an exit,
+# SIGTERM and SIGINT tear every open communicator down ALONE (its `abandon`): the
+# device given a bounded wait, every BORROWED peer IPC mapping closed, then our own
+# buffers freed once the device finished. It never waits on a peer: one may be dead. It
+# is idempotent.
+def abandon_open(wait_s: float = ABANDON_WAIT_S) -> None:
+    """EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS torn down alone, borrowed peer
+    mappings first: for an exit, a signal, a harness about to kill this process.
+    Never waits on a peer; waits at most `wait_s` a communicator for its device. A
+    communicator abandoned here can still be `close()`d (it does what is left)."""
+    for communicator in list(_open_communicators):
+        communicator.abandon(wait_s)
 
 
 class HipCustomCommunicator:
@@ -1031,11 +1163,13 @@ class HipCustomCommunicator:
         """Keep the groups and the device, then `open_state`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
         `timeout_seconds`: how long a kernel waits on a peer before it reports a fault;
-        None is the device group's own (`collective_timeout_seconds`). `max_rows` and
+        None is the device group's own (its backend's timeout). `max_rows` and
         `max_cols`: the largest call it serves, which its exchange is sized for; None is
-        the server's (`problem_size`). `quantization`: what the plain calls move across
+        the server's (its max_num_batched_tokens and hidden size). `quantization`: what
+        the plain calls move across
         the links, from each op's crossover up (their table: the quantized one where
-        INT4); None is what the environment asks (`configured_quantization`).
+        INT4); None is what the environment asks
+        (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION).
         `tuned_path`: the tuned tables' file its plain calls run from (the arch's table,
         `parse_tuned_table`): the shipped one (`hip_custom_communicator.json`), or a
         tuner's candidate."""
@@ -1043,7 +1177,24 @@ class HipCustomCommunicator:
         self.state = None
         device = torch.device(f"cuda:{device}" if isinstance(device, int) else device)
         if max_rows is None or max_cols is None:
-            served = problem_size()
+            # THE LARGEST CALL A MODEL'S COMMUNICATOR SERVES, from the server's
+            # config: every all-reduce is at most a batch of tokens,
+            # `max_num_batched_tokens`, and a row at most the hidden size, the
+            # target's or a speculative draft model's (STANDARDS, *A kernel's own
+            # buffers are sized from the problem it serves*). None where there is no
+            # server config (vLLM building its communicators in a test or a tool): a
+            # communicator is never sized by a guess.
+            from vllm.config import get_current_vllm_config_or_none
+
+            config = get_current_vllm_config_or_none()
+            served = None
+            if config is not None and config.model_config is not None:
+                widest = config.model_config.get_hidden_size()
+                spec = config.speculative_config
+                draft = getattr(spec, "draft_model_config", None) if spec else None
+                if draft is not None:
+                    widest = max(widest, draft.get_hidden_size())
+                served = config.scheduler_config.max_num_batched_tokens, widest
             if served is None:
                 # NOTHING TO SIZE THE EXCHANGE FROM (max_num_batched_tokens, the
                 # hidden size; or max_rows and max_cols): disabled, so vLLM takes its
@@ -1055,23 +1206,43 @@ class HipCustomCommunicator:
             served_rows, served_cols = served
             max_rows = served_rows if max_rows is None else max_rows
             max_cols = served_cols if max_cols is None else max_cols
+        if timeout_seconds is None:
+            # THE GROUP'S OWN TIMEOUT, so a wait in our kernels gives up when every
+            # other collective on the group would: torch's 10 minutes unless the
+            # group was made with another. Read through torch's backend options,
+            # which are private, so where they are not there it is torch's default.
+            try:
+                timeout_seconds = device_group._get_backend(
+                    device
+                ).options._timeout.total_seconds()
+            except (AttributeError, RuntimeError):
+                timeout_seconds = TORCH_COLLECTIVE_TIMEOUT_SECONDS
+        if quantization is None:
+            # WHAT VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION ASKS (exact by
+            # default: INT4 is lossy, so opt-in).
+            import vllm.envs as envs
+
+            asked = envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION
+            quantization = "int4" if asked == "INT4" else "exact"
         self.arguments = Arguments(
             cpu_group=cpu_group,
             device_group=device_group,
             device=device,
-            timeout_seconds=(
-                collective_timeout_seconds(device_group, device)
-                if timeout_seconds is None
-                else timeout_seconds
-            ),
+            timeout_seconds=timeout_seconds,
             max_rows=max_rows,
             max_cols=max_cols,
-            quantization=(
-                configured_quantization() if quantization is None else quantization
-            ),
+            quantization=quantization,
             tuned_path=tuned_path,
         )
-        opened = open_state(self.arguments)
+        opened = open_state(
+            cpu_group,
+            device_group,
+            device,
+            max_rows,
+            max_cols,
+            timeout_seconds,
+            tuned_path,
+        )
         if isinstance(opened, Error):
             self.lifecycle.status, self.lifecycle.error = "disabled", opened
             logger.info("%s disabled: %s", type(self).__name__, opened.name)
@@ -2073,7 +2244,21 @@ class HipCustomCommunicator:
         if not self.lifecycle.teardown.acquire(blocking=False):
             return
         try:
-            finished = _synchronized_within(self.arguments.device, wait_s)
+            # EVERY LAUNCH ON THE DEVICE FINISHED within `wait_s`, or not: the
+            # synchronize runs on its own thread, left behind when it does not
+            # return (the process is going; a peer may be dead).
+            failed: list[BaseException] = []
+
+            def synchronize() -> None:
+                try:
+                    torch.cuda.synchronize(self.arguments.device)
+                except BaseException as e:  # noqa: BLE001 -- reported as not finished
+                    failed.append(e)
+
+            waiter = threading.Thread(target=synchronize, daemon=True)
+            waiter.start()
+            waiter.join(wait_s)
+            finished = not waiter.is_alive() and not failed
             close_peers(self.state.handle)
             if finished:
                 free_state(self.state.handle)
@@ -2104,151 +2289,3 @@ class HipCustomCommunicator:
                 ResourceWarning,
                 stacklevel=2,
             )
-
-
-def open_state(arguments: Arguments) -> CommsState | Error:
-    """THE COMMUNICATOR'S STATE, OPENED from its `arguments`, or the Error it cannot
-    open for (it is then disabled): C++'s state made
-    (the device supported, its buffers allocated), the tuned table read for its
-    arch, and every peer's regions opened, after the exchange over the CPU group (a
-    collective, so every rank must reach it).
-
-    Eager, and before any capture: doing this inside a cudagraph capture is not
-    recoverable. An open that raises frees what it made, alone, and raises."""
-    # THE GROUPS: one world, this rank the same in both.
-    if (
-        arguments.cpu_group.size() != arguments.device_group.size()
-        or arguments.cpu_group.rank() != arguments.device_group.rank()
-    ):
-        return Error.groups_disagree
-    if torch.cuda.current_device() != arguments.device.index:
-        raise CommunicatorError(
-            Error.wrong_device,
-            f"the current device is {torch.cuda.current_device()}, not the "
-            f"communicator's {arguments.device.index}",
-        )
-    ops = torch.ops._rocm_C
-    error, handle, ipc_handle, arch = ops.hip_custom_communicator_open(
-        rank=arguments.rank,
-        world=arguments.world,
-        device=arguments.device.index,
-        max_rows=arguments.max_rows,
-        max_cols=arguments.max_cols,
-        timeout_seconds=arguments.timeout_seconds,
-    )
-    if error is not None:
-        return Error(error)
-    tuned_table = parse_tuned_table(arguments.tuned_path, arch)
-    if tuned_table is None:
-        ops.hip_custom_communicator_free(state=handle)
-        return Error.no_tuned_table
-    try:
-        # THE EXCHANGE, one collective over the CPU group: every rank's regions' IPC
-        # handles, its host, its GPU and its pid.
-        props = torch.cuda.get_device_properties(arguments.device)
-        me = {
-            "handle": ipc_handle,
-            "host": socket.gethostname(),
-            "gpu": str(getattr(props, "uuid", "")),
-            "pid": os.getpid(),
-        }
-        everyone: list[Any] = [None] * arguments.world
-        torch.distributed.all_gather_object(everyone, me, group=arguments.cpu_group)
-        # EVERY PEER'S GPU, where this process sees it (by its UUID), reachable from
-        # ours: a rank that cannot reach a peer's GPU is refused here, by name, not
-        # at its first call.
-        here = {
-            str(getattr(torch.cuda.get_device_properties(d), "uuid", "")): d
-            for d in range(torch.cuda.device_count())
-        }
-        for r, peer in enumerate(everyone):
-            d = here.get(peer["gpu"])
-            if r == arguments.rank or d is None or d == arguments.device.index:
-                continue
-            if not torch.cuda.can_device_access_peer(arguments.device.index, d):
-                raise CommunicatorError(
-                    Error.peer_not_accessible,
-                    f"device {arguments.device.index} cannot access rank {r}'s "
-                    f"device {d}",
-                )
-        for r, peer in enumerate(everyone):
-            if r == arguments.rank:
-                continue
-            if peer["host"] != me["host"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d is on another host", r
-                )
-            elif peer["gpu"] and peer["gpu"] == me["gpu"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d (pid %d) is on this "
-                    "rank's GPU",
-                    r,
-                    peer["pid"],
-                )
-        error = ops.hip_custom_communicator_connect(
-            state=handle, handles=[b for peer in everyone for b in peer["handle"]]
-        )
-        if error is not None:
-            raise CommunicatorError(Error(error), "opening the peers' regions")
-    except BaseException:
-        close_peers(handle)
-        free_state(handle)
-        raise
-    _install_exit_hooks()
-    logger.info(
-        "HipCustomCommunicator ready: exchange sized for %d rows of %d, "
-        "quantization=%s",
-        arguments.max_rows,
-        arguments.max_cols,
-        arguments.quantization,
-    )
-    return CommsState(handle=handle, arch=arch, tuned_table=tuned_table)
-
-
-def close_peers(handle: int) -> None:
-    """EVERY BORROWED MAPPING of the state at `handle` closed (C++'s close_peers: the
-    peers' regions, their captured inputs); carries on past an error, logged. Three
-    callers: an open that raised, close, abandon."""
-    error = torch.ops._rocm_C.hip_custom_communicator_close_peers(state=handle)
-    if error is not None:
-        logger.error("HipCustomCommunicator: closing the peers: %s", Error(error).name)
-
-
-def free_state(handle: int) -> None:
-    """THE STATE AT `handle` freed, its own buffers with it (C++'s free), once no peer
-    has them open; an error is logged. Three callers: an open that raised, close,
-    abandon."""
-    error = torch.ops._rocm_C.hip_custom_communicator_free(state=handle)
-    if error is not None:
-        logger.error("HipCustomCommunicator: freeing: %s", Error(error).name)
-
-
-def barrier_within(group: ProcessGroup, seconds: float) -> bool:
-    """EVERY RANK OF `group` ARRIVED within `seconds`, or False (a peer that did not,
-    or a group that failed): never unbounded, a peer may be dead. close's two
-    handshakes."""
-    try:
-        torch.distributed.barrier(group=group, async_op=True).wait(
-            timedelta(seconds=seconds)
-        )
-    except RuntimeError:
-        return False
-    return True
-
-
-def _synchronized_within(device: torch.device, seconds: float) -> bool:
-    """EVERY LAUNCH ON `device` FINISHED within `seconds`, or False: the synchronize
-    runs on its own thread, left behind when it does not return (the process is going; a
-    peer may be dead)."""
-    failed: list[BaseException] = []
-
-    def synchronize() -> None:
-        try:
-            torch.cuda.synchronize(device)
-        except BaseException as e:  # noqa: BLE001 -- reported as not finished
-            failed.append(e)
-
-    t = threading.Thread(target=synchronize, daemon=True)
-    t.start()
-    t.join(seconds)
-    return not t.is_alive() and not failed
