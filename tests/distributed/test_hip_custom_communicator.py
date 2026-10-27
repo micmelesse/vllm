@@ -11,11 +11,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.device_communicators.hip_custom_communicator import (
-    _TABLE,
-    CommunicatorError,
-    Error,
     HipCustomCommunicator,
-    parse_tuned_table,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -497,11 +493,10 @@ def refused_calls_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank,
             assert not comm.should_allreduce(past)
 
             # Not [rows, cols]: refused by name before anything launches.
-            with pytest.raises(CommunicatorError) as e:
+            with pytest.raises(RuntimeError, match="^not_two_d:"):
                 comm.all_reduce(
                     torch.ones(2, 4, HIDDEN, dtype=torch.bfloat16, device=device)
                 )
-            assert e.value.error == Error.not_two_d
 
             # A strided view of the hidden row: run where admitted, and summed right.
             x = torch.ones(4, 2 * HIDDEN, dtype=torch.bfloat16, device=device)[
@@ -522,20 +517,48 @@ def test_refused_calls(monkeypatch: pytest.MonkeyPatch):
     multi_process_parallel(monkeypatch, 2, 1, refused_calls_ranks)
 
 
-def test_tuned_table():
-    """The shipped tuned table parses and checks for the arch the build targets, and
-    every op has a pick at Kimi-K3's decode and prefill sizes."""
-    import vllm._rocm_C  # noqa: F401
-
-    tuned = parse_tuned_table(_TABLE, "gfx950")
-    assert tuned is not None, "no tuned table for gfx950"
-    for op in [
-        "all_reduce",
-        "all_reduce_rms_norm",
-        "all_reduce_add_rms_norm",
-        "all_reduce_add_attn_res_rms_norm",
-    ]:
+@ray.remote(num_gpus=1, max_calls=1)
+def tuned_table_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port):
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        dist.all_reduce(torch.zeros(1, device=device), group=group.device_group)
+        torch.accelerator.synchronize()
+        # THE SHIPPED TABLE, as a communicator reads it at open (its device's arch),
+        # in each mode: every tuned op has a pick at Kimi-K3's decode and prefill
+        # sizes at this world.
         for quantization in ["exact", "int4"]:
-            for num_tokens in [1, MAX_TOKENS]:
-                _, config = tuned.nearest(op, quantization, 8, num_tokens, HIDDEN)
-                assert config is not None, (op, quantization, num_tokens)
+            comm = HipCustomCommunicator(
+                group.cpu_group,
+                group.device_group,
+                device,
+                max_rows=MAX_TOKENS,
+                max_cols=HIDDEN,
+                quantization=quantization,
+            )
+            assert not comm.disabled, comm.lifecycle
+            try:
+                for op in [
+                    "all_reduce",
+                    "all_reduce_rms_norm",
+                    "all_reduce_add_rms_norm",
+                    "all_reduce_add_attn_res_rms_norm",
+                ]:
+                    for num_tokens in [1, MAX_TOKENS]:
+                        launches = comm.tuned(op, num_tokens, HIDDEN)
+                        assert launches, (op, quantization, num_tokens)
+            finally:
+                comm.close()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_tuned_table(monkeypatch: pytest.MonkeyPatch, tp_size):
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    multi_process_parallel(monkeypatch, tp_size, 1, tuned_table_ranks)
