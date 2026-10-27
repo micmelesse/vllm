@@ -853,6 +853,37 @@ _CONFIGS: Mapping[str, type[Config]] = {
 }
 
 
+# A FUSED OP AS TWO KERNELS OF OURS, its algorithm "split": our all-reduce into this
+# rank's sum, then the op on this rank's rows (`rows`, its kernel on rows). The tune
+# picks it where it is faster than the op's one kernel.
+@dataclass(frozen=True)
+class AllReduceRmsNormSplitConfig:
+    algorithm: ClassVar[str] = "split"
+    all_reduce: AllReduceConfig
+    rows: RmsNormConfig
+
+
+@dataclass(frozen=True)
+class AllReduceAddRmsNormSplitConfig:
+    algorithm: ClassVar[str] = "split"
+    all_reduce: AllReduceConfig
+    rows: AddRmsNormConfig
+
+
+@dataclass(frozen=True)
+class AllReduceAddAttnResRmsNormSplitConfig:
+    algorithm: ClassVar[str] = "split"
+    all_reduce: AllReduceConfig
+    rows: AddAttnResRmsNormConfig
+
+
+SplitConfig = (
+    AllReduceRmsNormSplitConfig
+    | AllReduceAddRmsNormSplitConfig
+    | AllReduceAddAttnResRmsNormSplitConfig
+)
+
+
 def config_of_record(c: Mapping[str, Any]) -> Config:
     """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as its
     kernel's config: its algorithm one of the kernel's, and a field the class holds
@@ -894,495 +925,6 @@ def _record(config: Config) -> dict[str, Any]:
     return {k: getattr(config, k) for k in _CONFIG_KEYS}
 
 
-def _moves_exact(config: Config, input: torch.Tensor) -> bool:
-    """WHETHER A CALL OF `config` ON `input` MOVES EXACT VALUES: an exact config, or an
-    INT4 one below its quantize_from_bytes (its build's instance passing the call
-    exact)."""
-    return config.quantization == "exact" or input.numel() * input.element_size() < (
-        config.quantize_from_bytes or 0
-    )
-
-
-# AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS, a function an op: every field given (the
-# config), or none (None: a plain call, the table's pick). Some but not all is refused,
-# forced_incomplete: C++ takes every field. `quantize_from_bytes`, a launch's, may be
-# left out of a forcing: None (an INT4 config then always quantizes; an exact one has
-# none).
-
-
-def get_given_all_reduce_config(
-    algorithm: AllReduceAlgorithm | None,
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AllReduceConfig | None:
-    """THE ALL-REDUCE'S CONFIG AS GIVEN."""
-    if (
-        algorithm is not None
-        and grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AllReduceConfig(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        algorithm is None
-        and grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced all_reduce gives algorithm, grid x y z, block x y z, "
-        "waves_per_eu, tile m n, quantization and pack_bytes",
-    )
-
-
-def get_given_all_reduce_rms_norm_config(
-    algorithm: AllReduceRmsNormAlgorithm | None,
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AllReduceRmsNormConfig | None:
-    """THE ALL-REDUCE THEN RMSNORM'S CONFIG AS GIVEN."""
-    if (
-        algorithm is not None
-        and grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AllReduceRmsNormConfig(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        algorithm is None
-        and grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced all_reduce_rms_norm gives algorithm, grid x y z, block x "
-        "y z, waves_per_eu, tile m n, quantization and pack_bytes",
-    )
-
-
-def get_given_all_reduce_add_rms_norm_config(
-    algorithm: AllReduceAddRmsNormAlgorithm | None,
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AllReduceAddRmsNormConfig | None:
-    """THE ALL-REDUCE THEN ADD-RMSNORM'S CONFIG AS GIVEN."""
-    if (
-        algorithm is not None
-        and grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AllReduceAddRmsNormConfig(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        algorithm is None
-        and grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced all_reduce_add_rms_norm gives algorithm, grid x y z, "
-        "block x y z, waves_per_eu, tile m n, quantization and pack_bytes",
-    )
-
-
-def get_given_all_reduce_add_attn_res_rms_norm_config(
-    algorithm: AllReduceAddAttnResRmsNormAlgorithm | None,
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    tile_k: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AllReduceAddAttnResRmsNormConfig | None:
-    """THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM'S CONFIG AS GIVEN."""
-    if (
-        algorithm is not None
-        and grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and tile_k is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AllReduceAddAttnResRmsNormConfig(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        algorithm is None
-        and grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and tile_k is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced all_reduce_add_attn_res_rms_norm gives algorithm, grid x "
-        "y z, block x y z, waves_per_eu, tile m n k, quantization and "
-        "pack_bytes",
-    )
-
-
-def get_given_rms_norm_config(
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> RmsNormConfig | None:
-    """THE RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
-    if (
-        grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return RmsNormConfig(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced rms_norm gives grid x y z, block x y z, waves_per_eu, "
-        "tile m n, quantization and pack_bytes",
-    )
-
-
-def get_given_add_rms_norm_config(
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AddRmsNormConfig | None:
-    """THE ADD-RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
-    if (
-        grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AddRmsNormConfig(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced add_rms_norm gives grid x y z, block x y z, waves_per_eu, "
-        "tile m n, quantization and pack_bytes",
-    )
-
-
-def get_given_add_attn_res_rms_norm_config(
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    tile_k: int | None,
-    quantization: Quantization | None,
-    pack_bytes: int | None,
-    quantize_from_bytes: int | None,
-) -> AddAttnResRmsNormConfig | None:
-    """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG AS GIVEN."""
-    if (
-        grid_x is not None
-        and grid_y is not None
-        and grid_z is not None
-        and block_x is not None
-        and block_y is not None
-        and block_z is not None
-        and waves_per_eu is not None
-        and tile_m is not None
-        and tile_n is not None
-        and tile_k is not None
-        and quantization is not None
-        and pack_bytes is not None
-    ):
-        return AddAttnResRmsNormConfig(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-    if (
-        grid_x is None
-        and grid_y is None
-        and grid_z is None
-        and block_x is None
-        and block_y is None
-        and block_z is None
-        and waves_per_eu is None
-        and tile_m is None
-        and tile_n is None
-        and tile_k is None
-        and quantization is None
-        and pack_bytes is None
-        and quantize_from_bytes is None
-    ):
-        return None
-    raise CommunicatorError(
-        Error.forced_incomplete,
-        "a forced add_attn_res_rms_norm gives grid x y z, block x y z, "
-        "waves_per_eu, tile m n k, quantization and pack_bytes",
-    )
-
-
 @dataclass(frozen=True)
 class TunedInput:
     """ONE INPUT THE TABLE WAS TUNED AT (its `inputs` record, the fields the lookup
@@ -1410,17 +952,17 @@ def _build(config: Config) -> dict[str, Any]:
 @dataclass(frozen=True)
 class TunedConfigs:
     """THE ARCH'S TUNED TABLE, parsed and checked (`parse_tuned_configs`): each tuned
-    input and what a plain call launches there, in order (the op's one kernel, or our
-    all-reduce then the op's norm on rows), and every config the file lists (its picks'
+    input and the config a plain call runs there (the op's one kernel, or its split:
+    our all-reduce then the op on rows), and every config the file lists (its picks'
     and a tune's candidates)."""
 
-    picks: dict[TunedInput, tuple[Config, ...]]
+    picks: dict[TunedInput, Config | SplitConfig]
     configs: tuple[Config, ...]
 
     def nearest(
         self, op: Op, quantization: Quantization, world: int, rows: int, cols: int
-    ) -> tuple[TunedInput, tuple[Config, ...]]:
-        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES, and the input it was
+    ) -> tuple[TunedInput, Config | SplitConfig]:
+        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` RUNS, and the input it was
         tuned at: the nearest input of `op` tuned in the communicator's mode at `world`.
         Among the inputs whose every config's pack fits the row (whole packs at the
         input's dtype; a config the row is not whole packs of is refused,
@@ -1434,7 +976,12 @@ class TunedConfigs:
         fitting = [
             (i, c)
             for i, c in tuned
-            if all(cols * _DTYPE_BYTES[i.dtype] % x.pack_bytes == 0 for x in c)
+            if all(
+                cols * _DTYPE_BYTES[i.dtype] % x.pack_bytes == 0
+                for x in (
+                    (c.all_reduce, c.rows) if isinstance(c, SplitConfig) else (c,)
+                )
+            )
         ]
         tuned = fitting or tuned
         width = min((i.hidden for i, _ in tuned), key=lambda h: abs(h - cols))
@@ -1474,8 +1021,13 @@ class TunedConfigs:
             (quantization, "exact") if quantization == "int4" else (quantization,)
         ):
             found = []
-            for i, launches in self.picks.items():
+            for i, pick in self.picks.items():
                 if i.world == world:
+                    launches = (
+                        (pick.all_reduce, pick.rows)
+                        if isinstance(pick, SplitConfig)
+                        else (pick,)
+                    )
                     c = next((c for c in launches if takes(c, moving)), None)
                     if c is not None:
                         found.append((i, c))
@@ -1489,7 +1041,10 @@ class TunedConfigs:
                     ),
                 )
             else:
-                config = next((c for c in self.configs if takes(c, moving)), None)
+                first = next((c for c in self.configs if takes(c, moving)), None)
+                if first is None:
+                    continue
+                config = first
             if config is not None:
                 return replace(
                     config,
@@ -1544,7 +1099,7 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
         if i in picked and _build(config) not in built.ops[op].builds:
             raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
         configs.append(config)
-    picks: dict[TunedInput, tuple[Config, ...]] = {}
+    picks: dict[TunedInput, Config | SplitConfig] = {}
     for i, k in enumerate(raw["picks"]):
         where = f"the tuned table: picks[{i}]"
         at = k.get("configs")
@@ -1594,7 +1149,20 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
             raise ValueError(
                 f"{where}: a quantized input picks the exact all-reduce kernel"
             )
-        picks[tuned] = launches
+        # ONE KERNEL, or the op's split: our all-reduce, then its kernel on rows (the
+        # ops checked above).
+        if len(launches) == 1:
+            picks[tuned] = launches[0]
+            continue
+        first, second = launches
+        assert isinstance(first, AllReduceConfig), where
+        if isinstance(second, RmsNormConfig):
+            picks[tuned] = AllReduceRmsNormSplitConfig(first, second)
+        elif isinstance(second, AddRmsNormConfig):
+            picks[tuned] = AllReduceAddRmsNormSplitConfig(first, second)
+        else:
+            assert isinstance(second, AddAttnResRmsNormConfig), where
+            picks[tuned] = AllReduceAddAttnResRmsNormSplitConfig(first, second)
     for name in TUNED_OPS:
         for world in sorted(built.worlds):
             for mode in _MODES.values():
@@ -1852,36 +1420,11 @@ class HipCustomCommunicator:
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
     # Each op takes its own tensors and values, then, keyword-only, what the tuner and
-    # the tests force: its config's fields, every one given or none
-    # (`get_given_<op>_config`). None is a plain call: the table's nearest input's
-    # configs (`TunedConfigs.nearest`), one kernel, or our all-reduce then the op's norm
-    # on rows. The norms on rows have no
-    # table: a call of one gives its config. A forced call asks no `should_`: C++
-    # answers it. An op raises a RuntimeError naming the Error it is refused for; a
-    # call its `should_` admitted is never refused.
-
-    @final
-    def _assert_moves(self, configs: Sequence[Config]) -> None:
-        """WHAT A CALL'S CONFIGS MOVE IS THE COMMUNICATOR'S, asserted before any launch,
-        a plain call's (the table's) or a forced one's alike: in quantized mode every
-        config of the plain all-reduce's kernel (the plain op's, a split's first) is
-        INT4, never the exact kernel (an INT4 config passes a call below its
-        quantize_from_bytes exact itself); in exact mode no config is INT4; an exact
-        config has no quantize_from_bytes. (A fused op's kernel in quantized mode may
-        still be its exact one: its one-shots have no INT4 yet.)"""
-        for c in configs:
-            if self.quantization == "exact" and c.quantization != "exact":
-                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
-            if (
-                self.quantization == "int4"
-                and c.kernel == "all_reduce"
-                and c.quantization != "int4"
-            ):
-                raise AssertionError(
-                    f"a quantized communicator given the exact all-reduce kernel: {c}"
-                )
-            if c.quantization == "exact" and c.quantize_from_bytes is not None:
-                raise AssertionError(f"an exact config with a quantize_from_bytes: {c}")
+    # the tests force: `config`, the op's config class (a fused op's split too). None is
+    # a plain call: the table's nearest input's config (`TunedConfigs.nearest`). The
+    # norms on rows have no table: a call of one gives its config. A forced call asks no
+    # `should_`: C++ answers it. An op raises a RuntimeError naming the Error it is
+    # refused for; a call its `should_` admitted is never refused.
 
     @final
     def _debug(
@@ -1942,10 +1485,12 @@ class HipCustomCommunicator:
     def tuned(self, op: Op, rows: int, cols: int) -> list[Config]:
         """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order: its
         table's nearest input's configs (`TunedConfigs.nearest`)."""
-        _, configs = self.tuned_configs.nearest(
+        _, config = self.tuned_configs.nearest(
             op, self.quantization, self.device_group.size(), rows, cols
         )
-        return list(configs)
+        if isinstance(config, SplitConfig):
+            return [config.all_reduce, config.rows]
+        return [config]
 
     @final
     def kernel_config(
@@ -1969,58 +1514,127 @@ class HipCustomCommunicator:
 
     @final
     def all_reduce(
-        self,
-        input: torch.Tensor,
-        *,
-        algorithm: AllReduceAlgorithm | None = None,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        self, input: torch.Tensor, *, config: AllReduceConfig | None = None
     ) -> torch.Tensor:
-        """The sum of every rank's `input`, at the config given (the tuner's, the
-        tests'), else at the table's pick for its rows and width. Each config argument
-        is C++'s of the same name."""
-        # THE CALL.
-        logger.debug(
-            "all_reduce %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        """The sum of every rank's `input`, at `config` (the tuner's, the tests'), else
+        at the tuned table's pick for its rows and width."""
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_all_reduce_config(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
+
+        # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
+        output = torch.empty_like(input)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if isinstance(self.state, Capturing) and not capturing:
+            return output
+
+        # THE CONFIG: the one given, else the tuned table's nearest input's.
+        tuned_input = None
+        if config is None:
+            rows, cols = input.shape
+            tuned_input, picked = self.tuned_configs.nearest(
+                "all_reduce", self.quantization, self._world, rows, cols
+            )
+            assert isinstance(picked, AllReduceConfig), picked
+            config = picked
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4, a quantized
+        # one runs the INT4 kernel (which passes a call below its quantize_from_bytes
+        # exact itself).
+        if self.quantization == "exact" and config.quantization != "exact":
+            raise AssertionError(
+                f"an exact communicator given an INT4 config: {config}"
+            )
+        if self.quantization == "int4" and config.quantization != "int4":
+            raise AssertionError(
+                f"a quantized communicator given an exact config: {config}"
+            )
+        self._debug("all_reduce", {"input": input}, {}, [config], tuned_input)
+
+        # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured exact pull reads every
+        # rank's input where it is, through a slot of its own, registered when the
+        # capture exits; anything else reads the staging (slot 0).
+        moves_exact = config.quantization == "exact" or (
+            input.numel() * input.element_size() < (config.quantize_from_bytes or 0)
         )
+        table_slot = 0
+        if moves_exact and config.algorithm not in _PUSHED and capturing:
+            table_slot = self._next_slot
+            if table_slot >= self._layout.table_slots:
+                raise CommunicatorError(
+                    Error.tables_full,
+                    f"{self._layout.table_slots - 1} captured launches",
+                )
+            self._next_slot += 1
+            self._pending.append((table_slot, input.data_ptr()))
+
+        error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+            rank=self._rank,
+            world=self._world,
+            shared_buffer=self._shared,
+            private_buffer=self._private,
+            status_device=self._status_device,
+            timeout_ticks=self._timeout_ticks,
+            max_rows=self.max_rows,
+            staging_bytes=self._layout.staging_bytes,
+            partials_bytes=self._layout.partials_bytes,
+            table_slot=table_slot,
+            checked_after_launch=self._checked,
+            input=input,
+            output=output,
+            kernel=config.kernel,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            tile_k=config.tile_k,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            quantize_from_bytes=config.quantize_from_bytes,
+        )
+        if error != -1:
+            raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
+        return output
+
+    @final
+    def should_allreduce_rms_norm(
+        self, input: torch.Tensor, weight: torch.Tensor
+    ) -> bool:
+        """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
+        return not self.disabled and should(
+            "all_reduce_rms_norm", input, self.capacity, weight
+        )
+
+    @final
+    def all_reduce_rms_norm(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        config: AllReduceRmsNormConfig | AllReduceRmsNormSplitConfig | None = None,
+    ) -> torch.Tensor:
+        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)`, at the config given
+        (the tuner's, the tests'), else at the table's pick for its rows and width: one
+        kernel, or our all-reduce then the norm on its rows. Returns the normed sum."""
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
+        if self.disabled:
+            raise CommunicatorError(
+                Error.disabled, f"{type(self).__name__} runs no call"
+            )
+        if input.dim() != 2:
+            raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         output = torch.empty_like(input)
@@ -2030,30 +1644,65 @@ class HipCustomCommunicator:
         ):
             return output
 
-        # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
-        # input's (`TunedConfigs.nearest`).
+        # THE CONFIG: the one given, else the tuned table's nearest input's (one
+        # kernel, or the split: our all-reduce, then the op on this rank's rows).
         tuned_input = None
-        if given_config is not None:
-            configs = [given_config]
-        else:
+        if config is None:
             rows, cols = input.shape
-            tuned_input, launches = self.tuned_configs.nearest(
-                "all_reduce", self.quantization, self.device_group.size(), rows, cols
+            tuned_input, picked = self.tuned_configs.nearest(
+                "all_reduce_rms_norm", self.quantization, self._world, rows, cols
             )
-            configs = list(launches)
-        logger.debug("all_reduce launches %s", configs)
-        self._assert_moves(configs)
+            assert isinstance(
+                picked, AllReduceRmsNormConfig | AllReduceRmsNormSplitConfig
+            ), picked
+            config = picked
+        launches: list[Config] = (
+            [config.all_reduce, config.rows]
+            if isinstance(config, AllReduceRmsNormSplitConfig)
+            else [config]
+        )
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
+        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
+        # call below its quantize_from_bytes exact itself.
+        for c in launches:
+            if self.quantization == "exact" and c.quantization != "exact":
+                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+            if (
+                self.quantization == "int4"
+                and c.kernel == "all_reduce"
+                and c.quantization != "int4"
+            ):
+                raise AssertionError(
+                    f"a quantized communicator given an exact config: {c}"
+                )
         self._debug(
-            "all_reduce",
-            {"input": input},
-            {},
-            configs,
+            "all_reduce_rms_norm",
+            {"input": input, "weight": weight},
+            {"eps": eps},
+            launches,
             tuned_input,
         )
 
-        match configs:
-            case [config]:
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+        match config:
+            case AllReduceRmsNormConfig():
+                # ONE KERNEL, the fused op.
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    config.quantization == "exact"
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
+                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
                     rank=self._rank,
                     world=self._world,
                     shared_buffer=self._shared,
@@ -2063,13 +1712,12 @@ class HipCustomCommunicator:
                     max_rows=self.max_rows,
                     staging_bytes=self._layout.staging_bytes,
                     partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input,
-                        _moves_exact(config, input) and config.algorithm not in _PUSHED,
-                    ),
+                    table_slot=table_slot,
                     checked_after_launch=self._checked,
                     input=input,
+                    weight=weight,
                     output=output,
+                    eps=eps,
                     kernel=config.kernel,
                     algorithm=config.algorithm,
                     grid_x=config.grid_x,
@@ -2090,155 +1738,31 @@ class HipCustomCommunicator:
                     raise CommunicatorError(
                         Error(error), f"{_record(config)} on {input.shape}"
                     )
-            case _:
-                raise AssertionError(f"all_reduce: a pick of {len(configs)} configs")
-        return output
-
-    @final
-    def should_allreduce_rms_norm(
-        self, input: torch.Tensor, weight: torch.Tensor
-    ) -> bool:
-        """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
-        return not self.disabled and should(
-            "all_reduce_rms_norm", input, self.capacity, weight
-        )
-
-    @final
-    def all_reduce_rms_norm(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-        *,
-        algorithm: AllReduceRmsNormAlgorithm | None = None,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
-    ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)`, at the config given
-        (the tuner's, the tests'), else at the table's pick for its rows and width: one
-        kernel, or our all-reduce then the norm on its rows. Each config argument is
-        C++'s of the same name. Returns the normed sum."""
-        # THE CALL.
-        logger.debug(
-            "all_reduce_rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
-        if self.disabled:
-            raise CommunicatorError(
-                Error.disabled, f"{type(self).__name__} runs no call"
-            )
-        if input.dim() != 2:
-            raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_all_reduce_rms_norm_config(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
-
-        # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
-        output = torch.empty_like(input)
-        if (
-            isinstance(self.state, Capturing)
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            return output
-
-        # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
-        # input's (`TunedConfigs.nearest`).
-        tuned_input = None
-        if given_config is not None:
-            configs = [given_config]
-        else:
-            rows, cols = input.shape
-            tuned_input, launches = self.tuned_configs.nearest(
-                "all_reduce_rms_norm",
-                self.quantization,
-                self.device_group.size(),
-                rows,
-                cols,
-            )
-            configs = list(launches)
-        logger.debug("all_reduce_rms_norm launches %s", configs)
-        self._assert_moves(configs)
-        self._debug(
-            "all_reduce_rms_norm",
-            {"input": input, "weight": weight},
-            {"eps": eps},
-            configs,
-            tuned_input,
-        )
-
-        match configs:
-            case [fused_config]:
-                # ONE KERNEL, the fused op.
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
-                    rank=self._rank,
-                    world=self._world,
-                    shared_buffer=self._shared,
-                    private_buffer=self._private,
-                    status_device=self._status_device,
-                    timeout_ticks=self._timeout_ticks,
-                    max_rows=self.max_rows,
-                    staging_bytes=self._layout.staging_bytes,
-                    partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input, fused_config.quantization == "exact"
-                    ),
-                    checked_after_launch=self._checked,
-                    input=input,
-                    weight=weight,
-                    output=output,
-                    eps=eps,
-                    kernel=fused_config.kernel,
-                    algorithm=fused_config.algorithm,
-                    grid_x=fused_config.grid_x,
-                    grid_y=fused_config.grid_y,
-                    grid_z=fused_config.grid_z,
-                    block_x=fused_config.block_x,
-                    block_y=fused_config.block_y,
-                    block_z=fused_config.block_z,
-                    waves_per_eu=fused_config.waves_per_eu,
-                    tile_m=fused_config.tile_m,
-                    tile_n=fused_config.tile_n,
-                    tile_k=fused_config.tile_k,
-                    quantization=fused_config.quantization,
-                    pack_bytes=fused_config.pack_bytes,
-                    quantize_from_bytes=fused_config.quantize_from_bytes,
-                )
-                if error != -1:
-                    raise CommunicatorError(
-                        Error(error), f"{_record(fused_config)} on {input.shape}"
-                    )
-            case [reduce_config, norm_config]:
+            case AllReduceRmsNormSplitConfig():
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
                 # norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the norm writes
                 # its rows over them in place (STANDARDS 3.5), no tensor of its own.
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    (
+                        config.all_reduce.quantization == "exact"
+                        or input.numel() * input.element_size()
+                        < (config.all_reduce.quantize_from_bytes or 0)
+                    )
+                    and config.all_reduce.algorithm not in _PUSHED
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     rank=self._rank,
                     world=self._world,
@@ -2249,33 +1773,29 @@ class HipCustomCommunicator:
                     max_rows=self.max_rows,
                     staging_bytes=self._layout.staging_bytes,
                     partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input,
-                        _moves_exact(reduce_config, input)
-                        and reduce_config.algorithm not in _PUSHED,
-                    ),
+                    table_slot=table_slot,
                     checked_after_launch=self._checked,
                     input=input,
                     output=output,
-                    kernel=reduce_config.kernel,
-                    algorithm=reduce_config.algorithm,
-                    grid_x=reduce_config.grid_x,
-                    grid_y=reduce_config.grid_y,
-                    grid_z=reduce_config.grid_z,
-                    block_x=reduce_config.block_x,
-                    block_y=reduce_config.block_y,
-                    block_z=reduce_config.block_z,
-                    waves_per_eu=reduce_config.waves_per_eu,
-                    tile_m=reduce_config.tile_m,
-                    tile_n=reduce_config.tile_n,
-                    tile_k=reduce_config.tile_k,
-                    quantization=reduce_config.quantization,
-                    pack_bytes=reduce_config.pack_bytes,
-                    quantize_from_bytes=reduce_config.quantize_from_bytes,
+                    kernel=config.all_reduce.kernel,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    tile_k=config.all_reduce.tile_k,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(reduce_config)} on {input.shape}"
+                        Error(error), f"{_record(config.all_reduce)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
                     world=self._world,
@@ -2284,30 +1804,26 @@ class HipCustomCommunicator:
                     weight=weight,
                     output=output,
                     eps=eps,
-                    kernel=norm_config.kernel,
-                    algorithm=norm_config.algorithm,
-                    grid_x=norm_config.grid_x,
-                    grid_y=norm_config.grid_y,
-                    grid_z=norm_config.grid_z,
-                    block_x=norm_config.block_x,
-                    block_y=norm_config.block_y,
-                    block_z=norm_config.block_z,
-                    waves_per_eu=norm_config.waves_per_eu,
-                    tile_m=norm_config.tile_m,
-                    tile_n=norm_config.tile_n,
-                    tile_k=norm_config.tile_k,
-                    quantization=norm_config.quantization,
-                    pack_bytes=norm_config.pack_bytes,
-                    quantize_from_bytes=norm_config.quantize_from_bytes,
+                    kernel=config.rows.kernel,
+                    algorithm=config.rows.algorithm,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    tile_k=config.rows.tile_k,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(norm_config)} on {input.shape}"
+                        Error(error), f"{_record(config.rows)} on {input.shape}"
                     )
-            case _:
-                raise AssertionError(
-                    f"all_reduce_rms_norm: a pick of {len(configs)} configs"
-                )
         return output
 
     @final
@@ -2327,57 +1843,23 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        algorithm: AllReduceAddRmsNormAlgorithm | None = None,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        config: AllReduceAddRmsNormConfig
+        | AllReduceAddRmsNormSplitConfig
+        | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)`,
         at the config given (the tuner's, the tests'), else at the table's pick for its
         rows and width: one kernel, or our all-reduce then the add and norm on its rows.
-        Each config argument is C++'s of the same name. Returns the normed result and
+        Returns the normed result and
         the sum plus residual."""
-        # THE CALL.
-        logger.debug(
-            "all_reduce_add_rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_all_reduce_add_rms_norm_config(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         output, residual_output = torch.empty_like(input), torch.empty_like(input)
@@ -2387,34 +1869,64 @@ class HipCustomCommunicator:
         ):
             return output, residual_output
 
-        # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
-        # input's (`TunedConfigs.nearest`).
+        # THE CONFIG: the one given, else the tuned table's nearest input's (one
+        # kernel, or the split: our all-reduce, then the op on this rank's rows).
         tuned_input = None
-        if given_config is not None:
-            configs = [given_config]
-        else:
+        if config is None:
             rows, cols = input.shape
-            tuned_input, launches = self.tuned_configs.nearest(
-                "all_reduce_add_rms_norm",
-                self.quantization,
-                self.device_group.size(),
-                rows,
-                cols,
+            tuned_input, picked = self.tuned_configs.nearest(
+                "all_reduce_add_rms_norm", self.quantization, self._world, rows, cols
             )
-            configs = list(launches)
-        logger.debug("all_reduce_add_rms_norm launches %s", configs)
-        self._assert_moves(configs)
+            assert isinstance(
+                picked, AllReduceAddRmsNormConfig | AllReduceAddRmsNormSplitConfig
+            ), picked
+            config = picked
+        launches: list[Config] = (
+            [config.all_reduce, config.rows]
+            if isinstance(config, AllReduceAddRmsNormSplitConfig)
+            else [config]
+        )
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
+        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
+        # call below its quantize_from_bytes exact itself.
+        for c in launches:
+            if self.quantization == "exact" and c.quantization != "exact":
+                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+            if (
+                self.quantization == "int4"
+                and c.kernel == "all_reduce"
+                and c.quantization != "int4"
+            ):
+                raise AssertionError(
+                    f"a quantized communicator given an exact config: {c}"
+                )
         self._debug(
             "all_reduce_add_rms_norm",
             {"input": input, "residual": residual, "weight": weight},
             {"eps": eps},
-            configs,
+            launches,
             tuned_input,
         )
 
-        match configs:
-            case [fused_config]:
+        match config:
+            case AllReduceAddRmsNormConfig():
                 # ONE KERNEL, the fused op.
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    config.quantization == "exact"
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
                 error = (
                     torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
                         rank=self._rank,
@@ -2426,9 +1938,7 @@ class HipCustomCommunicator:
                         max_rows=self.max_rows,
                         staging_bytes=self._layout.staging_bytes,
                         partials_bytes=self._layout.partials_bytes,
-                        table_slot=self._table_slot(
-                            input, fused_config.quantization == "exact"
-                        ),
+                        table_slot=table_slot,
                         checked_after_launch=self._checked,
                         input=input,
                         residual=residual,
@@ -2436,31 +1946,52 @@ class HipCustomCommunicator:
                         output=output,
                         residual_output=residual_output,
                         eps=eps,
-                        kernel=fused_config.kernel,
-                        algorithm=fused_config.algorithm,
-                        grid_x=fused_config.grid_x,
-                        grid_y=fused_config.grid_y,
-                        grid_z=fused_config.grid_z,
-                        block_x=fused_config.block_x,
-                        block_y=fused_config.block_y,
-                        block_z=fused_config.block_z,
-                        waves_per_eu=fused_config.waves_per_eu,
-                        tile_m=fused_config.tile_m,
-                        tile_n=fused_config.tile_n,
-                        tile_k=fused_config.tile_k,
-                        quantization=fused_config.quantization,
-                        pack_bytes=fused_config.pack_bytes,
-                        quantize_from_bytes=fused_config.quantize_from_bytes,
+                        kernel=config.kernel,
+                        algorithm=config.algorithm,
+                        grid_x=config.grid_x,
+                        grid_y=config.grid_y,
+                        grid_z=config.grid_z,
+                        block_x=config.block_x,
+                        block_y=config.block_y,
+                        block_z=config.block_z,
+                        waves_per_eu=config.waves_per_eu,
+                        tile_m=config.tile_m,
+                        tile_n=config.tile_n,
+                        tile_k=config.tile_k,
+                        quantization=config.quantization,
+                        pack_bytes=config.pack_bytes,
+                        quantize_from_bytes=config.quantize_from_bytes,
                     )
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(fused_config)} on {input.shape}"
+                        Error(error), f"{_record(config)} on {input.shape}"
                     )
-            case [reduce_config, norm_config]:
+            case AllReduceAddRmsNormSplitConfig():
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
                 # add and norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the norm writes
                 # its rows over them in place (STANDARDS 3.5), no tensor of its own.
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    (
+                        config.all_reduce.quantization == "exact"
+                        or input.numel() * input.element_size()
+                        < (config.all_reduce.quantize_from_bytes or 0)
+                    )
+                    and config.all_reduce.algorithm not in _PUSHED
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     rank=self._rank,
                     world=self._world,
@@ -2471,33 +2002,29 @@ class HipCustomCommunicator:
                     max_rows=self.max_rows,
                     staging_bytes=self._layout.staging_bytes,
                     partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input,
-                        _moves_exact(reduce_config, input)
-                        and reduce_config.algorithm not in _PUSHED,
-                    ),
+                    table_slot=table_slot,
                     checked_after_launch=self._checked,
                     input=input,
                     output=output,
-                    kernel=reduce_config.kernel,
-                    algorithm=reduce_config.algorithm,
-                    grid_x=reduce_config.grid_x,
-                    grid_y=reduce_config.grid_y,
-                    grid_z=reduce_config.grid_z,
-                    block_x=reduce_config.block_x,
-                    block_y=reduce_config.block_y,
-                    block_z=reduce_config.block_z,
-                    waves_per_eu=reduce_config.waves_per_eu,
-                    tile_m=reduce_config.tile_m,
-                    tile_n=reduce_config.tile_n,
-                    tile_k=reduce_config.tile_k,
-                    quantization=reduce_config.quantization,
-                    pack_bytes=reduce_config.pack_bytes,
-                    quantize_from_bytes=reduce_config.quantize_from_bytes,
+                    kernel=config.all_reduce.kernel,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    tile_k=config.all_reduce.tile_k,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(reduce_config)} on {input.shape}"
+                        Error(error), f"{_record(config.all_reduce)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
                     world=self._world,
@@ -2508,30 +2035,26 @@ class HipCustomCommunicator:
                     output=output,
                     residual_output=residual_output,
                     eps=eps,
-                    kernel=norm_config.kernel,
-                    algorithm=norm_config.algorithm,
-                    grid_x=norm_config.grid_x,
-                    grid_y=norm_config.grid_y,
-                    grid_z=norm_config.grid_z,
-                    block_x=norm_config.block_x,
-                    block_y=norm_config.block_y,
-                    block_z=norm_config.block_z,
-                    waves_per_eu=norm_config.waves_per_eu,
-                    tile_m=norm_config.tile_m,
-                    tile_n=norm_config.tile_n,
-                    tile_k=norm_config.tile_k,
-                    quantization=norm_config.quantization,
-                    pack_bytes=norm_config.pack_bytes,
-                    quantize_from_bytes=norm_config.quantize_from_bytes,
+                    kernel=config.rows.kernel,
+                    algorithm=config.rows.algorithm,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    tile_k=config.rows.tile_k,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(norm_config)} on {input.shape}"
+                        Error(error), f"{_record(config.rows)} on {input.shape}"
                     )
-            case _:
-                raise AssertionError(
-                    f"all_reduce_add_rms_norm: a pick of {len(configs)} configs"
-                )
         return output, residual_output
 
     @final
@@ -2555,61 +2078,25 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        algorithm: AllReduceAddAttnResRmsNormAlgorithm | None = None,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        config: AllReduceAddAttnResRmsNormConfig
+        | AllReduceAddAttnResRmsNormSplitConfig
+        | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(input), blocks, ...)`, at the config given (the
         tuner's, the tests'), else at the table's pick for its rows and width: one
         kernel, or our all-reduce then AttnRes on its rows; with no `prefix` the sum
-        starts one. Each config argument is C++'s of the same name. Returns the new
+        starts one. Returns the new
         prefix and the AttnRes output, each a new tensor: `prefix` is only read.
         `write_index` >= 0 also stores the new prefix as that block of `blocks`, which
         must not be one of the `num_blocks` sources the call reads."""
-        # THE CALL.
-        logger.debug(
-            "all_reduce_add_attn_res_rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_all_reduce_add_attn_res_rms_norm_config(
-            algorithm=algorithm,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         prefix_output, output = torch.empty_like(input), torch.empty_like(input)
@@ -2619,23 +2106,43 @@ class HipCustomCommunicator:
         ):
             return prefix_output, output
 
-        # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
-        # input's (`TunedConfigs.nearest`).
+        # THE CONFIG: the one given, else the tuned table's nearest input's (one
+        # kernel, or the split: our all-reduce, then the op on this rank's rows).
         tuned_input = None
-        if given_config is not None:
-            configs = [given_config]
-        else:
+        if config is None:
             rows, cols = input.shape
-            tuned_input, launches = self.tuned_configs.nearest(
+            tuned_input, picked = self.tuned_configs.nearest(
                 "all_reduce_add_attn_res_rms_norm",
                 self.quantization,
-                self.device_group.size(),
+                self._world,
                 rows,
                 cols,
             )
-            configs = list(launches)
-        logger.debug("all_reduce_add_attn_res_rms_norm launches %s", configs)
-        self._assert_moves(configs)
+            assert isinstance(
+                picked,
+                AllReduceAddAttnResRmsNormConfig
+                | AllReduceAddAttnResRmsNormSplitConfig,
+            ), picked
+            config = picked
+        launches: list[Config] = (
+            [config.all_reduce, config.rows]
+            if isinstance(config, AllReduceAddAttnResRmsNormSplitConfig)
+            else [config]
+        )
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
+        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
+        # call below its quantize_from_bytes exact itself.
+        for c in launches:
+            if self.quantization == "exact" and c.quantization != "exact":
+                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+            if (
+                self.quantization == "int4"
+                and c.kernel == "all_reduce"
+                and c.quantization != "int4"
+            ):
+                raise AssertionError(
+                    f"a quantized communicator given an exact config: {c}"
+                )
         self._debug(
             "all_reduce_add_attn_res_rms_norm",
             {
@@ -2652,16 +2159,32 @@ class HipCustomCommunicator:
                 "eps": eps,
                 "output_eps": output_eps,
             },
-            configs,
+            launches,
             tuned_input,
         )
 
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        match configs:
-            case [fused_config]:
+        match config:
+            case AllReduceAddAttnResRmsNormConfig():
                 # ONE KERNEL, the fused op.
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    config.quantization == "exact"
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
                     rank=self._rank,
                     world=self._world,
@@ -2672,9 +2195,7 @@ class HipCustomCommunicator:
                     max_rows=self.max_rows,
                     staging_bytes=self._layout.staging_bytes,
                     partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input, fused_config.quantization == "exact"
-                    ),
+                    table_slot=table_slot,
                     checked_after_launch=self._checked,
                     input=input,
                     prefix=prefix,
@@ -2688,30 +2209,51 @@ class HipCustomCommunicator:
                     num_blocks=num_blocks,
                     eps=eps,
                     output_eps=output_eps,
-                    kernel=fused_config.kernel,
-                    algorithm=fused_config.algorithm,
-                    grid_x=fused_config.grid_x,
-                    grid_y=fused_config.grid_y,
-                    grid_z=fused_config.grid_z,
-                    block_x=fused_config.block_x,
-                    block_y=fused_config.block_y,
-                    block_z=fused_config.block_z,
-                    waves_per_eu=fused_config.waves_per_eu,
-                    tile_m=fused_config.tile_m,
-                    tile_n=fused_config.tile_n,
-                    tile_k=fused_config.tile_k,
-                    quantization=fused_config.quantization,
-                    pack_bytes=fused_config.pack_bytes,
-                    quantize_from_bytes=fused_config.quantize_from_bytes,
+                    kernel=config.kernel,
+                    algorithm=config.algorithm,
+                    grid_x=config.grid_x,
+                    grid_y=config.grid_y,
+                    grid_z=config.grid_z,
+                    block_x=config.block_x,
+                    block_y=config.block_y,
+                    block_z=config.block_z,
+                    waves_per_eu=config.waves_per_eu,
+                    tile_m=config.tile_m,
+                    tile_n=config.tile_n,
+                    tile_k=config.tile_k,
+                    quantization=config.quantization,
+                    pack_bytes=config.pack_bytes,
+                    quantize_from_bytes=config.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(fused_config)} on {input.shape}"
+                        Error(error), f"{_record(config)} on {input.shape}"
                     )
-            case [reduce_config, norm_config]:
+            case AllReduceAddAttnResRmsNormSplitConfig():
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then
                 # AttnRes on its rows.
                 summed = torch.empty_like(input)
+                # THE INPUT TABLE SLOT (C++'s INPUT TABLES): a captured call
+                # reading every rank's input in place takes a slot of its own,
+                # registered when the capture exits; any other reads slot 0.
+                table_slot = 0
+                if (
+                    (
+                        config.all_reduce.quantization == "exact"
+                        or input.numel() * input.element_size()
+                        < (config.all_reduce.quantize_from_bytes or 0)
+                    )
+                    and config.all_reduce.algorithm not in _PUSHED
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    table_slot = self._next_slot
+                    if table_slot >= self._layout.table_slots:
+                        raise CommunicatorError(
+                            Error.tables_full,
+                            f"{self._layout.table_slots - 1} captured launches",
+                        )
+                    self._next_slot += 1
+                    self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     rank=self._rank,
                     world=self._world,
@@ -2722,33 +2264,29 @@ class HipCustomCommunicator:
                     max_rows=self.max_rows,
                     staging_bytes=self._layout.staging_bytes,
                     partials_bytes=self._layout.partials_bytes,
-                    table_slot=self._table_slot(
-                        input,
-                        _moves_exact(reduce_config, input)
-                        and reduce_config.algorithm not in _PUSHED,
-                    ),
+                    table_slot=table_slot,
                     checked_after_launch=self._checked,
                     input=input,
                     output=summed,
-                    kernel=reduce_config.kernel,
-                    algorithm=reduce_config.algorithm,
-                    grid_x=reduce_config.grid_x,
-                    grid_y=reduce_config.grid_y,
-                    grid_z=reduce_config.grid_z,
-                    block_x=reduce_config.block_x,
-                    block_y=reduce_config.block_y,
-                    block_z=reduce_config.block_z,
-                    waves_per_eu=reduce_config.waves_per_eu,
-                    tile_m=reduce_config.tile_m,
-                    tile_n=reduce_config.tile_n,
-                    tile_k=reduce_config.tile_k,
-                    quantization=reduce_config.quantization,
-                    pack_bytes=reduce_config.pack_bytes,
-                    quantize_from_bytes=reduce_config.quantize_from_bytes,
+                    kernel=config.all_reduce.kernel,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    tile_k=config.all_reduce.tile_k,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(reduce_config)} on {input.shape}"
+                        Error(error), f"{_record(config.all_reduce)} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
                     world=self._world,
@@ -2765,31 +2303,26 @@ class HipCustomCommunicator:
                     num_blocks=num_blocks,
                     eps=eps,
                     output_eps=output_eps,
-                    kernel=norm_config.kernel,
-                    algorithm=norm_config.algorithm,
-                    grid_x=norm_config.grid_x,
-                    grid_y=norm_config.grid_y,
-                    grid_z=norm_config.grid_z,
-                    block_x=norm_config.block_x,
-                    block_y=norm_config.block_y,
-                    block_z=norm_config.block_z,
-                    waves_per_eu=norm_config.waves_per_eu,
-                    tile_m=norm_config.tile_m,
-                    tile_n=norm_config.tile_n,
-                    tile_k=norm_config.tile_k,
-                    quantization=norm_config.quantization,
-                    pack_bytes=norm_config.pack_bytes,
-                    quantize_from_bytes=norm_config.quantize_from_bytes,
+                    kernel=config.rows.kernel,
+                    algorithm=config.rows.algorithm,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    tile_k=config.rows.tile_k,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
-                        Error(error), f"{_record(norm_config)} on {input.shape}"
+                        Error(error), f"{_record(config.rows)} on {input.shape}"
                     )
-            case _:
-                raise AssertionError(
-                    f"all_reduce_add_attn_res_rms_norm: a pick of "
-                    f"{len(configs)} configs"
-                )
         return prefix_output, output
 
     # ---- THE NORMS ON THIS RANK'S ROWS, no peer: the second kernel of an op as two
@@ -2803,52 +2336,18 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        config: RmsNormConfig,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(input, weight, eps)` on this rank's rows, `input` a
         sum, at the config given. Returns the normed rows."""
-        # THE CALL.
-        logger.debug(
-            "rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_rms_norm_config(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         output = torch.empty_like(input)
@@ -2858,14 +2357,9 @@ class HipCustomCommunicator:
         ):
             return output
 
-        # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if given_config is None:
-            raise CommunicatorError(
-                Error.forced_incomplete, "a norm on rows takes its config"
-            )
-        config = given_config
-        logger.debug("rms_norm launches %s", config)
-        self._assert_moves([config])
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: a norm on rows moves nothing quantized.
+        if config.quantization != "exact":
+            raise AssertionError(f"a norm on rows given an INT4 config: {config}")
         self._debug(
             "rms_norm",
             {"input": input, "weight": weight},
@@ -2909,53 +2403,19 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        config: AddRmsNormConfig,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(input, residual, weight, eps)` on this rank's
         rows, `input` a sum, at the config given. Returns the normed result and the sum
         plus residual."""
-        # THE CALL.
-        logger.debug(
-            "add_rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_add_rms_norm_config(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         output, residual_output = torch.empty_like(input), torch.empty_like(input)
@@ -2965,14 +2425,9 @@ class HipCustomCommunicator:
         ):
             return output, residual_output
 
-        # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if given_config is None:
-            raise CommunicatorError(
-                Error.forced_incomplete, "a norm on rows takes its config"
-            )
-        config = given_config
-        logger.debug("add_rms_norm launches %s", config)
-        self._assert_moves([config])
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: a norm on rows moves nothing quantized.
+        if config.quantization != "exact":
+            raise AssertionError(f"a norm on rows given an INT4 config: {config}")
         self._debug(
             "add_rms_norm",
             {"input": input, "residual": residual, "weight": weight},
@@ -3024,55 +2479,19 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        grid_x: int | None = None,
-        grid_y: int | None = None,
-        grid_z: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
-        waves_per_eu: int | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        quantization: Quantization | None = None,
-        pack_bytes: int | None = None,
-        quantize_from_bytes: int | None = None,
+        config: AddAttnResRmsNormConfig,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, input, blocks, ...)` on this rank's rows, `input` a sum,
         its arguments `all_reduce_add_attn_res_rms_norm`'s, at the config given.
         Returns the new prefix and the AttnRes output."""
-        # THE CALL.
-        logger.debug(
-            "add_attn_res_rms_norm %s %s%s",
-            tuple(input.shape),
-            input.dtype,
-            " (captured)" if torch.cuda.is_current_stream_capturing() else "",
-        )
-
-        # WHAT IT IS REFUSED FOR BEFORE C++ IS ASKED: a communicator that runs nothing,
-        # an input that is not [rows, cols], a forcing that is not whole (C++ takes
-        # every field).
+        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
+        # is not [rows, cols].
         if self.disabled:
             raise CommunicatorError(
                 Error.disabled, f"{type(self).__name__} runs no call"
             )
         if input.dim() != 2:
             raise CommunicatorError(Error.not_two_d, f"not {tuple(input.shape)}")
-        given_config = get_given_add_attn_res_rms_norm_config(
-            grid_x=grid_x,
-            grid_y=grid_y,
-            grid_z=grid_z,
-            block_x=block_x,
-            block_y=block_y,
-            block_z=block_z,
-            waves_per_eu=waves_per_eu,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            quantization=quantization,
-            pack_bytes=pack_bytes,
-            quantize_from_bytes=quantize_from_bytes,
-        )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
         prefix_output, output = torch.empty_like(input), torch.empty_like(input)
@@ -3082,14 +2501,9 @@ class HipCustomCommunicator:
         ):
             return prefix_output, output
 
-        # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if given_config is None:
-            raise CommunicatorError(
-                Error.forced_incomplete, "a norm on rows takes its config"
-            )
-        config = given_config
-        logger.debug("add_attn_res_rms_norm launches %s", config)
-        self._assert_moves([config])
+        # WHAT IT MOVES IS THE COMMUNICATOR'S: a norm on rows moves nothing quantized.
+        if config.quantization != "exact":
+            raise AssertionError(f"a norm on rows given an INT4 config: {config}")
         self._debug(
             "add_attn_res_rms_norm",
             {
@@ -3503,28 +2917,10 @@ class HipCustomCommunicator:
             eager + [0] * (layout.max_ranks - self._world),
         )
 
-    def _table_slot(self, input: torch.Tensor, reads_table: bool) -> int:
-        """THE INPUT TABLE SLOT a collective's launch takes (C++'s INPUT TABLES): 0,
-        eager, or where its kernel does not read the table (`reads_table`: C++'s rule,
-        an exact pulled all-reduce and an exact fused op); capturing, a fresh one, never
-        reused (a graph's addresses die with it), its input remembered for `_on_capture`
-        to register. C++ raises where the two disagree."""
-        if not reads_table or not torch.cuda.is_current_stream_capturing():
-            return 0
-        slot = self._next_slot
-        if slot >= self._layout.table_slots:
-            raise CommunicatorError(
-                Error.tables_full,
-                f"{self._layout.table_slots - 1} captured launches",
-            )
-        self._next_slot += 1
-        self._pending.append((slot, input.data_ptr()))
-        return slot
-
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
         """Wrap a cudagraph capture. Each captured collective reserved an input table
-        slot (`_table_slot`), filled on exit, before any replay: the ranks' counts
+        slot (its op's, inline), filled on exit, before any replay: the ranks' counts
         compared, then every rank's recorded inputs' IPC handles exchanged over the CPU
         group (a collective, so every rank exits its capture together), each peer
         allocation opened once (cached by its handle: the caching allocator hands every

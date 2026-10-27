@@ -541,5 +541,5 @@ def test_tuned_table():
     ]:
         for quantization in ["exact", "int4"]:
             for num_tokens in [1, MAX_TOKENS]:
-                _, configs = tuned.nearest(op, quantization, 8, num_tokens, HIDDEN)
-                assert configs, (op, quantization, num_tokens)
+                _, config = tuned.nearest(op, quantization, 8, num_tokens, HIDDEN)
+                assert config is not None, (op, quantization, num_tokens)
