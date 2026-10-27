@@ -216,7 +216,7 @@ DINLINE void attn_res(
         float acc[ROWS][K][P];
         mix(c, acc);
         DTYPE wide_w[1][K][P], wide_out[ROWS][K][P];
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, wide_w, wide_out, output_eps, inv_hidden, n_all, c,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, wide_w, wide_out, output_eps, inv_hidden, n_all, c,
                                     NormPart::wide, false, LAYOUT);
       }
     }
@@ -227,7 +227,7 @@ DINLINE void attn_res(
       if (output_norm_weight_ptr != nullptr) {
         DTYPE output_norm_weight[1][K][P];
         load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, n_all, 1, n_all, output_norm_weight, 0, c, 1);
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, output_norm_weight, result, output_eps, inv_hidden,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, output_norm_weight, result, output_eps, inv_hidden,
                                     n_all, c, NormPart::apply, false, LAYOUT);
       } else {
 #pragma unroll
@@ -435,7 +435,7 @@ DINLINE void attn_res(
       DTYPE output_norm_weight[1][K][P];
       load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
       float scale[ROWS];
-      rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, output_norm_weight, result, output_eps,
+      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(acc, scale, output_norm_weight, result, output_eps,
                                               inv_hidden, input_size_n, offs_n, NormPart::row, false, LAYOUT);
     } else {
 #pragma unroll

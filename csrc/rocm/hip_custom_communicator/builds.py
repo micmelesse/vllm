@@ -61,15 +61,15 @@ CPP_TYPES = {"f16": "c10::Half", "bf16": "c10::BFloat16", "f32": "float"}
 SCALAR_TYPES = {"f16": "Half", "bf16": "BFloat16", "f32": "Float"}
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
 # EACH KERNEL'S ALGORITHM ENUM (its op file's); a norm on rows has one algorithm, the
-# table's "rows" (the host's RowsAlgorithm).
+# table's "rows" (its own enum in the host).
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
     "all_reduce_rms_norm": "AllReduceRmsNormAlgorithm",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormAlgorithm",
     "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormAlgorithm",
-    "rms_norm_rows": "RowsAlgorithm",
-    "add_rms_norm_rows": "RowsAlgorithm",
-    "add_attn_res_rms_norm_rows": "RowsAlgorithm",
+    "rms_norm": "RmsNormAlgorithm",
+    "add_rms_norm": "AddRmsNormAlgorithm",
+    "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
 }
 # EACH KERNEL'S TEMPLATE PARAMETERS, in its template's order (kernels/*.cuh): a build
 # field, an instance's (world, wave_size, contiguous, chunked, tail, quantize_int4),
@@ -83,11 +83,10 @@ TEMPLATE_ARGS = {
     "wave_size pack_bytes waves_per_eu chunked tail",
     "all_reduce_add_attn_res_rms_norm": "algorithm quantize_int4 T world tile_m "
     "tile_n tile_k block_x wave_size pack_bytes waves_per_eu chunked tail",
-    "rms_norm_rows": "T W tile_m tile_n block_x wave_size pack_bytes waves_per_eu "
-    "chunked",
-    "add_rms_norm_rows": "T W tile_m tile_n block_x wave_size pack_bytes "
+    "rms_norm": "T W tile_m tile_n block_x wave_size pack_bytes waves_per_eu chunked",
+    "add_rms_norm": "T W tile_m tile_n block_x wave_size pack_bytes "
     "waves_per_eu chunked",
-    "add_attn_res_rms_norm_rows": "T tile_m tile_n tile_k block_x wave_size "
+    "add_attn_res_rms_norm": "T tile_m tile_n tile_k block_x wave_size "
     "pack_bytes waves_per_eu chunked",
 }
 # THE KERNELS' SOURCES, which every instance file includes.

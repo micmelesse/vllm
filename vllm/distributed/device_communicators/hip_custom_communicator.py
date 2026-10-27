@@ -419,7 +419,6 @@ class AllReduceConfig:
     """THE ALL-REDUCE'S CONFIG."""
 
     kernel: ClassVar[str] = "all_reduce"
-    op: ClassVar[Op] = "all_reduce"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceAlgorithm
@@ -444,7 +443,6 @@ class AllReduceRmsNormConfig:
     """THE ALL-REDUCE THEN RMSNORM'S CONFIG, one kernel."""
 
     kernel: ClassVar[str] = "all_reduce_rms_norm"
-    op: ClassVar[Op] = "all_reduce_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceRmsNormAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceRmsNormAlgorithm
@@ -469,7 +467,6 @@ class AllReduceAddRmsNormConfig:
     """THE ALL-REDUCE THEN ADD-RMSNORM'S CONFIG, one kernel."""
 
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
-    op: ClassVar[Op] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
     algorithm: AllReduceAddRmsNormAlgorithm
@@ -495,7 +492,6 @@ class AllReduceAddAttnResRmsNormConfig:
     sources a step."""
 
     kernel: ClassVar[str] = "all_reduce_add_attn_res_rms_norm"
-    op: ClassVar[Op] = "all_reduce_add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(
         AllReduceAddAttnResRmsNormAlgorithm
     )
@@ -521,8 +517,7 @@ class AllReduceAddAttnResRmsNormConfig:
 class RmsNormConfig:
     """THE RMSNORM ON THIS RANK'S ROWS' CONFIG."""
 
-    kernel: ClassVar[str] = "rms_norm_rows"
-    op: ClassVar[Op] = "rms_norm"
+    kernel: ClassVar[str] = "rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
@@ -546,8 +541,7 @@ class RmsNormConfig:
 class AddRmsNormConfig:
     """THE ADD-RMSNORM ON THIS RANK'S ROWS' CONFIG."""
 
-    kernel: ClassVar[str] = "add_rms_norm_rows"
-    op: ClassVar[Op] = "add_rms_norm"
+    kernel: ClassVar[str] = "add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
@@ -571,8 +565,7 @@ class AddRmsNormConfig:
 class AddAttnResRmsNormConfig:
     """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG: TILE_K sources a step."""
 
-    kernel: ClassVar[str] = "add_attn_res_rms_norm_rows"
-    op: ClassVar[Op] = "add_attn_res_rms_norm"
+    kernel: ClassVar[str] = "add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     grid_x: int
@@ -667,20 +660,11 @@ def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
     an algorithm its kernel lacks, no_such_kernel; tile_k on a kernel without K,
     field_not_this_templates."""
     cls = _CONFIGS.get(c["kernel"])
-    if (
-        cls is None
-        or kernel_op(c["kernel"]) != op
-        or c["algorithm"] not in cls.algorithms
-    ):
+    if cls is None or c["kernel"] != op or c["algorithm"] not in cls.algorithms:
         return Error.no_such_kernel
     if "tile_k" not in {f.name for f in fields(cls)} and c["tile_k"] != cls.tile_k:
         return Error.field_not_this_templates
     return None
-
-
-def kernel_op(kernel: str) -> str | None:
-    """The op whose one kernel `kernel` is, or None."""
-    return _CONFIGS[kernel].op if kernel in _CONFIGS else None
 
 
 @dataclass(frozen=True)
@@ -753,8 +737,7 @@ class TunedConfigs:
         launches, of any op, else the first such config of the table's; moving INT4
         where it has no INT4 config, its exact config moved INT4 (a build it lists).
         None where it has neither."""
-        op = kernel_op(kernel)
-        assert op is not None, f"no op's kernel is {kernel}"
+        assert kernel in _CONFIGS, f"no op's kernel is {kernel}"
         # ITS BUILDS: the table's configs of it (builds.py compiles exactly those).
         builds = {Build.of(c) for c in self.configs if c.kernel == kernel}
 
@@ -828,8 +811,7 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
         where = f"the tuned table: configs[{i}]"
         if list(c) != ["op", *_CONFIG_KEYS]:
             raise ValueError(f"{where} has keys {list(c)}, not {['op', *_CONFIG_KEYS]}")
-        op = kernel_op(c["kernel"])
-        if op is None or c["op"] != _QUALIFIED + op:
+        if c["kernel"] not in _CONFIGS or c["op"] != _QUALIFIED + c["kernel"]:
             raise ValueError(f"{where}: {c['kernel']} is no kernel of {c['op']}")
         q = c["quantize_from_bytes"]
         if (c["quantization"] == "exact") != (q is None) or (
@@ -877,7 +859,7 @@ def parse_tuned_configs(path: Path, arch: str) -> TunedConfigs | None:
         if tuned in picks:
             raise ValueError(f"{where}: {tuned} is tuned twice")
         launches = tuple(configs[j] for j in at)
-        ops = [kernel_op(c.kernel) for c in launches]
+        ops = [c.kernel for c in launches]
         if ops not in ([name], ["all_reduce", _ROWS.get(name)]):
             raise ValueError(
                 f"{where}: its configs are {ops}'s: one of {name}'s, or our all-reduce "

@@ -4,7 +4,7 @@
 // ALL-REDUCE THEN RMSNORM, AND THEN ADD THEN RMSNORM: their kernels, one
 // section each (pull one-shot, pull two-shot, push two-shot), each kernel of
 // the RMSNorm op a wrapper over its add-RMSNorm body; then our separate norm
-// kernels (rms_norm_rows, add_rms_norm_rows), the splits' second.
+// kernels (rms_norm, add_rms_norm), the splits' second.
 
 #pragma once
 
@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -155,7 +155,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
             DTYPE wide_out[1][kPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                         NormPart::wide, true, Layout::tile);
           }
         }
@@ -165,7 +165,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
           DTYPE normed[1][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
                                       NormPart::apply, true, Layout::tile);
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
@@ -196,7 +196,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
       float scale[1];
       DTYPE normed[1][kPacks][kPackElems];
-      rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                        input_size_n, 0, NormPart::row, true, Layout::tile);
       store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
@@ -212,7 +212,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if constexpr (!QUANTIZE_INT4) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
       // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
       constexpr int kPacks =
           (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
       constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -273,7 +273,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         DTYPE normed[1][kPacks][kPackElems];
 
         // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0, NormPart::row, true, Layout::tile);
         store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
       };
@@ -307,7 +307,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
               DTYPE wide_out[1][kPacks][kPackElems];
-              rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+              rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                           NormPart::wide, true, Layout::tile);
             }
           }
@@ -317,7 +317,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             WEIGHT_DTYPE wc[1][kPacks][kPackElems];
             load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
             DTYPE normed[1][kPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
                                         NormPart::apply, true, Layout::tile);
             store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, c, 1);
           }
@@ -473,7 +473,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kThreadPacks][kPackElems];
               DTYPE wide_out[1][kThreadPacks][kPackElems];
-              rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+              rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
                                           NormPart::wide, true, Layout::group_run);
             }
           }
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::group_run, TAIL>(
                 &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
             DTYPE normed[1][kThreadPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c,
                                         NormPart::apply, true, Layout::group_run);
             store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::group_run, TAIL>(
                 normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
@@ -513,7 +513,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float scale[1];
         DTYPE normed[1][kThreadPacks][kPackElems];
         {
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row,
                                       true, Layout::group_run);
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::group_run, TAIL>(
               normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
@@ -563,7 +563,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "all_reduce_rms_norm: no body for this algorithm");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -608,7 +608,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
             DTYPE wide_out[1][kPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                         NormPart::wide, true, Layout::tile);
           }
         }
@@ -618,7 +618,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
           DTYPE normed[1][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
                                       NormPart::apply, true, Layout::tile);
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
@@ -643,7 +643,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
       float scale[1];
       DTYPE normed[1][kPacks][kPackElems];
-      rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                        input_size_n, 0, NormPart::row, true, Layout::tile);
       store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
@@ -692,7 +692,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -751,7 +751,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
             DTYPE wide_out[1][kPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                         NormPart::wide, true, Layout::tile);
           }
         }
@@ -763,7 +763,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
           DTYPE normed[1][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
                                       NormPart::apply, true, Layout::tile);
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
@@ -801,7 +801,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
       float scale[1];
       DTYPE normed[1][kPacks][kPackElems];
-      rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                        input_size_n, 0, NormPart::row, true, Layout::tile);
       store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
@@ -817,7 +817,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if constexpr (!QUANTIZE_INT4) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
       // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
       constexpr int kPacks =
           (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
       constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -886,7 +886,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float scale[1];
         DTYPE normed[1][kPacks][kPackElems];
         {
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                              input_size_n, 0, NormPart::scale, true, Layout::tile);
           // The row's scale into its slot, the partials row's first float: a column of one element,
           // so its one pack is thread 0's.
@@ -897,7 +897,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           return;
         }
         // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0, NormPart::row, true, Layout::tile);
         store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
       };
@@ -945,7 +945,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
               DTYPE wide_out[1][kPacks][kPackElems];
-              rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+              rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                           NormPart::wide, true, Layout::tile);
             }
           }
@@ -1004,7 +1004,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               for (int j = 0; j < kPackElems; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
               float scale[1] = {sc[r][0][0][0]};
               DTYPE normed[1][1][kPackElems];
-              rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(got_f, scale, w_step, normed, eps,
+              rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(got_f, scale, w_step, normed, eps,
                                                                  inv_hidden, input_size_n, c, NormPart::apply, true, Layout::tile);
               store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
             }
@@ -1140,7 +1140,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               chunk(c, s);
               WEIGHT_DTYPE wide_w[1][kThreadPacks][kPackElems];
               DTYPE wide_out[1][kThreadPacks][kPackElems];
-              rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+              rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
                                           NormPart::wide, true, Layout::group_run);
             }
           }
@@ -1191,7 +1191,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::group_run, TAIL>(
               added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, 0, l * n_pad, 1);
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::scale,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::scale,
                                       true, Layout::group_run);
           float scale_row[1][1][1] = {{{scale[0]}}};
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
@@ -1240,7 +1240,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               for (int j = 0; j < kPackElems; ++j) got_f[0][k][j] = static_cast<float>(row_got[0][k][j]);
             float scale[1] = {sc[v][0][0][0]};
             DTYPE normed[1][kThreadPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(got_f, scale, w, normed, eps, inv_hidden, n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(got_f, scale, w, normed, eps, inv_hidden, n, c,
                                         NormPart::apply, true, Layout::group_run);
             store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::group_run, TAIL>(
                 normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n,
@@ -1265,7 +1265,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "all_reduce_add_rms_norm: no body for this algorithm");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -1319,7 +1319,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             chunk(c, s);
             WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
             DTYPE wide_out[1][kPacks][kPackElems];
-            rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+            rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
                                         NormPart::wide, true, Layout::tile);
           }
         }
@@ -1331,7 +1331,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
           DTYPE normed[1][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, input_size_n, c,
                                       NormPart::apply, true, Layout::tile);
           store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
@@ -1362,7 +1362,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
       float scale[1];
       DTYPE normed[1][kPacks][kPackElems];
-      rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
+      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden,
                                                        input_size_n, 0, NormPart::row, true, Layout::tile);
       store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
@@ -1372,12 +1372,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 
 // =============================================================================
-// rms_norm_rows, add_rms_norm_rows
+// rms_norm, add_rms_norm
 //
 // OUR SEPARATE NORM KERNELS, ON ROWS (STANDARDS 3.2, *We win at the
 // op level*): RMSNorm (and fused_add_rms_norm) on rows already all-reduced.
-// Python composes the norm op as two kernels (Template::rms_norm_rows and
-// add_rms_norm_rows): our all-reduce into a tensor of this rank's,
+// Python composes the norm op as two kernels (Template::rms_norm and
+// add_rms_norm): our all-reduce into a tensor of this rank's,
 // then this kernel on it, on its own grid: nothing over the
 // peers. Every row's math and rounding the one-shot's (above): the sum `input`
 // is the all-reduce's, rounded to DTYPE as theirs is, s = float(sum)
@@ -1394,14 +1394,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    rms_norm_rows(const DTYPE* input_ptr, int64_t input_stride_m,
+    rms_norm(const DTYPE* input_ptr, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_m, int input_size_n,
                   const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
                   int weight_size_n, DTYPE* output_ptr, int64_t output_stride_m,
                   int64_t output_stride_n, int output_size_m, int output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
   constexpr int kPacks =
       (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
   constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -1435,7 +1435,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           chunk(c, s);
           WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
           DTYPE wide_out[TILE_M][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
                                       NormPart::wide, true, Layout::tile);
         }
       }
@@ -1446,7 +1446,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
             &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
         DTYPE normed[TILE_M][kPacks][kPackElems];
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c, NormPart::apply,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c, NormPart::apply,
                                     true, Layout::tile);
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
             normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,
@@ -1467,7 +1467,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int j = 0; j < kPackElems; ++j) s[i][k][j] = static_cast<float>(x[i][k][j]);
     float scale[TILE_M];
     DTYPE normed[TILE_M][kPacks][kPackElems];
-    rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
+    rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
                                 Layout::tile);
     store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,
@@ -1479,7 +1479,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    add_rms_norm_rows(const DTYPE* input_ptr, int64_t input_stride_m,
+    add_rms_norm(const DTYPE* input_ptr, int64_t input_stride_m,
                       int64_t input_stride_n, int input_size_m, int input_size_n,
                       const DTYPE* residual_ptr, int64_t residual_stride_m,
                       int64_t residual_stride_n, int residual_size_m, int residual_size_n,
@@ -1491,7 +1491,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       int residual_output_size_m, int residual_output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
   constexpr int kPacks =
       (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
   constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -1537,7 +1537,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           chunk(c, s);
           WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
           DTYPE wide_out[TILE_M][kPacks][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+          rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
                                       NormPart::wide, true, Layout::tile);
         }
       }
@@ -1552,7 +1552,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
             &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
         DTYPE normed[TILE_M][kPacks][kPackElems];
-        rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c, NormPart::apply,
+        rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, wc, normed, eps, inv_hidden, n, c, NormPart::apply,
                                     true, Layout::tile);
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
             normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,
@@ -1584,7 +1584,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
     float scale[TILE_M];
     DTYPE normed[TILE_M][kPacks][kPackElems];
-    rms_norm<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
+    rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
                                 Layout::tile);
     store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,

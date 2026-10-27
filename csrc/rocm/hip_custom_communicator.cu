@@ -238,7 +238,7 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 
-// rms_norm (its kernel rms_norm_rows).
+// rms_norm (its kernel rms_norm).
 struct RmsNormBuildConfig {
   Dim3 block;
   int waves_per_eu;
@@ -249,7 +249,7 @@ struct RmsNormBuildConfig {
   bool operator==(const RmsNormBuildConfig&) const = default;
 };
 
-// add_rms_norm (its kernel add_rms_norm_rows).
+// add_rms_norm (its kernel add_rms_norm).
 struct AddRmsNormBuildConfig {
   Dim3 block;
   int waves_per_eu;
@@ -260,8 +260,8 @@ struct AddRmsNormBuildConfig {
   bool operator==(const AddRmsNormBuildConfig&) const = default;
 };
 
-// add_attn_res_rms_norm (its kernel add_attn_res_rms_norm_rows): TILE_K sources
-// a step.
+// add_attn_res_rms_norm (its kernel add_attn_res_rms_norm): TILE_K sources a
+// step.
 struct AddAttnResRmsNormBuildConfig {
   Dim3 block;
   int waves_per_eu;
@@ -308,9 +308,11 @@ struct AddAttnResRmsNormBuildConfig {
 // table, which a launch looks its kernel up in.
 // =============================================================================
 
-// A NORM ON ROWS' ONE ALGORITHM (the table's "rows"; its kernel has no
-// algorithm parameter).
-enum class RowsAlgorithm : int { rows };
+// EACH NORM ON ROWS' ONE ALGORITHM, its op's own (the table's "rows"; its
+// kernel has no algorithm parameter).
+enum class RmsNormAlgorithm : int { rows };
+enum class AddRmsNormAlgorithm : int { rows };
+enum class AddAttnResRmsNormAlgorithm : int { rows };
 
 // A COMPILED INSTANCE OF A KERNEL, a row of its table: the build it was
 // compiled at (a tuned config, its grid aside), the world (0 for a norm on
@@ -353,14 +355,13 @@ using AllReduceAddAttnResRmsNormKernel =
              AllReduceAddAttnResRmsNormAlgorithm{}, false, T, 2, 1, 1, 1, 64,
              64, 16, 1, false, false>);
 template <typename T, typename W>
-using RmsNormRowsKernel =
-    decltype(&rms_norm_rows<T, W, 1, 1, 64, 64, 16, 1, false>);
+using RmsNormKernel = decltype(&rms_norm<T, W, 1, 1, 64, 64, 16, 1, false>);
 template <typename T, typename W>
-using AddRmsNormRowsKernel =
-    decltype(&add_rms_norm_rows<T, W, 1, 1, 64, 64, 16, 1, false>);
+using AddRmsNormKernel =
+    decltype(&add_rms_norm<T, W, 1, 1, 64, 64, 16, 1, false>);
 template <typename T, typename W>
-using AddAttnResRmsNormRowsKernel =
-    decltype(&add_attn_res_rms_norm_rows<T, 1, 1, 1, 64, 64, 16, 1, false>);
+using AddAttnResRmsNormKernel =
+    decltype(&add_attn_res_rms_norm<T, 1, 1, 1, 64, 64, 16, 1, false>);
 
 // EVERY KERNEL INSTANCE IS COMPILED IN ITS BUILD'S OWN FILE (builds.py):
 // declared here, so this file instantiates none of them; then the tables.
@@ -1594,22 +1595,9 @@ ErrorCode hip_custom_communicator_all_reduce(
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y),
                    static_cast<int>(block_z)};
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  // ---- PRECONDITIONS: the config, the call, then its instance. The first
-  // Error refuses the call; past this section the call runs. ----
-  // THE OUTPUT APART FROM THE INPUT: their bytes do not meet (an output that
-  // aliases the input is refused, interleaved rows included).
-  if (m > 0 && n > 0) {
-    const char* input_first = static_cast<const char*>(input_ptr);
-    const char* output_first = static_cast<const char*>(output_ptr);
-    const char* input_last =
-        input_first +
-        ((m - 1) * input_stride_m + (n - 1) * input_stride_n + 1) * e;
-    const char* output_last =
-        output_first +
-        ((m - 1) * output_stride_m + (n - 1) * output_stride_n + 1) * e;
-    if (input_first < output_last && output_first < input_last)
-      return error_code(Error::inputs_overlap_outputs);
-  }
+  // ---- PRECONDITIONS, every Error the call can be refused for, in this order:
+  // the config alone; the call against the config; the regions; the compiled
+  // kernel on this device. Past this section the call runs. ----
   // THE CONFIG'S NAMES.
   AllReduceAlgorithm algorithm;
   if (algorithm_name == "one_shot_pull")
@@ -1627,13 +1615,9 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";
-  // THE DTYPE BUILT (the world is: open refuses the rest).
-  if (std::find(kDtypes.begin(), kDtypes.end(), dtype) == kDtypes.end())
-    return error_code(Error::dtype_not_built);
-  // THE LAUNCH IN THE HARDWARE'S RANGES (STANDARDS 3.2): the grid and the block
-  // x alone (the kernel's one dimension), the block whole waves up to the
-  // device's workgroup, the grid at most the blocks the signals have slots for,
-  // the waves a EU the CU holds.
+  // THE GRID: x alone (the kernel's one dimension), at least a block, at most
+  // the blocks the signals have slots for. The block and the waves are the
+  // build's (not_built, below).
   if (grid_y != 1 || grid_z != 1 || grid_x < 1 ||
       grid_x > s.symmetric.max_blocks)
     return error_code(Error::launch_out_of_range);
@@ -1643,15 +1627,20 @@ ErrorCode hip_custom_communicator_all_reduce(
     return error_code(Error::field_not_this_templates);
   const int64_t quantize_from = quantize_from_bytes.value_or(0);
   if (quantize_from < 0) return error_code(Error::field_not_positive);
-  // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes), at least an element,
-  // whole packs a row (an aligned load of the pack's width); INT4 at the widest
+  // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes); INT4 at the widest
   // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION).
   if (pack_bytes < 2 || pack_bytes > kPackBytes ||
-      (pack_bytes & (pack_bytes - 1)) != 0 || pack_bytes < e)
+      (pack_bytes & (pack_bytes - 1)) != 0)
     return error_code(Error::pack_out_of_range);
-  if (n * e % pack_bytes != 0) return error_code(Error::row_not_packs);
   if (int4_config && pack_bytes != kPackBytes)
     return error_code(Error::quantization_not_supported);
+  // THE CALL'S DTYPE BUILT (the world is: open refuses the rest), and its
+  // elements whole packs: at least an element a pack, whole packs a row (an
+  // aligned load of the pack's width).
+  if (std::find(kDtypes.begin(), kDtypes.end(), dtype) == kDtypes.end())
+    return error_code(Error::dtype_not_built);
+  if (pack_bytes < e) return error_code(Error::pack_out_of_range);
+  if (n * e % pack_bytes != 0) return error_code(Error::row_not_packs);
   // A LAYOUT THE PACKED LOADS CAN READ: the innermost stride 1, every row on
   // whole packs.
   if (input_stride_n != 1 || output_stride_n != 1)
@@ -1659,6 +1648,20 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (input_stride_m * e % pack_bytes != 0 ||
       output_stride_m * e % pack_bytes != 0)
     return error_code(Error::row_stride_not_packs);
+  // THE OUTPUT APART FROM THE INPUT: their bytes do not meet (an output that
+  // aliases the input is refused, interleaved rows included).
+  if (m > 0 && n > 0) {
+    const char* input_first = static_cast<const char*>(input_ptr);
+    const char* output_first = static_cast<const char*>(output_ptr);
+    const char* input_last =
+        input_first +
+        ((m - 1) * input_stride_m + (n - 1) * input_stride_n + 1) * e;
+    const char* output_last =
+        output_first +
+        ((m - 1) * output_stride_m + (n - 1) * output_stride_n + 1) * e;
+    if (input_first < output_last && output_first < input_last)
+      return error_code(Error::inputs_overlap_outputs);
+  }
   // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization
   // is int4 and the call's bytes reach its quantize_from_bytes, else exact (the
   // kernel's one template parameter).
@@ -1672,6 +1675,21 @@ ErrorCode hip_custom_communicator_all_reduce(
                           output_stride_m == n * output_stride_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
+  // THE PUSHED ONE-SHOT'S UNFENCED REGION HOLDS ITS TILES: a row of a block's
+  // tile in a slot's lines, a line a pack of at most kLinePayloadBytes (a
+  // narrower pack its line alone: kernels/all_reduce.cuh), INT4 a line a word
+  // of its tile's whole groups; a block's TILE_M rows of a bank's
+  // unfenced_blocks, a block its own slots (a grid past them is refused, never
+  // cut).
+  if (algorithm == AllReduceAlgorithm::one_shot_push) {
+    const int64_t line_pack = std::min<int64_t>(pack_bytes, kLinePayloadBytes);
+    const int64_t row_lines =
+        quantize_int4 ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
+                      : (tile_n * e + line_pack - 1) / line_pack;
+    if (row_lines > s.symmetric.unfenced_slot_bytes / kLinePayloadBytes ||
+        grid_x * tile_m > s.symmetric.unfenced_blocks)
+      return error_code(Error::unfenced_too_small);
+  }
   void* kernel = nullptr;
   // THE INSTANCE: the kernel compiled at this config, on this device, for this
   // call (builds.py's kAllReduceInstances, a row each); a config the table did
@@ -1775,25 +1793,11 @@ ErrorCode hip_custom_communicator_all_reduce(
         staging_need = int4_payload_bytes(m, n);
       }
       break;
-    case AllReduceAlgorithm::one_shot_push: {
+    case AllReduceAlgorithm::one_shot_push:
       // THE UNFENCED REGION: [writer, row, n] payload elements, 2 *
       // unfenced_blocks rows (bank, row) of unfenced_slot_bytes of payload each
       // whatever the build (so a row is the same bytes at every build, its
-      // epoch its own), a writer's rows contiguous. ITS CAPACITY: a row of a
-      // block's tile in a slot's lines, a line a pack of at most
-      // kLinePayloadBytes (a narrower pack its line alone:
-      // kernels/all_reduce.cuh), INT4 a line a word of its tile's whole groups;
-      // a block's TILE_M rows of a bank's unfenced_blocks, a block its own
-      // slots (a grid past them is refused, never cut).
-      const int64_t line_pack =
-          std::min<int64_t>(pack_bytes, kLinePayloadBytes);
-      const int64_t row_lines =
-          quantize_int4
-              ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
-              : (tile_n * e + line_pack - 1) / line_pack;
-      if (row_lines > s.symmetric.unfenced_slot_bytes / kLinePayloadBytes ||
-          grid_x * tile_m > s.symmetric.unfenced_blocks)
-        return error_code(Error::unfenced_too_small);
+      // epoch its own), a writer's rows contiguous.
       unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
                              (s.symmetric.unfenced_slot_bytes / e);
       unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
@@ -1802,7 +1806,6 @@ ErrorCode hip_custom_communicator_all_reduce(
       unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
       unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
       break;
-    }
     case AllReduceAlgorithm::one_shot_push_staged: {
       // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot whole
       // kInt4ScalesAlign), no partials.
@@ -2642,9 +2645,9 @@ ErrorCode hip_custom_communicator_rms_norm(
   const bool chunked = n > build.tile_n;
   void* kernel = nullptr;
   // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kRmsNormRowsInstances, a row each).
-  for (const auto& i : kRmsNormRowsInstances)
-    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
+  // call (builds.py's kRmsNormInstances, a row each).
+  for (const auto& i : kRmsNormInstances)
+    if (i.algorithm == RmsNormAlgorithm::rows && i.block_x == build.block.x &&
         i.block_y == build.block.y && i.block_z == build.block.z &&
         i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
         i.tile_n == build.tile_n && i.tile_k == 1 &&
@@ -2665,7 +2668,7 @@ ErrorCode hip_custom_communicator_rms_norm(
   // ----
   // THE LAUNCH: the instance's kernel, at the call's dtypes.
   const auto launch = [&]<typename T, typename W>() {
-    const auto typed = reinterpret_cast<RmsNormRowsKernel<T, W>>(kernel);
+    const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(kernel);
     typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
@@ -2777,12 +2780,12 @@ ErrorCode hip_custom_communicator_add_rms_norm(
   const bool chunked = n > build.tile_n;
   void* kernel = nullptr;
   // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kAddRmsNormRowsInstances, a row each).
-  for (const auto& i : kAddRmsNormRowsInstances)
-    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
-        i.block_y == build.block.y && i.block_z == build.block.z &&
-        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
-        i.tile_n == build.tile_n && i.tile_k == 1 &&
+  // call (builds.py's kAddRmsNormInstances, a row each).
+  for (const auto& i : kAddRmsNormInstances)
+    if (i.algorithm == AddRmsNormAlgorithm::rows &&
+        i.block_x == build.block.x && i.block_y == build.block.y &&
+        i.block_z == build.block.z && i.waves_per_eu == build.waves_per_eu &&
+        i.tile_m == build.tile_m && i.tile_n == build.tile_n && i.tile_k == 1 &&
         i.quantization == build.quantization &&
         i.pack_bytes == build.pack_bytes && i.world == 0 &&
         i.wave_size == s.device.wave_size && i.dtype == dtype &&
@@ -2800,7 +2803,7 @@ ErrorCode hip_custom_communicator_add_rms_norm(
   // ----
   // THE LAUNCH: the instance's kernel, at the call's dtypes.
   const auto launch = [&]<typename T, typename W>() {
-    const auto typed = reinterpret_cast<AddRmsNormRowsKernel<T, W>>(kernel);
+    const auto typed = reinterpret_cast<AddRmsNormKernel<T, W>>(kernel);
     typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
@@ -2964,13 +2967,13 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
   const bool chunked = n > build.tile_n;
   void* kernel = nullptr;
   // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kAddAttnResRmsNormRowsInstances, a row each).
-  for (const auto& i : kAddAttnResRmsNormRowsInstances)
-    if (i.algorithm == RowsAlgorithm::rows && i.block_x == build.block.x &&
-        i.block_y == build.block.y && i.block_z == build.block.z &&
-        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
-        i.tile_n == build.tile_n && i.tile_k == build.tile_k &&
-        i.quantization == build.quantization &&
+  // call (builds.py's kAddAttnResRmsNormInstances, a row each).
+  for (const auto& i : kAddAttnResRmsNormInstances)
+    if (i.algorithm == AddAttnResRmsNormAlgorithm::rows &&
+        i.block_x == build.block.x && i.block_y == build.block.y &&
+        i.block_z == build.block.z && i.waves_per_eu == build.waves_per_eu &&
+        i.tile_m == build.tile_m && i.tile_n == build.tile_n &&
+        i.tile_k == build.tile_k && i.quantization == build.quantization &&
         i.pack_bytes == build.pack_bytes && i.world == 0 &&
         i.wave_size == s.device.wave_size && i.dtype == dtype &&
         i.weight_dtype == dtype && i.contiguous == false &&
@@ -2987,8 +2990,7 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
   // ----
   // THE LAUNCH: the instance's kernel, at the call's dtypes.
   const auto launch = [&]<typename T, typename W>() {
-    const auto typed =
-        reinterpret_cast<AddAttnResRmsNormRowsKernel<T, W>>(kernel);
+    const auto typed = reinterpret_cast<AddAttnResRmsNormKernel<T, W>>(kernel);
     typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),

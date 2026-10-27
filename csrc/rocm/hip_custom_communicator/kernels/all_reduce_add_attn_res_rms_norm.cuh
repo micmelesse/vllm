@@ -3,7 +3,7 @@
 //
 // ALL-REDUCE THEN ADD, ATTNRES AND RMSNORM: the kernels, one section each (pull
 // one-shot, pull two-shot, push two-shot), then our separate AttnRes kernel
-// (add_attn_res_rms_norm_rows), on rows. Every one computes AttnRes by
+// (add_attn_res_rms_norm), on rows. Every one computes AttnRes by
 // the one function, attn_res (attn_res.cuh).
 
 #pragma once
@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // an INT4 call of it by name, quantization_not_supported).
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -406,7 +406,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // THE EXACT BUILD.
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
       // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-      // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+      // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
       constexpr int kPacks =
           (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
       constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // written.
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-    // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+    // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
     constexpr int kPacks =
         (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
     constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
@@ -562,12 +562,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 
 // =============================================================================
-// add_attn_res_rms_norm_rows
+// add_attn_res_rms_norm
 //
 // OUR SEPARATE ATTNRES KERNEL, ON ROWS: Kimi-K3's AttnRes and its
 // RMSNorm on rows already all-reduced (STANDARDS 3.2, *We win at the op level*:
 // where fusing stops paying, the op runs our all-reduce, then this). Python
-// composes the op as two kernels (Template::add_attn_res_rms_norm_rows): our
+// composes the op as two kernels (Template::add_attn_res_rms_norm): our
 // all-reduce into a tensor of this rank's, then
 // this kernel on it: AttnRes on its own
 // grid at its own occupancy, not on the communication kernel's (the fused INT4
@@ -583,7 +583,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE,
           int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    add_attn_res_rms_norm_rows(
+    add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
@@ -606,7 +606,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
-  // the row's columns past the pass masked (rms_norm's mask, the loads' clip), none skipped.
+  // the row's columns past the pass masked (rms_normalize's mask, the loads' clip), none skipped.
   constexpr int kPacks =
       (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) / (kPackElems * THREADS_PER_BLOCK);
   constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;

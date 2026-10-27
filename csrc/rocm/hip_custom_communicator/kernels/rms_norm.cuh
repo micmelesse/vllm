@@ -28,8 +28,8 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2, wide = 3 };
 // (whole groups a thread, group j of thread t the row's t + j * THREADS_PER_BLOCK, its
 // kInt4GroupPacks packs consecutive: common.cuh's Layout); a literal at every call.
 template <int THREADS_PER_BLOCK, int WAVE_SIZE, typename W, typename T, int ROWS, int K, int P>
-DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
-                      const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
+DINLINE void rms_normalize(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
+                           const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
                       float inv_hidden, int size_n, int offs_n, NormPart part,
                       bool round_scaled, Layout layout) {
   if (part != NormPart::apply) {
