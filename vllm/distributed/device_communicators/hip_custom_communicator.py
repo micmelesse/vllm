@@ -18,13 +18,14 @@ own: `config`, its op's config class, the one way to force one, for the tuner an
 the tests. C++ takes every field of every call, checks the config, and returns the Error
 it refused it for, or none: it raises nothing, holds no table and picks nothing.
 
-THE MEMORY is C++'s, in its CommsState (a handle this class holds): the arena (signals,
-staging, partials, scales, the pushed one-shot's inbox), which every rank opens at open
-over legacy HIP IPC after this class exchanges the handles over the CPU group; the
-private buffer (the regions' device arrays, the pushed one-shot's epochs, the input
-tables); the status the kernels write before a wait that gave up traps. Every exact pull
+THE MEMORY is C++'s, in its CommsState (a handle this class holds), each buffer its own
+allocation: the exchange's regions (signals, staging, partials, scales, the pushed
+one-shot's inbox), which every rank opens at open over legacy HIP IPC after this class
+exchanges the handles over the CPU group; the regions' device arrays, the pushed
+one-shot's epochs, the input tables; the status the kernels write before a wait that
+gave up traps. Every exact pull
 reads every rank's input IN PLACE through an input table (aiter's gfx950 pattern): an
-eager call's copy, which C++ makes into the arena's staging on the call's stream, or a
+eager call's copy, which C++ makes into its staging on the call's stream, or a
 captured call's tensors, each launch reserving its slot in the state and every rank's
 registered when `capture()` exits (vLLM's register_graph_buffers). An INT4 call's kernel
 quantizes its input into the staging itself.
@@ -1241,7 +1242,7 @@ class HipCustomCommunicator:
     def _open(self) -> Error | None:
         """OPEN, or the Error it cannot open for (it is then disabled): C++'s state made
         (the device supported, its buffers allocated), the tuned table read for its
-        arch, and every peer's arena opened, after the exchange over the CPU group (a
+        arch, and every peer's regions opened, after the exchange over the CPU group (a
         collective, so every rank must reach it).
 
         Eager, and before any capture: doing this inside a cudagraph capture is not
@@ -1284,8 +1285,8 @@ class HipCustomCommunicator:
             tuned_configs=tuned_configs,
         )
         try:
-            # THE EXCHANGE, one collective over the CPU group: every rank's arena's IPC
-            # handle, its host, its GPU and its pid.
+            # THE EXCHANGE, one collective over the CPU group: every rank's regions' IPC
+            # handles, its host, its GPU and its pid.
             props = torch.cuda.get_device_properties(arguments.device)
             me = {
                 "handle": ipc_handle,
@@ -1330,7 +1331,7 @@ class HipCustomCommunicator:
                 state=handle, handles=[b for peer in everyone for b in peer["handle"]]
             )
             if error is not None:
-                raise CommunicatorError(Error(error), "opening the peers' arenas")
+                raise CommunicatorError(Error(error), "opening the peers' regions")
         except BaseException:
             self._close_peers()
             self._free()
@@ -2324,7 +2325,7 @@ class HipCustomCommunicator:
             )
 
     def _close_peers(self) -> None:
-        """EVERY BORROWED MAPPING closed (C++'s close_peers: the peers' arenas, their
+        """EVERY BORROWED MAPPING closed (C++'s close_peers: the peers' regions, their
         captured inputs). Idempotent; carries on past an error, logged."""
         if self.state is None:
             return
