@@ -98,89 +98,62 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>>
 hip_custom_communicator_build_info();
 
-// THE STATE AND EACH OP'S CONFIG, as handles (plain structs of the API's, Python's to free): the
-// communicator's state once its buffers are; an op's config from its own fields (its algorithm
-// by name, none on a norm on rows; tile_k on AttnRes alone), its handle or the Error's number it
-// is refused for, exactly one set.
+// THE STATE, as a handle (the API's CommsState, Python's to free), made once the buffers are.
 int64_t hip_custom_communicator_state(int64_t rank, int64_t world, int64_t shared_buffer,
     int64_t private_buffer, int64_t status_device, int64_t timeout_ticks, int64_t max_rows,
     int64_t staging_bytes, int64_t partials_bytes, bool checked_after_launch);
 void hip_custom_communicator_free_state(int64_t state);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_all_reduce_config(const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
-    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+
+// Each op once, on its communicator's state (a handle, above), its tensors and values, then its
+// config's fields as plain values, its op's own: an algorithm by name where its kernel has
+// several, the grid and the block, the waves a EU, the tile (tile_k where it has K), what it
+// moves ("exact" or "int4"), the pack, the bytes an INT4 build quantizes from. The norms on rows
+// are the second kernel of an op Python composes after our all-reduce. Each returns the Error's
+// number it was refused for, or -1 when it ran (hip_custom_communicator.cu's Answer).
+
+int64_t hip_custom_communicator_all_reduce(int64_t state, int64_t table_slot, torch::Tensor& input,
+    torch::Tensor& output, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+int64_t hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t table_slot,
+    torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output, double eps,
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_all_reduce_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_all_reduce_rms_norm_config(const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
-    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_all_reduce_rms_norm_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_all_reduce_add_rms_norm_config(const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
-    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_all_reduce_add_rms_norm_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_all_reduce_add_attn_res_rms_norm_config(const std::string& algorithm,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
-    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_all_reduce_add_attn_res_rms_norm_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_rms_norm_config(int64_t grid_x,
+int64_t hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t table_slot,
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps, const std::string& algorithm, int64_t grid_x,
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
     int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_rms_norm_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_add_rms_norm_config(int64_t grid_x,
-    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, const std::string& quantization,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_add_rms_norm_config(int64_t config);
-std::tuple<std::optional<int64_t>, std::optional<int64_t>>
-hip_custom_communicator_add_attn_res_rms_norm_config(int64_t grid_x,
-    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
-void hip_custom_communicator_free_add_attn_res_rms_norm_config(int64_t config);
-
-// Each op once, on its communicator's state and its config (handles, above), then its tensors and
-// values. The norms on rows are the second kernel of an op Python composes after our all-reduce.
-// Each returns the Error's number it was refused for, or -1 when it ran
-// (hip_custom_communicator.cu's Answer).
-
-int64_t hip_custom_communicator_all_reduce(int64_t state, int64_t config, int64_t table_slot,
-    torch::Tensor& input, torch::Tensor& output);
-int64_t hip_custom_communicator_all_reduce_rms_norm(int64_t state, int64_t config,
-    int64_t table_slot, torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output,
-    double eps);
-int64_t hip_custom_communicator_all_reduce_add_rms_norm(int64_t state, int64_t config,
-    int64_t table_slot, torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
-    torch::Tensor& output, torch::Tensor& residual_output, double eps);
-int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, int64_t config,
-    int64_t table_slot, torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
-    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
-    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps);
-int64_t hip_custom_communicator_rms_norm(int64_t state, int64_t config, torch::Tensor& input,
-    torch::Tensor& weight, torch::Tensor& output, double eps);
-int64_t hip_custom_communicator_add_rms_norm(int64_t state, int64_t config, torch::Tensor& input,
-    torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps);
-int64_t hip_custom_communicator_add_attn_res_rms_norm(int64_t state, int64_t config,
+int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state, int64_t table_slot,
     torch::Tensor& input, const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
     torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps);
+    double eps, double output_eps, const std::string& algorithm, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization,
+    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes);
+int64_t hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, torch::Tensor& weight,
+    torch::Tensor& output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
+    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
+    int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+int64_t hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& input,
+    torch::Tensor& residual, torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y, int64_t grid_z,
+    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
+    int64_t tile_n, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);
+int64_t hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks, torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight, const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output, torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output, int64_t num_blocks, double eps,
+    double output_eps, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
+    std::optional<int64_t> quantize_from_bytes);

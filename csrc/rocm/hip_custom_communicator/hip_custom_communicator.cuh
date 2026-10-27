@@ -300,9 +300,8 @@ constexpr const char* to_string(Where w) {
 // =================================================================================================
 
 // THE VOCABULARY, every type the tables and the handle name: why a call cannot run (`Error`),
-// what a caller asks for (`OpType`), and what is tuned and forced (each op's `OpConfig`: its op's
-// build, its algorithm its op file's, and its launch). `DType` is common.cuh's; what runs is
-// `Config`.
+// what a caller asks for (`OpType`), and what is compiled in (each op's build, its algorithm its
+// op file's). `DType` is common.cuh's.
 
 
 
@@ -615,24 +614,6 @@ static_assert(build_t<OpType::all_reduce>::op == OpType::all_reduce &&
               build_t<OpType::add_attn_res_rms_norm>::op == OpType::add_attn_res_rms_norm,
               "BuildConfig's alternatives are not in OpType's order");
 
-// EACH OP'S CONFIG, one type an op, the whole of it: its build (its op's own, compiled in), its
-// grid (blocks in each dimension), and the call's bytes from which an INT4 build QUANTIZES (the
-// tune's pick: below it the INT4 build passes the call exact, through its instance that does; 0,
-// it always quantizes; an exact build's 0). Made and checked once (`config_of`), held by Python as
-// a handle, and handed to its op's every call, down to its launch.
-template <typename B>
-struct OpConfig {
-  B build;
-  Dim3 grid;
-  int64_t quantize_from_bytes;
-};
-using AllReduceConfig = OpConfig<AllReduceBuildConfig>;
-using AllReduceRmsNormConfig = OpConfig<AllReduceRmsNormBuildConfig>;
-using AllReduceAddRmsNormConfig = OpConfig<AllReduceAddRmsNormBuildConfig>;
-using AllReduceAddAttnResRmsNormConfig = OpConfig<AllReduceAddAttnResRmsNormBuildConfig>;
-using RmsNormConfig = OpConfig<RmsNormBuildConfig>;
-using AddRmsNormConfig = OpConfig<AddRmsNormBuildConfig>;
-using AddAttnResRmsNormConfig = OpConfig<AddAttnResRmsNormBuildConfig>;
 
 // THE FIELDS EVERY BUILD HAS.
 constexpr OpType op_of(const BuildConfig& b) {
@@ -1215,9 +1196,7 @@ constexpr int64_t staged_rows(A algorithm, int quantization, int64_t m, int worl
 
 
 // =================================================================================================
-// 1. AN OP'S CONFIG, CHECKED ONCE: every field given (the C++ API takes no optional; what a caller
-// may leave out is Python's to fill), its algorithm by name among its kernel's. A value out of
-// range is its Error; a build the kernel does not list is the call's check to name.
+// 1. AN OP'S ALGORITHM BY NAME: the call names it, among its kernel's.
 // =================================================================================================
 
 // AN ALGORITHM OF B'S KERNEL by its name, or none where the kernel has no such algorithm.
@@ -1226,38 +1205,6 @@ constexpr std::optional<decltype(B::algorithm)> algorithm_named(std::string_view
   for (const auto& a : B::algorithms)
     if (name == a.name) return a.algorithm;
   return std::nullopt;
-}
-
-// THE CONFIG of `build` on `grid`, checked: the grid and the block (x alone, every kernel's one
-// dimension: y and z 1) of whole waves up to the device's workgroup (the hardware's limit; a wider
-// block's register trade is the tune's to measure), the grid at most the blocks the signals have
-// slots for (every block the device holds resident: whether this kernel's are is
-// grid_not_resident), waves a EU the CU holds, the tile positive, the quantization exact or int4,
-// a pack a load the hardware has. QUANTIZE FROM is an INT4 build's alone (none given: 0, it always
-// quantizes). Each limit is the hardware's (STANDARDS 3.2).
-template <typename B>
-std::variant<OpConfig<B>, Error> config_of(const B& build, Dim3 grid,
-                                           std::optional<int64_t> quantize_from_bytes) {
-  if (build.quantization != Quantization::exact && build.quantization != Quantization::int4)
-    return Error::no_such_quantization;
-  const Dim3 block = build.block;
-  if (!x_alone(block) || !x_alone(grid) || block.x < kTarget.wave_size ||
-      block.x > kTarget.max_workgroup || block.x % kTarget.wave_size != 0 || grid.x < 1 ||
-      grid.x > kMaxBlocks || build.waves_per_eu < 1 ||
-      build.waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
-    return Error::launch_out_of_range;
-  int tile_k = 1;  // a kernel with no K: its identity
-  if constexpr (requires { build.tile_k; }) tile_k = build.tile_k;
-  if (build.tile_m < 1 || build.tile_n < 1 || tile_k < 1) return Error::field_not_positive;
-  if (build.quantization == Quantization::exact && quantize_from_bytes)
-    return Error::field_not_this_templates;
-  if (quantize_from_bytes.value_or(0) < 0) return Error::field_not_positive;
-  // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest); an element's at least is
-  // the call's (refused): the dtype is not known here.
-  if (build.pack_bytes < 2 || build.pack_bytes > kBuild.memory.pack_bytes ||
-      (build.pack_bytes & (build.pack_bytes - 1)) != 0)
-    return Error::pack_out_of_range;
-  return OpConfig<B>{build, grid, quantize_from_bytes.value_or(0)};
 }
 
 // =================================================================================================
@@ -1316,43 +1263,68 @@ inline std::optional<Error> layout_refused(
   return std::nullopt;
 }
 
-// THE CHECK OF A BUILD OF TYPE B (its op's) on a call of `m` rows of `n`: what the build cannot
-// run, then what the regions cannot hold. With no state (`collective` false) the checks that need
-// peers are left out.
+// THE CHECK OF A CALL'S CONFIG (its build, of its op's type B, its grid, and the bytes it
+// quantizes from) on a call of `m` rows of `n`: the world and the dtype built; the config's ranges,
+// each the hardware's (STANDARDS 3.2): the grid and the block x alone (every kernel's one
+// dimension), the block whole waves up to the device's workgroup (a wider block's register trade
+// is the tune's to measure), the grid at most the blocks the signals have slots for (whether this
+// kernel's are resident is grid_not_resident), the waves a EU the CU holds, the tile positive, a
+// pack a load the hardware has, quantize_from_bytes an INT4 build's alone; then what the build
+// cannot run; then what the regions cannot hold. With no state (`collective` false) the checks
+// that need peers are left out.
 template <typename B>
-std::optional<Error> refused_build(bool collective, int world, int64_t staging_bytes,
-                                   int64_t partials_bytes, const OpConfig<B>& c,
-                                   DType dtype, int64_t m, int64_t n) {
+std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
+                             int64_t partials_bytes, const B& build, Dim3 grid,
+                             std::optional<int64_t> quantize_from_bytes, DType dtype, int64_t m,
+                             int64_t n) {
+  if (collective && !world_built(world)) return Error::world_not_built;
+  if (!dtype_built(dtype)) return Error::dtype_not_built;
+  if (!x_alone(build.block) || !x_alone(grid) || build.block.x < kTarget.wave_size ||
+      build.block.x > kTarget.max_workgroup || build.block.x % kTarget.wave_size != 0 ||
+      grid.x < 1 || grid.x > kMaxBlocks || build.waves_per_eu < 1 ||
+      build.waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
+    return Error::launch_out_of_range;
+  int tile_k = 1;  // a kernel with no K: its identity
+  if constexpr (requires { build.tile_k; }) tile_k = build.tile_k;
+  if (build.tile_m < 1 || build.tile_n < 1 || tile_k < 1) return Error::field_not_positive;
+  if (build.quantization == Quantization::exact && quantize_from_bytes)
+    return Error::field_not_this_templates;
+  if (quantize_from_bytes.value_or(0) < 0) return Error::field_not_positive;
+  // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest).
+  if (build.pack_bytes < 2 || build.pack_bytes > kBuild.memory.pack_bytes ||
+      (build.pack_bytes & (build.pack_bytes - 1)) != 0)
+    return Error::pack_out_of_range;
+  const int64_t quantize_from = quantize_from_bytes.value_or(0);
   constexpr bool kPlain = std::is_same_v<B, AllReduceBuildConfig>;
   // THE BUILD'S PACK: at least an element, and whole packs a row (an aligned load of the
   // pack's width: a row that is not whole packs starts the next off them; a narrower
   // build's takes it).
-  const int64_t pack = c.build.pack_bytes;
+  const int64_t pack = build.pack_bytes;
   if (pack < elem_bytes(dtype)) return Error::pack_out_of_range;
   if (n * elem_bytes(dtype) % pack != 0) return Error::row_not_packs;
   // INT4 ON A NORM ON ROWS (it moves nothing) OR A FUSED ONE-SHOT (it reads its peers' inputs as
   // they are): named before the build lookup, which lists no such build; INT4 AT A NARROWER PACK
   // than the widest: the format's word is a pack of 8 values (common.cuh's QUANTIZATION).
-  const bool int4_build = c.build.quantization == Quantization::int4;
+  const bool int4_build = build.quantization == Quantization::int4;
   if constexpr (HasAlgorithm<B>) {
-    if (int4_build && ((!kPlain && is_one_shot(c.build.algorithm)) || pack != kBuild.memory.pack_bytes))
+    if (int4_build && ((!kPlain && is_one_shot(build.algorithm)) || pack != kBuild.memory.pack_bytes))
       return Error::quantization_not_supported;
   } else if (int4_build) {
     return Error::quantization_not_supported;
   }
   // A FUSED OP'S INT4 BUILD ALWAYS QUANTIZES: its kernels have no exact instance of their own.
-  if (int4_build && !kPlain && c.quantize_from_bytes != 0)
+  if (int4_build && !kPlain && quantize_from != 0)
     return Error::field_not_this_templates;
   // A BUILD THE KERNEL DOES NOT LIST, named by what differs: its block, its waves, its tile.
-  if (!built_at_block(B::op, c.build)) return Error::threads_not_built;
-  if (!built_at_waves(B::op, c.build)) return Error::waves_not_built;
-  if (!built(B::op, c.build)) return Error::tile_not_built;
+  if (!built_at_block(B::op, build)) return Error::threads_not_built;
+  if (!built_at_waves(B::op, build)) return Error::waves_not_built;
+  if (!built(B::op, build)) return Error::tile_not_built;
   if constexpr (!HasAlgorithm<B>) {
     return std::nullopt;  // a norm on rows reads no peer and no region
   } else {
     // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the call's bytes from its
     // quantize_from_bytes on), else exact (the INT4 build's instance passing it exact).
-    const bool int4 = int4_build && m * n * elem_bytes(dtype) >= c.quantize_from_bytes;
+    const bool int4 = int4_build && m * n * elem_bytes(dtype) >= quantize_from;
     if constexpr (kPlain) {
       // A PUSHED ONE-SHOT IN THE UNFENCED REGION, its capacity (not a build's rule: any tile and
       // grid is built): a row of a block's tile in a slot's lines, a line a pack of at most
@@ -1361,11 +1333,11 @@ std::optional<Error> refused_build(bool collective, int world, int64_t staging_b
       // a block's TILE_M rows of a bank's kUnfencedBlocks.
       const int64_t line_pack = pack < kLinePayloadBytes ? pack : kLinePayloadBytes;
       const int64_t row_lines =
-          int4 ? (c.build.tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
-               : (c.build.tile_n * elem_bytes(dtype) + line_pack - 1) / line_pack;
-      if (c.build.algorithm == AllReduceAlgorithm::one_shot_push &&
+          int4 ? (build.tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
+               : (build.tile_n * elem_bytes(dtype) + line_pack - 1) / line_pack;
+      if (build.algorithm == AllReduceAlgorithm::one_shot_push &&
           (row_lines > kUnfencedSlotBytes / kLinePayloadBytes ||
-           int64_t{c.grid.x} * c.build.tile_m > kUnfencedBlocks))
+           int64_t{grid.x} * build.tile_m > kUnfencedBlocks))
         return Error::unfenced_too_small;
     }
     if (!collective) return std::nullopt;
@@ -1374,15 +1346,15 @@ std::optional<Error> refused_build(bool collective, int world, int64_t staging_b
       // [m, n] payload; the staged push's inbox, WORLD slots of an input (INT4: its payload, whole
       // kInt4ScalesAlign). The line push stages nothing (INT4 or exact; exact's eager input
       // aside, below).
-      if (is_one_shot(c.build.algorithm) &&
-          (c.build.algorithm == AllReduceAlgorithm::one_shot_push_staged || int4)) {
+      if (is_one_shot(build.algorithm) &&
+          (build.algorithm == AllReduceAlgorithm::one_shot_push_staged || int4)) {
         const int64_t payload = int4 ? int4_payload_bytes(m, n) : m * n * elem_bytes(dtype);
         const int64_t slot =
             int4 ? (payload + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign
                  : payload;
-        const int64_t staged = c.build.algorithm == AllReduceAlgorithm::one_shot_push_staged
+        const int64_t staged = build.algorithm == AllReduceAlgorithm::one_shot_push_staged
                                    ? world * slot
-                               : c.build.algorithm == AllReduceAlgorithm::one_shot_pull ? payload
+                               : build.algorithm == AllReduceAlgorithm::one_shot_pull ? payload
                                                                                  : 0;
         if (staged > staging_bytes) return Error::staging_too_small;
         return std::nullopt;
@@ -1393,17 +1365,17 @@ std::optional<Error> refused_build(bool collective, int world, int64_t staging_b
     // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
     // most one row of the partials's elements (its every view's bound); the flat walk's
     // on its shares' own views (int4_flat_share).
-    const bool flat = kPlain && is_two_shot(c.build.algorithm);
+    const bool flat = kPlain && is_two_shot(build.algorithm);
     const int64_t share = int4_flat_share(m, n, world);
-    const int64_t row = payload_row(c.build.algorithm, Quantization::int4, n);
+    const int64_t row = payload_row(build.algorithm, Quantization::int4, n);
     if (int4 && (flat ? int4_payload_bytes(1, world * share)
                       : int4_payload_bytes(
-                            staged_rows(c.build.algorithm, Quantization::int4, m, world), row)) >
+                            staged_rows(build.algorithm, Quantization::int4, m, world), row)) >
                     staging_bytes)
       return Error::staging_too_small;
-    const int64_t partials = partials_need(c.build.algorithm, m, packs, world, pack);
+    const int64_t partials = partials_need(build.algorithm, m, packs, world, pack);
     if (int4 && (flat ? int4_payload_bytes(1, share)
-                 : int4_groups_a_thread(c.build.algorithm)
+                 : int4_groups_a_thread(build.algorithm)
                      ? int4_payload_bytes((m + world - 1) / world, row)
                      : int4_payload_bytes(1, partials / elem_bytes(dtype))) > partials_bytes)
       return Error::partials_too_small;
@@ -1770,10 +1742,69 @@ inline dim3 dim3_of(const Dim3& d) {
 // =================================================================================================
 
 inline std::optional<Error> all_reduce(
-    const CommsState& s, const AllReduceConfig& c, int64_t table_slot, const void* input,
+    const CommsState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
-    int64_t output_size_n, DType dtype, hipStream_t stream) {
+    int64_t output_size_n, DType dtype, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  const std::optional<AllReduceAlgorithm> named = algorithm_named<AllReduceBuildConfig>(algorithm_name);
+  if (!named) return Error::no_such_kernel;
+  const AllReduceAlgorithm algorithm = *named;
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AllReduceBuildConfig build{.algorithm = algorithm,
+      .block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e = refused(true, s.world, s.staging_bytes, s.partials_bytes, build,
+                                             grid, quantize_from_bytes, dtype, m, n))
+    return *e;
+  const int64_t quantize_from = quantize_from_bytes.value_or(0);
+  if (const std::optional<Error> e =
+          layout_refused(dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
+                                 {input_stride_m, input_stride_n}}))
+    return *e;
+  // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization is int4 and the
+  // call's bytes reach its quantize_from_bytes, else exact (the kernel's one template parameter).
+  const bool quantize_int4 = build.quantization == Quantization::int4 &&
+                           input_size_m * input_size_n * elem_bytes(dtype) >=
+                               quantize_from;
+  const int q = quantize_int4 ? Quantization::int4 : Quantization::exact;
+  // IN PLACE: the exact pull, every rank's input read where its table says.
+  const bool in_place = !is_push(algorithm) && q == Quantization::exact;
+  // THE UNFENCED REGION: the pushed one-shot pushes lines into its own inbox there, a tile a
+  // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
+  // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
+  // epoch as it was.
+  const bool unfenced = algorithm == AllReduceAlgorithm::one_shot_push;
+  if (unfenced && volume(grid) > kUnfencedBlocks) return Error::launch_out_of_range;
+  // THE WHOLE CALL IN ONE PASS (the regions are sized from the largest call; refused() refuses a
+  // call past them). The two-shots' exact share is the flat walk's, whole packs, rounded up: a
+  // rank's slice of a row in the partials, and the pushed two-shot's inbox [WORLD, slot] in the
+  // staging, its slot a share of the whole call.
+  const int64_t pack = build.pack_bytes;  // the build's
+  const int64_t packs = n * elem_bytes(dtype) / pack;
+  const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack;
+  const int64_t slot = (m * packs + s.world - 1) / s.world * pack / elem_bytes(dtype);
+  // THE EXACT PUSHED TWO-SHOT'S INBOX, its slots rounded up to whole packs.
+  const bool inbox = !quantize_int4 && algorithm == AllReduceAlgorithm::two_shot_push;
+  if (inbox && s.world * slot * elem_bytes(dtype) > s.staging_bytes) return Error::staging_too_small;
+  const int shared_memory_bytes = 0;
+  const bool contiguous = input_stride_m == n * input_stride_n &&
+      output_stride_m == n * output_stride_n;
+  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
+  const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
+  const void* kernel = nullptr;
+  with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
   const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
@@ -1788,50 +1819,9 @@ inline std::optional<Error> all_reduce(
   const auto unfenced_epochs =
       reinterpret_cast<int32_t*>(s.private_buffer + kPrivateUnfencedEpochs);
   const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, c.build.pack_bytes, {{output_stride_m, output_stride_n},
-                                 {input_stride_m, input_stride_n}}))
-    return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  const AllReduceBuildConfig& a = c.build;
-  const AllReduceAlgorithm algorithm = a.algorithm;
-  // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization is int4 and the
-  // call's bytes reach its quantize_from_bytes, else exact (the kernel's one template parameter).
-  const bool quantize_int4 = a.quantization == Quantization::int4 &&
-                           input_size_m * input_size_n * elem_bytes(dtype) >=
-                               c.quantize_from_bytes;
-  const int q = quantize_int4 ? Quantization::int4 : Quantization::exact;
-  // IN PLACE: the exact pull, every rank's input read where its table says.
-  const bool in_place = !is_push(algorithm) && q == Quantization::exact;
-  // THE UNFENCED REGION: the pushed one-shot pushes lines into its own inbox there, a tile a
-  // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
-  // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
-  // epoch as it was.
-  const bool unfenced = algorithm == AllReduceAlgorithm::one_shot_push;
-  if (unfenced && volume(c.grid) > kUnfencedBlocks) return Error::launch_out_of_range;
-  // THE WHOLE CALL IN ONE PASS (the regions are sized from the largest call; refused_build refuses a
-  // call past them). The two-shots' exact share is the flat walk's, whole packs, rounded up: a
-  // rank's slice of a row in the partials, and the pushed two-shot's inbox [WORLD, slot] in the
-  // staging, its slot a share of the whole call.
-  const int64_t pack = a.pack_bytes;  // the build's
-  const int64_t packs = n * elem_bytes(dtype) / pack;
-  const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack;
-  const int64_t slot = (m * packs + s.world - 1) / s.world * pack / elem_bytes(dtype);
-  if (!world_built(s.world)) return Error::world_not_built;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (const std::optional<Error> e = refused_build(true, s.world, s.staging_bytes, s.partials_bytes,
-                                               c, dtype, m, n))
-    return *e;
-  // THE EXACT PUSHED TWO-SHOT'S INBOX, its slots rounded up to whole packs.
-  const bool inbox = !quantize_int4 && algorithm == AllReduceAlgorithm::two_shot_push;
-  if (inbox && s.world * slot * elem_bytes(dtype) > s.staging_bytes) return Error::staging_too_small;
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, unfenced_stride_slot = 0, unfenced_stride_m = 0, unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0, unfenced_size_n = 0;
-  int shared_memory_bytes = 0;
-  bool contiguous = false, tail = false;
   // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share): both two-shots'.
   const bool int4_flat = quantize_int4 && is_two_shot(algorithm);
   const int64_t share = int4_flat_share(m, n, s.world);
@@ -1853,8 +1843,6 @@ inline std::optional<Error> all_reduce(
   unfenced_size_slot = unfenced ? s.world : 0;
   unfenced_size_m = unfenced ? 2 * kUnfencedBlocks : 0;
   unfenced_size_n = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
-  contiguous = input_stride_m == n * input_stride_n &&
-      output_stride_m == n * output_stride_n;
   // THE ONE-SHOTS IN THE STAGING (kernels/all_reduce.cuh), as bytes over the dtype's elements
   // (what the launch's region checks read): the INT4 pull's [m, n] payload; the staged push's
   // WORLD slots of an input (INT4: its payload); no partials. The kernels find them from the
@@ -1876,13 +1864,7 @@ inline std::optional<Error> all_reduce(
     partials_size_m = 0;
     partials_size_n = 0;
   }
-  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
-  std::optional<Error> refused;
-  with_instance<OpType::all_reduce>(c.build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, true);
-    if (refused) return;
+  with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -1911,21 +1893,21 @@ inline std::optional<Error> all_reduce(
          elem_bytes(dtype) * (kLineBytes / kLinePayloadBytes), (layout.unfenced_guard - layout.unfenced));
     fits("unfenced epochs", 1, 0, int64_t{kUnfencedBlocks}, kUnfencedEpochsStrideBlock,
          kUnfencedEpochsStrideBlock, int64_t{1}, 4, kUnfencedEpochsBytes);
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     // THE INSTANCE THE CALL'S BYTES NAME: an INT4 build quantizing from its quantize_from_bytes
     // on and passing the call exact below; an exact build never quantizing.
     if (I.quantize_int4 != (B.quantization == Quantization::int4 &&
                        input_size_m * input_size_n * elem_bytes(dtype) >=
-                           c.quantize_from_bytes))
+                           quantize_from))
       throw std::runtime_error(
           "hip_custom_communicator all_reduce before its launch: the instance (quantize_int4 " +
           std::to_string(I.quantize_int4) + ") is not the one " +
           std::to_string(input_size_m * input_size_n * elem_bytes(dtype)) +
           " bytes name at quantize_from_bytes " +
-          std::to_string(c.quantize_from_bytes));
+          std::to_string(quantize_from));
     // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
     // it reads the staging.
     const bool in_table = in_place;
@@ -1940,7 +1922,7 @@ inline std::optional<Error> all_reduce(
     const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.contiguous, I.tail>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         reinterpret_cast<const T* const*>(table), table_size, table_stride_m, table_stride_n,
@@ -1998,7 +1980,6 @@ inline std::optional<Error> all_reduce(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2010,11 +1991,58 @@ inline std::optional<Error> all_reduce(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_rms_norm(
-    const CommsState& s, const AllReduceRmsNormConfig& c, int64_t table_slot, const void* input,
+    const CommsState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
     int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n,
-    DType dtype, DType weight_dtype, float eps, hipStream_t stream) {
+    DType dtype, DType weight_dtype, float eps, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  const std::optional<AllReduceRmsNormAlgorithm> named = algorithm_named<AllReduceRmsNormBuildConfig>(algorithm_name);
+  if (!named) return Error::no_such_kernel;
+  const AllReduceRmsNormAlgorithm algorithm = *named;
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AllReduceRmsNormBuildConfig build{.algorithm = algorithm,
+      .block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e = refused(true, s.world, s.staging_bytes, s.partials_bytes, build,
+                                             grid, quantize_from_bytes, dtype, m, n))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
+                                 {input_stride_m, input_stride_n}}))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
+    return *e;
+  const OpType op = OpType::all_reduce_rms_norm;
+  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
+  const int64_t partials_rows =
+      n > 0 ? partials_need(algorithm, m,
+                           n * elem_bytes(dtype) / build.pack_bytes, s.world,
+                           build.pack_bytes) /
+                  (n * elem_bytes(dtype))
+            : 0;
+  const int shared_memory_bytes = 0;
+  const bool contiguous = input_stride_m == n * input_stride_n &&
+      output_stride_m == n * output_stride_n;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  const bool chunked = n > build.tile_n;
+  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
+  const bool tail = build.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
+  const void* kernel = nullptr;
+  with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
   const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
@@ -2026,60 +2054,22 @@ inline std::optional<Error> all_reduce_rms_norm(
   char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
   char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
   const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, c.build.pack_bytes, {{output_stride_m, output_stride_n},
-                                 {input_stride_m, input_stride_n}}))
-    return *e;
-  if (const std::optional<Error> e =
-          layout_refused(weight_dtype, c.build.pack_bytes, {{0, weight_stride_n}}))
-    return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  const OpType op = OpType::all_reduce_rms_norm;
-  if (!world_built(s.world)) return Error::world_not_built;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
-  if (const std::optional<Error> e = refused_build(true, s.world, s.staging_bytes, s.partials_bytes,
-                                               c, dtype, m, n))
-    return *e;
-  const AllReduceRmsNormBuildConfig& r =
-      c.build;
-  const AllReduceRmsNormAlgorithm algorithm = r.algorithm;
-  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
-  const int64_t partials_rows =
-      n > 0 ? partials_need(algorithm, m,
-                           n * elem_bytes(dtype) / c.build.pack_bytes, s.world,
-                           c.build.pack_bytes) /
-                  (n * elem_bytes(dtype))
-            : 0;
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
-  int shared_memory_bytes = 0;
-  bool contiguous = false, chunked = false, tail = false, in_place = false;
-  const int64_t row_n = payload_row(algorithm, r.quantization, n);
+  bool in_place = false;
+  const int64_t row_n = payload_row(algorithm, build.quantization, n);
   partials_stride_m = row_n;
   partials_stride_n = 1;
   partials_size_m = partials_rows;
   partials_size_n = row_n;
   staging_stride_m = row_n;
   staging_stride_n = 1;
-  staging_size_m = staged_rows(algorithm, r.quantization, m, s.world);
+  staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
   staging_size_n = row_n;
-  contiguous = input_stride_m == n * input_stride_n &&
-      output_stride_m == n * output_stride_n;
   in_place = !is_push(algorithm) &&
-      r.quantization == Quantization::exact;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > r.tile_n;
-  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  tail = r.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
-  std::optional<Error> refused;
-  with_instance<OpType::all_reduce_rms_norm>(c.build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, true);
-    if (refused) return;
+      build.quantization == Quantization::exact;
+  with_instance<OpType::all_reduce_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -2103,13 +2093,13 @@ inline std::optional<Error> all_reduce_rms_norm(
          partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
          staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
     // it reads the staging.
-    const bool in_table = quantization_of(c.build) == Quantization::exact;
+    const bool in_table = quantization_of(build) == Quantization::exact;
     void* const* const table =
         in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
@@ -2121,7 +2111,7 @@ inline std::optional<Error> all_reduce_rms_norm(
     const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(table),
@@ -2177,7 +2167,6 @@ inline std::optional<Error> all_reduce_rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2186,7 +2175,7 @@ inline std::optional<Error> all_reduce_rms_norm(
 // fused_add_rms_norm(all_reduce(inp), residual, weight), vLLM's roundings
 // exactly.
 inline std::optional<Error> all_reduce_add_rms_norm(
-    const CommsState& s, const AllReduceAddRmsNormConfig& c, int64_t table_slot, const void* input,
+    const CommsState& s, int64_t table_slot, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* residual, int64_t residual_stride_m, int64_t residual_stride_n,
     int64_t residual_size_m, int64_t residual_size_n, const void* weight, int64_t weight_stride_n,
@@ -2194,7 +2183,69 @@ inline std::optional<Error> all_reduce_add_rms_norm(
     int64_t output_size_m, int64_t output_size_n, void* residual_output,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype, DType weight_dtype,
-    float eps, hipStream_t stream) {
+    float eps, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  const std::optional<AllReduceAddRmsNormAlgorithm> named = algorithm_named<AllReduceAddRmsNormBuildConfig>(algorithm_name);
+  if (!named) return Error::no_such_kernel;
+  const AllReduceAddRmsNormAlgorithm algorithm = *named;
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AllReduceAddRmsNormBuildConfig build{.algorithm = algorithm,
+      .block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e = refused(true, s.world, s.staging_bytes, s.partials_bytes, build,
+                                             grid, quantize_from_bytes, dtype, m, n))
+    return *e;
+  if (const std::optional<Error> e = layout_refused(
+          dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
+                  {residual_output_stride_m, residual_output_stride_n},
+                  {input_stride_m, input_stride_n},
+                  {residual_stride_m, residual_stride_n}}))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
+    return *e;
+  const OpType op = OpType::all_reduce_add_rms_norm;
+  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none),
+  // at its row stride: the exact pull two-shot's row is its scale's pack then the
+  // row (partials_need); the INT4 build's rows are the row alone, its scales in
+  // the scales region.
+  const bool scale_slot = algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull &&
+                          build.quantization == Quantization::exact;
+  // The scale slot's row whole slots (scale_slot_row), so every row's scale is aligned at any pack.
+  const int64_t slot = scale_slot ? kScaleSlotBytes / elem_bytes(dtype) : 0;
+  const int64_t row = payload_row(algorithm, build.quantization, n);
+  const int64_t partials_stride_m =
+      scale_slot ? scale_slot_row(row * elem_bytes(dtype)) / elem_bytes(dtype) + slot : row;
+  const int64_t partials_rows =
+      n > 0 ? partials_need(algorithm, m,
+                           n * elem_bytes(dtype) / build.pack_bytes, s.world, build.pack_bytes) /
+                  (partials_stride_m * elem_bytes(dtype))
+            : 0;
+  const int shared_memory_bytes = 0;
+  const bool contiguous = input_stride_m == n * input_stride_n &&
+      output_stride_m == n * output_stride_n;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  const bool chunked = n > build.tile_n;
+  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
+  const bool tail = build.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
+  // THE INT4 PULL TWO-SHOT'S SCALES, a rank's rows of them, in the scales region (max_rows rows).
+  if (algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull && !scale_slot &&
+      (m + s.world - 1) / s.world > s.max_rows)
+    return Error::partials_too_small;
+  const void* kernel = nullptr;
+  with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
   // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
   // and the private buffer's arrays, epochs and tables (kPrivate*).
   const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
@@ -2208,49 +2259,10 @@ inline std::optional<Error> all_reduce_add_rms_norm(
   const auto scales_ptr_array =
       reinterpret_cast<float* const*>(region_ptr_arrays + kScalesArray * kMaxRanks);
   const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
-  if (const std::optional<Error> e = layout_refused(
-          dtype, c.build.pack_bytes, {{output_stride_m, output_stride_n},
-                  {residual_output_stride_m, residual_output_stride_n},
-                  {input_stride_m, input_stride_n},
-                  {residual_stride_m, residual_stride_n}}))
-    return *e;
-  if (const std::optional<Error> e =
-          layout_refused(weight_dtype, c.build.pack_bytes, {{0, weight_stride_n}}))
-    return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  const OpType op = OpType::all_reduce_add_rms_norm;
-  if (!world_built(s.world)) return Error::world_not_built;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
-  if (const std::optional<Error> e = refused_build(true, s.world, s.staging_bytes, s.partials_bytes,
-                                               c, dtype, m, n))
-    return *e;
-  const AllReduceAddRmsNormBuildConfig& r =
-      c.build;
-  const AllReduceAddRmsNormAlgorithm algorithm = r.algorithm;
-  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none),
-  // at its row stride: the exact pull two-shot's row is its scale's pack then the
-  // row (partials_need); the INT4 build's rows are the row alone, its scales in
-  // the scales region.
-  const bool scale_slot = algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull &&
-                          r.quantization == Quantization::exact;
-  // The scale slot's row whole slots (scale_slot_row), so every row's scale is aligned at any pack.
-  const int64_t slot = scale_slot ? kScaleSlotBytes / elem_bytes(dtype) : 0;
-  const int64_t row = payload_row(algorithm, r.quantization, n);
-  const int64_t partials_stride_m =
-      scale_slot ? scale_slot_row(row * elem_bytes(dtype)) / elem_bytes(dtype) + slot : row;
-  const int64_t partials_rows =
-      n > 0 ? partials_need(algorithm, m,
-                           n * elem_bytes(dtype) / r.pack_bytes, s.world, r.pack_bytes) /
-                  (partials_stride_m * elem_bytes(dtype))
-            : 0;
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0, scales_stride_m = 0, scales_size_m = 0;
-  int shared_memory_bytes = 0;
-  bool contiguous = false, chunked = false, tail = false, in_place = false;
+  bool in_place = false;
   partials_stride_n = 1;
   partials_size_m = partials_rows;
   partials_size_n = partials_stride_m;
@@ -2259,24 +2271,13 @@ inline std::optional<Error> all_reduce_add_rms_norm(
       algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull && !scale_slot
           ? (m + s.world - 1) / s.world
           : 0;
-  staging_stride_m = payload_row(algorithm, r.quantization, n);
+  staging_stride_m = payload_row(algorithm, build.quantization, n);
   staging_stride_n = 1;
-  staging_size_m = staged_rows(algorithm, r.quantization, m, s.world);
-  staging_size_n = payload_row(algorithm, r.quantization, n);
-  contiguous = input_stride_m == n * input_stride_n &&
-      output_stride_m == n * output_stride_n;
+  staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
+  staging_size_n = payload_row(algorithm, build.quantization, n);
   in_place = !is_push(algorithm) &&
-      r.quantization == Quantization::exact;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > r.tile_n;
-  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  tail = r.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
-  if (scales_size_m > s.max_rows) return Error::partials_too_small;
-  std::optional<Error> refused;
-  with_instance<OpType::all_reduce_add_rms_norm>(c.build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, true);
-    if (refused) return;
+      build.quantization == Quantization::exact;
+  with_instance<OpType::all_reduce_add_rms_norm>(build, s.world, dtype, weight_dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -2301,13 +2302,13 @@ inline std::optional<Error> all_reduce_add_rms_norm(
     fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
          staging_stride_n, elem_bytes(dtype), s.staging_bytes);
     fits("scales", 1, 0, scales_size_m, scales_stride_m, 1, 1, 4, (layout.partials_guard - layout.scales));
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_add_rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
     // it reads the staging.
-    const bool in_table = quantization_of(c.build) == Quantization::exact;
+    const bool in_table = quantization_of(build) == Quantization::exact;
     void* const* const table =
         in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
@@ -2319,7 +2320,7 @@ inline std::optional<Error> all_reduce_add_rms_norm(
     const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_add_rms_norm<B.algorithm, I.quantize_int4, T, W, I.world, B.tile_n, B.block.x,
         I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(table),
@@ -2385,7 +2386,6 @@ inline std::optional<Error> all_reduce_add_rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2399,7 +2399,7 @@ inline std::optional<Error> all_reduce_add_rms_norm(
 // =================================================================================================
 
 inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
-    const CommsState& s, const AllReduceAddAttnResRmsNormConfig& c, int64_t table_slot,
+    const CommsState& s, int64_t table_slot,
     const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
     int64_t input_size_n, const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
     int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m,
@@ -2412,20 +2412,28 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
     int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
-    DType dtype, int num_blocks, float eps, float output_eps, hipStream_t stream) {
-  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
-  // and the private buffer's arrays, epochs and tables (kPrivate*).
-  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
-                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
-  char* const* const region_ptr_arrays =
-      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
-  const auto signals_ptr_array =
-      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
-  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
-  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
-  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
+    DType dtype, int num_blocks, float eps, float output_eps, std::string_view algorithm_name, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, int tile_k, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  const std::optional<AllReduceAddAttnResRmsNormAlgorithm> named = algorithm_named<AllReduceAddAttnResRmsNormBuildConfig>(algorithm_name);
+  if (!named) return Error::no_such_kernel;
+  const AllReduceAddAttnResRmsNormAlgorithm algorithm = *named;
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AllReduceAddAttnResRmsNormBuildConfig build{.algorithm = algorithm,
+      .block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .tile_k = tile_k,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e = refused(true, s.world, s.staging_bytes, s.partials_bytes, build,
+                                             grid, quantize_from_bytes, dtype, m, n))
+    return *e;
   if (const std::optional<Error> e = layout_refused(
-          dtype, c.build.pack_bytes, {{input_stride_m, input_stride_n},
+          dtype, build.pack_bytes, {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
                   {blocks_stride_r, blocks_stride_n},
                   {0, norm_weight_stride_n},
@@ -2438,65 +2446,66 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
   // was refused as `inner_stride_not_one`, 2026-10-13).
   if (prefix != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, c.build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
+            layout_refused(dtype, build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
       return *e;
   if (output_norm_weight != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, c.build.pack_bytes, {{0, output_norm_weight_stride_n}}))
+            layout_refused(dtype, build.pack_bytes, {{0, output_norm_weight_stride_n}}))
       return *e;
   if (block_output != nullptr)
     if (const std::optional<Error> e = layout_refused(
-            dtype, c.build.pack_bytes, {{block_output_stride_m, block_output_stride_n}}))
+            dtype, build.pack_bytes, {{block_output_stride_m, block_output_stride_n}}))
       return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  if (!world_built(s.world)) return Error::world_not_built;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (const std::optional<Error> e = refused_build(true, s.world, s.staging_bytes, s.partials_bytes,
-                                               c, dtype, m, n))
-    return *e;
-  const AllReduceAddAttnResRmsNormBuildConfig& a =
-      c.build;
-  const AllReduceAddAttnResRmsNormAlgorithm algorithm = a.algorithm;
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(algorithm, m,
-                           n * elem_bytes(dtype) / c.build.pack_bytes, s.world,
-                           c.build.pack_bytes) /
+                           n * elem_bytes(dtype) / build.pack_bytes, s.world,
+                           build.pack_bytes) /
                   (n * elem_bytes(dtype))
             : 0;
+  // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
+  // attn_res_wide): [tile_m][num_blocks + 1] floats.
+  const int shared_memory_bytes =
+      n > build.tile_n ? static_cast<int>(build.tile_m * (num_blocks + 1) * sizeof(float)) : 0;
+  const bool contiguous = input_stride_m == n * input_stride_n &&
+      output_stride_m == n * output_stride_n;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  const bool chunked = n > build.tile_n;
+  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
+  const bool tail = build.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
+  const void* kernel = nullptr;
+  with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, true))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
+  // THIS CALL'S BUFFERS, from its arguments: the shared buffer's regions (`arena_layout`)
+  // and the private buffer's arrays, epochs and tables (kPrivate*).
+  const ArenaLayout layout = arena_layout(s.staging_bytes, s.partials_bytes,
+                                         s.max_rows * int64_t{sizeof(float)}, unfenced_bytes(s.world));
+  char* const* const region_ptr_arrays =
+      reinterpret_cast<char* const*>(s.private_buffer + kPrivateRegionPtrArrays);
+  const auto signals_ptr_array =
+      reinterpret_cast<uint32_t* const*>(region_ptr_arrays + kSignalsArray * kMaxRanks);
+  char* const* const staging_ptr_array = region_ptr_arrays + kStagingArray * kMaxRanks;
+  char* const* const partials_ptr_array = region_ptr_arrays + kPartialsArray * kMaxRanks;
+  const auto tables = reinterpret_cast<void* const*>(s.private_buffer + kPrivateTables);
   // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot, m, n]), in
   // elements: zeros where it reads none.
   int64_t partials_stride_m = 0, partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0, staging_size_n = 0;
-  int shared_memory_bytes = 0;
-  bool contiguous = false, chunked = false, tail = false, in_place = false;
-  // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
-  // attn_res_wide): [tile_m][num_blocks + 1] floats.
-  shared_memory_bytes =
-      n > a.tile_n ? static_cast<int>(a.tile_m * (num_blocks + 1) * sizeof(float)) : 0;
-  const int64_t row_n = payload_row(algorithm, a.quantization, n);
+  bool in_place = false;
+  const int64_t row_n = payload_row(algorithm, build.quantization, n);
   partials_stride_m = row_n;
   partials_stride_n = 1;
   partials_size_m = partials_rows;
   partials_size_n = row_n;
   staging_stride_m = row_n;
   staging_stride_n = 1;
-  staging_size_m = staged_rows(algorithm, a.quantization, m, s.world);
+  staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
   staging_size_n = row_n;
-  contiguous = input_stride_m == n * input_stride_n &&
-      output_stride_m == n * output_stride_n;
   in_place = !is_push(algorithm) &&
-      a.quantization == Quantization::exact;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > a.tile_n;
-  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  tail = a.quantization == Quantization::int4 && int4_tail(algorithm, m, n, s.world);
-  std::optional<Error> refused;
-  with_instance<OpType::all_reduce_add_attn_res_rms_norm>(c.build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, true);
-    if (refused) return;
+      build.quantization == Quantization::exact;
+  with_instance<OpType::all_reduce_add_attn_res_rms_norm>(build, s.world, dtype, dtype, contiguous, chunked, tail, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -2520,13 +2529,13 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
          partials_stride_n, elem_bytes(dtype), s.partials_bytes);
     fits("staging", 1, 0, staging_size_m, staging_stride_m, staging_size_n,
          staging_stride_n, elem_bytes(dtype), s.staging_bytes);
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator all_reduce_add_attn_res_rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input, or none where
     // it reads the staging.
-    const bool in_table = quantization_of(c.build) == Quantization::exact;
+    const bool in_table = quantization_of(build) == Quantization::exact;
     void* const* const table =
         in_table ? input_table(tables, table_slot, s.shared_buffer + layout.staging, s.staging_bytes,
                                input, input_stride_m, input_size_m, input_size_n,
@@ -2538,7 +2547,7 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
     const int64_t table_stride_n = !in_table ? staging_stride_n : 1;
     all_reduce_add_attn_res_rms_norm<B.algorithm, I.quantize_int4, T, I.world, B.tile_m, B.tile_n,
         B.tile_k, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu, I.chunked, I.tail>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(table),
@@ -2608,7 +2617,6 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2621,35 +2629,44 @@ inline std::optional<Error> all_reduce_add_attn_res_rms_norm(
 // rms_norm: out = rms_norm(inp, weight), vLLM's roundings exactly, on this rank's rows; the
 // weight `weight_dtype`, dtype or f32.
 inline std::optional<Error> rms_norm(
-    const CommsState& s, const RmsNormConfig& c, const void* input, int64_t input_stride_m,
+    const CommsState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* weight,
     int64_t weight_stride_n, int64_t weight_size_n, void* output, int64_t output_stride_m,
     int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n, DType dtype,
-    DType weight_dtype, float eps, hipStream_t stream) {
+    DType weight_dtype, float eps, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const RmsNormBuildConfig build{.block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   if (const std::optional<Error> e =
-          layout_refused(dtype, c.build.pack_bytes, {{output_stride_m, output_stride_n},
+          refused(false, s.world, 0, 0, build, grid, quantize_from_bytes, dtype, m, n))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, c.build.pack_bytes, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
     return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   const OpType op = OpType::rms_norm;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
-  if (const std::optional<Error> e = refused_build(false, 1, 0, 0,
-                                               c, dtype, m, n))
-    return *e;
-  int shared_memory_bytes = 0;
-  bool chunked = false;
+  const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > c.build.tile_n;
-  std::optional<Error> refused;
-  with_instance<OpType::rms_norm>(c.build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, false);
-    if (refused) return;
+  const bool chunked = n > build.tile_n;
+  const void* kernel = nullptr;
+  with_instance<OpType::rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
+  with_instance<OpType::rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -2657,13 +2674,13 @@ inline std::optional<Error> rms_norm(
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes, B.waves_per_eu,
         I.chunked>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<const W*>(weight), weight_stride_n, static_cast<int>(weight_size_n),
@@ -2694,7 +2711,6 @@ inline std::optional<Error> rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2702,7 +2718,7 @@ inline std::optional<Error> rms_norm(
 // add_rms_norm: out, residual_out = fused_add_rms_norm(inp, residual, weight), vLLM's roundings
 // exactly, on this rank's rows.
 inline std::optional<Error> add_rms_norm(
-    const CommsState& s, const AddRmsNormConfig& c, const void* input, int64_t input_stride_m,
+    const CommsState& s, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n, const void* residual,
     int64_t residual_stride_m, int64_t residual_stride_n, int64_t residual_size_m,
     int64_t residual_size_n, const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
@@ -2710,33 +2726,42 @@ inline std::optional<Error> add_rms_norm(
     int64_t output_size_n, void* residual_output, int64_t residual_output_stride_m,
     int64_t residual_output_stride_n, int64_t residual_output_size_m,
     int64_t residual_output_size_n, DType dtype, DType weight_dtype, float eps,
-    hipStream_t stream) {
+    Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AddRmsNormBuildConfig build{.block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e =
+          refused(false, s.world, 0, 0, build, grid, quantize_from_bytes, dtype, m, n))
+    return *e;
   if (const std::optional<Error> e = layout_refused(
-          dtype, c.build.pack_bytes, {{output_stride_m, output_stride_n},
+          dtype, build.pack_bytes, {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
                   {input_stride_m, input_stride_n},
                   {residual_stride_m, residual_stride_n}}))
     return *e;
   if (const std::optional<Error> e =
-          layout_refused(weight_dtype, c.build.pack_bytes, {{0, weight_stride_n}}))
+          layout_refused(weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
     return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   const OpType op = OpType::add_rms_norm;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (const std::optional<Error> e = weight_refused(op, dtype, weight_dtype)) return *e;
-  if (const std::optional<Error> e = refused_build(false, 1, 0, 0,
-                                               c, dtype, m, n))
-    return *e;
-  int shared_memory_bytes = 0;
-  bool chunked = false;
+  const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > c.build.tile_n;
-  std::optional<Error> refused;
-  with_instance<OpType::add_rms_norm>(c.build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, false);
-    if (refused) return;
+  const bool chunked = n > build.tile_n;
+  const void* kernel = nullptr;
+  with_instance<OpType::add_rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
+  with_instance<OpType::add_rms_norm>(build, s.world, dtype, weight_dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     using W = typename of_dtype<I.weight_dtype>::t;
@@ -2744,13 +2769,13 @@ inline std::optional<Error> add_rms_norm(
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator add_rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     add_rms_norm_rows<T, W, B.tile_m, B.tile_n, B.block.x, I.wave_size, B.pack_bytes,
         B.waves_per_eu, I.chunked>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<const T*>(residual), residual_stride_m, residual_stride_n,
@@ -2788,7 +2813,6 @@ inline std::optional<Error> add_rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }
@@ -2796,7 +2820,7 @@ inline std::optional<Error> add_rms_norm(
 // add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each of this rank's rows
 // (all_reduce_add_attn_res_rms_norm's, its input the sum), `num_blocks` sources.
 inline std::optional<Error> add_attn_res_rms_norm(
-    const CommsState& s, const AddAttnResRmsNormConfig& c, const void* input,
+    const CommsState& s, const void* input,
     int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, int64_t prefix_size_m,
     int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
@@ -2809,9 +2833,24 @@ inline std::optional<Error> add_attn_res_rms_norm(
     void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
     int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
-    DType dtype, int num_blocks, float eps, float output_eps, hipStream_t stream) {
+    DType dtype, int num_blocks, float eps, float output_eps, Dim3 grid, Dim3 block, int waves_per_eu, int tile_m, int tile_n, int tile_k, std::string_view quantization_name, int pack_bytes, std::optional<int64_t> quantize_from_bytes, hipStream_t stream) {
+  // ---- VALIDATION: the config, the call, then its instance. The first Error refuses the call;
+  // past this section the call runs. ----
+  if (quantization_name != "exact" && quantization_name != "int4")
+    return Error::no_such_quantization;
+  const AddAttnResRmsNormBuildConfig build{.block = block,
+      .waves_per_eu = waves_per_eu,
+      .tile_m = tile_m,
+      .tile_n = tile_n,
+      .tile_k = tile_k,
+      .quantization = quantization_name == "int4" ? Quantization::int4 : Quantization::exact,
+      .pack_bytes = pack_bytes};
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
+  if (const std::optional<Error> e =
+          refused(false, s.world, 0, 0, build, grid, quantize_from_bytes, dtype, m, n))
+    return *e;
   if (const std::optional<Error> e = layout_refused(
-          dtype, c.build.pack_bytes, {{input_stride_m, input_stride_n},
+          dtype, build.pack_bytes, {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
                   {blocks_stride_r, blocks_stride_n},
                   {0, norm_weight_stride_n},
@@ -2822,48 +2861,41 @@ inline std::optional<Error> add_attn_res_rms_norm(
   // THE OPTIONAL BUFFERS, checked only when given (all_reduce_add_attn_res_rms_norm's).
   if (prefix != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, c.build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
+            layout_refused(dtype, build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
       return *e;
   if (output_norm_weight != nullptr)
     if (const std::optional<Error> e =
-            layout_refused(dtype, c.build.pack_bytes, {{0, output_norm_weight_stride_n}}))
+            layout_refused(dtype, build.pack_bytes, {{0, output_norm_weight_stride_n}}))
       return *e;
   if (block_output != nullptr)
     if (const std::optional<Error> e = layout_refused(
-            dtype, c.build.pack_bytes, {{block_output_stride_m, block_output_stride_n}}))
+            dtype, build.pack_bytes, {{block_output_stride_m, block_output_stride_n}}))
       return *e;
-  // ITS LAUNCH CONFIG: the call checked, then every view and instance argument decided.
-  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (const std::optional<Error> e = refused_build(false, 1, 0, 0,
-                                               c, dtype, m, n))
-    return *e;
   // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
   // attn_res_wide): [tile_m][num_blocks + 1] floats.
-  const int tile_m = c.build.tile_m, tile_n = c.build.tile_n;
-  int shared_memory_bytes = 0;
-  bool chunked = false;
-  shared_memory_bytes = n > tile_n ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float)) : 0;
+  const int shared_memory_bytes = n > tile_n ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float)) : 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  chunked = n > c.build.tile_n;
-  std::optional<Error> refused;
-  with_instance<OpType::add_attn_res_rms_norm>(c.build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
-    // THE INSTANCE RUNS HERE: its blocks resident, its LDS within the CU's.
-    refused = check_kernel(kernel_pointer<I>(), c.grid, I.build.block, shared_memory_bytes, false);
-    if (refused) return;
+  const bool chunked = n > build.tile_n;
+  const void* kernel = nullptr;
+  with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() { kernel = kernel_pointer<I>(); });
+  if (const std::optional<Error> e = check_kernel(kernel, grid, block, shared_memory_bytes, false))
+    return *e;
+
+  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance. ----
+  with_instance<OpType::add_attn_res_rms_norm>(build, s.world, dtype, dtype, /*contiguous=*/false, chunked, /*tail=*/false, /*quantize_int4=*/false, [&]<Instance I>() {
     constexpr auto B = I.build;
     using T = typename of_dtype<I.dtype>::t;
     // BEFORE THE LAUNCH, every expectation of what add_attn_res_rms_norm is handed (October 26: n11 rebooted
     // seven times timing the fused two-shots at size; the kernels check their indices only
     // against these sizes, so a size past its region was never caught): each view of a region
     // inside the region, and the grid inside the signals' slots.
-    if (volume(c.grid) > int64_t{kMaxBlocks})
+    if (volume(grid) > int64_t{kMaxBlocks})
       throw std::runtime_error("hip_custom_communicator add_attn_res_rms_norm before its launch: a grid of " +
-          std::to_string(volume(c.grid)) + " blocks past the signals' " +
+          std::to_string(volume(grid)) + " blocks past the signals' " +
           std::to_string(int64_t{kMaxBlocks}));
     add_attn_res_rms_norm_rows<T, B.tile_m, B.tile_n, B.tile_k, B.block.x, I.wave_size,
         B.pack_bytes, B.waves_per_eu, I.chunked>
-        <<<dim3_of(c.grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
+        <<<dim3_of(grid), dim3_of(B.block), shared_memory_bytes, stream>>>(
         static_cast<const T*>(input), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<const T*>(prefix), prefix_stride_m, prefix_stride_n,
@@ -2906,7 +2938,6 @@ inline std::optional<Error> add_attn_res_rms_norm(
       }
     }
   });
-  if (refused) return refused;
   HIP_CHECK(hipGetLastError());
   return std::nullopt;
 }

@@ -656,9 +656,8 @@ _CONFIG_KEYS = (
 # build passes the call exact; 0, it always quantizes; an exact config's None). Its
 # kernel, its algorithms and what it does not choose (a norm on rows' one algorithm, a
 # kernel without K's tile_k) are the class's: the table and C++ name every field of
-# every op, so a config reads them alike, but a call cannot force them. C++ holds each
-# as its op's own struct, made from its own fields by name once (`_make_config`), its
-# handle handed to every call.
+# every op, so a config reads them alike, but a call cannot force them. Every op's C++
+# call is handed its own fields by name, a line each.
 @dataclass(frozen=True)
 class AllReduceConfig:
     """THE ALL-REDUCE'S CONFIG."""
@@ -924,151 +923,6 @@ def kernel_op(kernel: str) -> str | None:
 def _record(config: Config) -> dict[str, Any]:
     """`config` as the table holds a config (`_CONFIG_KEYS`, every op's every field)."""
     return {k: getattr(config, k) for k in _CONFIG_KEYS}
-
-
-def _make_config(config: Config) -> int:
-    """`config` MADE IN C++, its op's own struct, checked once there: its handle (freed
-    by `_free_config`). Raises naming the Error it is refused for."""
-    ops = torch.ops._rocm_C
-    match config:
-        case AllReduceConfig():
-            handle, error = ops.hip_custom_communicator_all_reduce_config(
-                algorithm=config.algorithm,
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-        case AllReduceRmsNormConfig():
-            handle, error = ops.hip_custom_communicator_all_reduce_rms_norm_config(
-                algorithm=config.algorithm,
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-        case AllReduceAddRmsNormConfig():
-            handle, error = ops.hip_custom_communicator_all_reduce_add_rms_norm_config(
-                algorithm=config.algorithm,
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-        case AllReduceAddAttnResRmsNormConfig():
-            handle, error = (
-                ops.hip_custom_communicator_all_reduce_add_attn_res_rms_norm_config(
-                    algorithm=config.algorithm,
-                    grid_x=config.grid_x,
-                    grid_y=config.grid_y,
-                    grid_z=config.grid_z,
-                    block_x=config.block_x,
-                    block_y=config.block_y,
-                    block_z=config.block_z,
-                    waves_per_eu=config.waves_per_eu,
-                    tile_m=config.tile_m,
-                    tile_n=config.tile_n,
-                    tile_k=config.tile_k,
-                    quantization=config.quantization,
-                    pack_bytes=config.pack_bytes,
-                    quantize_from_bytes=config.quantize_from_bytes,
-                )
-            )
-        case RmsNormConfig():
-            handle, error = ops.hip_custom_communicator_rms_norm_config(
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-        case AddRmsNormConfig():
-            handle, error = ops.hip_custom_communicator_add_rms_norm_config(
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-        case AddAttnResRmsNormConfig():
-            handle, error = ops.hip_custom_communicator_add_attn_res_rms_norm_config(
-                grid_x=config.grid_x,
-                grid_y=config.grid_y,
-                grid_z=config.grid_z,
-                block_x=config.block_x,
-                block_y=config.block_y,
-                block_z=config.block_z,
-                waves_per_eu=config.waves_per_eu,
-                tile_m=config.tile_m,
-                tile_n=config.tile_n,
-                tile_k=config.tile_k,
-                quantization=config.quantization,
-                pack_bytes=config.pack_bytes,
-                quantize_from_bytes=config.quantize_from_bytes,
-            )
-    if error is not None:
-        raise CommunicatorError(Error(error), f"{_record(config)}")
-    return handle
-
-
-def _free_config(config: Config, handle: int) -> None:
-    """`config`'s handle (`_make_config`'s) freed."""
-    ops = torch.ops._rocm_C
-    match config:
-        case AllReduceConfig():
-            ops.hip_custom_communicator_free_all_reduce_config(handle)
-        case AllReduceRmsNormConfig():
-            ops.hip_custom_communicator_free_all_reduce_rms_norm_config(handle)
-        case AllReduceAddRmsNormConfig():
-            ops.hip_custom_communicator_free_all_reduce_add_rms_norm_config(handle)
-        case AllReduceAddAttnResRmsNormConfig():
-            ops.hip_custom_communicator_free_all_reduce_add_attn_res_rms_norm_config(
-                handle
-            )
-        case RmsNormConfig():
-            ops.hip_custom_communicator_free_rms_norm_config(handle)
-        case AddRmsNormConfig():
-            ops.hip_custom_communicator_free_add_rms_norm_config(handle)
-        case AddAttnResRmsNormConfig():
-            ops.hip_custom_communicator_free_add_attn_res_rms_norm_config(handle)
 
 
 @dataclass(frozen=True)
@@ -1482,10 +1336,6 @@ class HipCustomCommunicator:
     # THE SAME, AS C++ HOLDS IT (its CommsState, every op's first argument): made once
     # the buffers are, freed with them.
     _state: int | None = None
-    # EACH CONFIG AS C++ HOLDS IT (its op's own struct), by the config: the table's
-    # made at open, a forced one's at its first call (`_config_handle`); freed with the
-    # state.
-    _configs: dict[Config, int]
     # THE PEER MEMORY, three buffers a rank, as addresses. HOST: the status words, as
     # the host and the device reach them. SHARED: this rank's (OWNED), and each peer's
     # as its IPC opening gave it (BORROWED), by rank. PRIVATE: this rank's (OWNED).
@@ -1599,9 +1449,6 @@ class HipCustomCommunicator:
         self._peers = {}
         self._pending = []
         self._opened_inputs = {}
-        # EACH CONFIG AS C++ HOLDS IT (its op's own struct), by the config: the table's
-        # made at open, a forced one's at its first call (`_config_handle`).
-        self._configs = {}
         self._stop_watching = threading.Event()
         self._watchdog = None
         self._debug_out = None
@@ -1660,10 +1507,6 @@ class HipCustomCommunicator:
                 partials_bytes=self._layout.partials_bytes,
                 checked_after_launch=self._checked,
             )
-            # EVERY CONFIG THE TABLE LISTS, made and checked: a table C++ refuses a
-            # config of fails the open, naming it.
-            for config in tuned_configs.configs:
-                self._configs[config] = _make_config(config)
         except BaseException:
             self._release_peers()
             self._release_own()
@@ -1895,10 +1738,22 @@ class HipCustomCommunicator:
 
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
             state=self._state,
-            config=self._config_handle(config),
             table_slot=table_slot,
             input=input,
             output=output,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
             raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
@@ -2002,12 +1857,24 @@ class HipCustomCommunicator:
                     self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
                     state=self._state,
-                    config=self._config_handle(config),
                     table_slot=table_slot,
                     input=input,
                     weight=weight,
                     output=output,
                     eps=eps,
+                    algorithm=config.algorithm,
+                    grid_x=config.grid_x,
+                    grid_y=config.grid_y,
+                    grid_z=config.grid_z,
+                    block_x=config.block_x,
+                    block_y=config.block_y,
+                    block_z=config.block_z,
+                    waves_per_eu=config.waves_per_eu,
+                    tile_m=config.tile_m,
+                    tile_n=config.tile_n,
+                    quantization=config.quantization,
+                    pack_bytes=config.pack_bytes,
+                    quantize_from_bytes=config.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2040,10 +1907,22 @@ class HipCustomCommunicator:
                     self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     state=self._state,
-                    config=self._config_handle(config.all_reduce),
                     table_slot=table_slot,
                     input=input,
                     output=output,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2051,11 +1930,22 @@ class HipCustomCommunicator:
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
                     state=self._state,
-                    config=self._config_handle(config.rows),
                     input=output,
                     weight=weight,
                     output=output,
                     eps=eps,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2167,7 +2057,6 @@ class HipCustomCommunicator:
                 error = (
                     torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
                         state=self._state,
-                        config=self._config_handle(config),
                         table_slot=table_slot,
                         input=input,
                         residual=residual,
@@ -2175,6 +2064,19 @@ class HipCustomCommunicator:
                         output=output,
                         residual_output=residual_output,
                         eps=eps,
+                        algorithm=config.algorithm,
+                        grid_x=config.grid_x,
+                        grid_y=config.grid_y,
+                        grid_z=config.grid_z,
+                        block_x=config.block_x,
+                        block_y=config.block_y,
+                        block_z=config.block_z,
+                        waves_per_eu=config.waves_per_eu,
+                        tile_m=config.tile_m,
+                        tile_n=config.tile_n,
+                        quantization=config.quantization,
+                        pack_bytes=config.pack_bytes,
+                        quantize_from_bytes=config.quantize_from_bytes,
                     )
                 )
                 if error != -1:
@@ -2208,10 +2110,22 @@ class HipCustomCommunicator:
                     self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     state=self._state,
-                    config=self._config_handle(config.all_reduce),
                     table_slot=table_slot,
                     input=input,
                     output=output,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2219,13 +2133,24 @@ class HipCustomCommunicator:
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
                     state=self._state,
-                    config=self._config_handle(config.rows),
                     input=output,
                     residual=residual,
                     weight=weight,
                     output=output,
                     residual_output=residual_output,
                     eps=eps,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2363,7 +2288,6 @@ class HipCustomCommunicator:
                     self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
                     state=self._state,
-                    config=self._config_handle(config),
                     table_slot=table_slot,
                     input=input,
                     prefix=prefix,
@@ -2377,6 +2301,20 @@ class HipCustomCommunicator:
                     num_blocks=num_blocks,
                     eps=eps,
                     output_eps=output_eps,
+                    algorithm=config.algorithm,
+                    grid_x=config.grid_x,
+                    grid_y=config.grid_y,
+                    grid_z=config.grid_z,
+                    block_x=config.block_x,
+                    block_y=config.block_y,
+                    block_z=config.block_z,
+                    waves_per_eu=config.waves_per_eu,
+                    tile_m=config.tile_m,
+                    tile_n=config.tile_n,
+                    tile_k=config.tile_k,
+                    quantization=config.quantization,
+                    pack_bytes=config.pack_bytes,
+                    quantize_from_bytes=config.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2409,10 +2347,22 @@ class HipCustomCommunicator:
                     self._pending.append((table_slot, input.data_ptr()))
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     state=self._state,
-                    config=self._config_handle(config.all_reduce),
                     table_slot=table_slot,
                     input=input,
                     output=summed,
+                    algorithm=config.all_reduce.algorithm,
+                    grid_x=config.all_reduce.grid_x,
+                    grid_y=config.all_reduce.grid_y,
+                    grid_z=config.all_reduce.grid_z,
+                    block_x=config.all_reduce.block_x,
+                    block_y=config.all_reduce.block_y,
+                    block_z=config.all_reduce.block_z,
+                    waves_per_eu=config.all_reduce.waves_per_eu,
+                    tile_m=config.all_reduce.tile_m,
+                    tile_n=config.all_reduce.tile_n,
+                    quantization=config.all_reduce.quantization,
+                    pack_bytes=config.all_reduce.pack_bytes,
+                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2420,7 +2370,6 @@ class HipCustomCommunicator:
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
                     state=self._state,
-                    config=self._config_handle(config.rows),
                     input=summed,
                     prefix=prefix,
                     blocks=blocks,
@@ -2433,6 +2382,19 @@ class HipCustomCommunicator:
                     num_blocks=num_blocks,
                     eps=eps,
                     output_eps=output_eps,
+                    grid_x=config.rows.grid_x,
+                    grid_y=config.rows.grid_y,
+                    grid_z=config.rows.grid_z,
+                    block_x=config.rows.block_x,
+                    block_y=config.rows.block_y,
+                    block_z=config.rows.block_z,
+                    waves_per_eu=config.rows.waves_per_eu,
+                    tile_m=config.rows.tile_m,
+                    tile_n=config.rows.tile_n,
+                    tile_k=config.rows.tile_k,
+                    quantization=config.rows.quantization,
+                    pack_bytes=config.rows.pack_bytes,
+                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error != -1:
                     raise CommunicatorError(
@@ -2485,11 +2447,22 @@ class HipCustomCommunicator:
 
         error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
             state=self._state,
-            config=self._config_handle(config),
             input=input,
             weight=weight,
             output=output,
             eps=eps,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
             raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
@@ -2538,13 +2511,24 @@ class HipCustomCommunicator:
 
         error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
             state=self._state,
-            config=self._config_handle(config),
             input=input,
             residual=residual,
             weight=weight,
             output=output,
             residual_output=residual_output,
             eps=eps,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
             raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
@@ -2612,7 +2596,6 @@ class HipCustomCommunicator:
         block_output = blocks[:, write_index] if write_index >= 0 else None
         error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
             state=self._state,
-            config=self._config_handle(config),
             input=input,
             prefix=prefix,
             blocks=blocks,
@@ -2625,6 +2608,19 @@ class HipCustomCommunicator:
             num_blocks=num_blocks,
             eps=eps,
             output_eps=output_eps,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            tile_k=config.tile_k,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            quantize_from_bytes=config.quantize_from_bytes,
         )
         if error != -1:
             raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
@@ -2743,18 +2739,8 @@ class HipCustomCommunicator:
                 Error.signals_left_set, f"after {what}: {len(left)}, {left[:4]}"
             )
 
-    # ---- THE HELPERS, after their callers: a config's handle, debug mode, a capture,
-    # the handshake, the watchdog and a fault. ----
-
-    @final
-    def _config_handle(self, config: Config) -> int:
-        """`config` AS C++ HOLDS IT: the table's, made at open; a forced one's, made at
-        its first call and kept. Raises naming the Error C++ refuses it for."""
-        handle = self._configs.get(config)
-        if handle is None:
-            handle = _make_config(config)
-            self._configs[config] = handle
-        return handle
+    # ---- THE HELPERS, after their callers: debug mode, a capture, the handshake, the
+    # watchdog and a fault. ----
 
     @final
     def _debug(
@@ -3017,11 +3003,8 @@ class HipCustomCommunicator:
 
     def _release_own(self) -> None:
         """OUR OWN shared and private buffers freed: once no peer has them open. With
-        them, the state and every config C++ holds for us. Idempotent."""
+        them, the state C++ holds for us. Idempotent."""
         ops = torch.ops._rocm_C
-        for config, handle in self._configs.items():
-            _free_config(config, handle)
-        self._configs = {}
         if self._state is not None:
             ops.hip_custom_communicator_free_state(self._state)
             self._state = None
