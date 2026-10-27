@@ -1433,169 +1433,19 @@ class HipCustomCommunicator:
         return output
 
     @final
-    def should_allreduce_rms_norm(
-        self, input: torch.Tensor, weight: torch.Tensor
-    ) -> bool:
-        """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, its weight in its dtype or fp32, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
-        return (
-            not self.disabled
-            and self.state is not None
-            and input.dtype in _INPUT_DTYPES
-            and input.is_contiguous()
-            and input.dim() == 2
-            and input.numel() > 0
-            and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
-            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
-            and input.shape[0] <= self.arguments.max_rows
-            and input.shape[1] <= self.arguments.max_cols
-        )
-
-    @final
-    def all_reduce_rms_norm(
+    def should_allreduce_add_rms_norm(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
-        eps: float,
-        *,
-        config: AllReduceRmsNormConfig | AllReduceRmsNormSplitConfig | None = None,
-    ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)`, at the config given
-        (the tuner's, the tests'), else at the table's pick for its rows and width: one
-        kernel, or our all-reduce then the norm on its rows. Returns the normed sum."""
-        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
-        # is not [rows, cols].
-        if self.disabled:
-            raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
-        assert self.state is not None, "an open communicator has its state"
-        if input.dim() != 2:
-            raise RuntimeError(f"not_two_d: not {tuple(input.shape)}")
-
-        # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
-        output = torch.empty_like(input)
-        if (
-            self.lifecycle.status == "capturing"
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            return output
-
-        # THE CONFIG: the one given, else the tuned table's nearest input's (one
-        # kernel, or the split: our all-reduce, then the op on this rank's rows).
-        if config is None:
-            rows, cols = input.shape
-            _, picked = self.state.tuned_table.nearest(
-                "all_reduce_rms_norm",
-                self.arguments.quantization,
-                self.arguments.world,
-                rows,
-                cols,
-            )
-            assert isinstance(
-                picked, AllReduceRmsNormConfig | AllReduceRmsNormSplitConfig
-            ), picked
-            config = picked
-        launches: list[Config] = (
-            [config.all_reduce, config.rows]
-            if isinstance(config, AllReduceRmsNormSplitConfig)
-            else [config]
-        )
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
-        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
-        # call below its quantize_from_bytes exact itself.
-        for c in launches:
-            if self.arguments.quantization == "exact" and c.quantization != "exact":
-                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
-            if (
-                self.arguments.quantization == "int4"
-                and c.kernel == "all_reduce"
-                and c.quantization != "int4"
-            ):
-                raise AssertionError(
-                    f"a quantized communicator given an exact config: {c}"
-                )
-
-        match config:
-            case AllReduceRmsNormConfig():
-                # ONE KERNEL, the fused op.
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
-                    state=self.state.handle,
-                    input=input,
-                    weight=weight,
-                    output=output,
-                    eps=eps,
-                    algorithm=config.algorithm,
-                    grid_x=config.grid_x,
-                    grid_y=config.grid_y,
-                    grid_z=config.grid_z,
-                    block_x=config.block_x,
-                    block_y=config.block_y,
-                    block_z=config.block_z,
-                    waves_per_eu=config.waves_per_eu,
-                    tile_m=config.tile_m,
-                    tile_n=config.tile_n,
-                    quantization=config.quantization,
-                    pack_bytes=config.pack_bytes,
-                    quantize_from_bytes=config.quantize_from_bytes,
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config} on {input.shape}"
-                    )
-            case AllReduceRmsNormSplitConfig():
-                # THE SPLIT, an algorithm of the same op (`split_<the all-reduce's>`):
-                # C++ runs our all-reduce into the output, then the norm on its rows
-                # in place, back to back. Its config's fields are the all-reduce's,
-                # its rms_norm_ fields the norm's.
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
-                    state=self.state.handle,
-                    input=input,
-                    weight=weight,
-                    output=output,
-                    eps=eps,
-                    algorithm=f"split_{config.all_reduce.algorithm}",
-                    grid_x=config.all_reduce.grid_x,
-                    grid_y=config.all_reduce.grid_y,
-                    grid_z=config.all_reduce.grid_z,
-                    block_x=config.all_reduce.block_x,
-                    block_y=config.all_reduce.block_y,
-                    block_z=config.all_reduce.block_z,
-                    waves_per_eu=config.all_reduce.waves_per_eu,
-                    tile_m=config.all_reduce.tile_m,
-                    tile_n=config.all_reduce.tile_n,
-                    quantization=config.all_reduce.quantization,
-                    pack_bytes=config.all_reduce.pack_bytes,
-                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
-                    rms_norm_grid_x=config.rows.grid_x,
-                    rms_norm_grid_y=config.rows.grid_y,
-                    rms_norm_grid_z=config.rows.grid_z,
-                    rms_norm_block_x=config.rows.block_x,
-                    rms_norm_block_y=config.rows.block_y,
-                    rms_norm_block_z=config.rows.block_z,
-                    rms_norm_waves_per_eu=config.rows.waves_per_eu,
-                    rms_norm_tile_m=config.rows.tile_m,
-                    rms_norm_tile_n=config.rows.tile_n,
-                    rms_norm_pack_bytes=config.rows.pack_bytes,
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config} on {input.shape}"
-                    )
-        return output
-
-    @final
-    def should_allreduce_add_rms_norm(
-        self, input: torch.Tensor, weight: torch.Tensor
+        residual: torch.Tensor | None = None,
     ) -> bool:
-        """Whether `all_reduce_add_rms_norm(input, ..., weight, ...)` runs here."""
+        """Whether `all_reduce_add_rms_norm(input, weight, ..., residual=residual)` runs
+        here."""
         # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, its weight in its dtype or fp32, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
+        # kernels are compiled at, its weight in its dtype or fp32, a residual (if
+        # any) its shape and dtype, whole packs a row, inside the box the exchange
+        # was sized for (C++ sized every region for it at every dtype). Python alone,
+        # no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this admits.
         return (
             not self.disabled
             and self.state is not None
@@ -1604,6 +1454,10 @@ class HipCustomCommunicator:
             and input.dim() == 2
             and input.numel() > 0
             and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
+            and (
+                residual is None
+                or (residual.shape == input.shape and residual.dtype == input.dtype)
+            )
             and input.shape[1] * input.element_size() % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
@@ -1613,19 +1467,22 @@ class HipCustomCommunicator:
     def all_reduce_add_rms_norm(
         self,
         input: torch.Tensor,
-        residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         *,
-        config: AllReduceAddRmsNormConfig
+        residual: torch.Tensor | None = None,
+        config: AllReduceRmsNormConfig
+        | AllReduceRmsNormSplitConfig
+        | AllReduceAddRmsNormConfig
         | AllReduceAddRmsNormSplitConfig
         | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)`,
-        at the config given (the tuner's, the tests'), else at the table's pick for its
-        rows and width: one kernel, or our all-reduce then the add and norm on its rows.
-        Returns the normed result and
-        the sum plus residual."""
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """THE RMSNORM OF VLLM ON THE ALL-REDUCE, at the config given (the tuner's, the
+        tests'), else at the table's pick for its rows and width: without a residual
+        `rms_norm(all_reduce(input), weight, eps)`, returning the normed sum; with one
+        `fused_add_rms_norm(all_reduce(input), residual, weight, eps)`, returning the
+        normed result and the sum plus residual. One kernel, or the split: our
+        all-reduce then the norm (or add-norm) on its rows, back to back."""
         # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
         # is not [rows, cols].
         if self.disabled:
@@ -1635,33 +1492,46 @@ class HipCustomCommunicator:
             raise RuntimeError(f"not_two_d: not {tuple(input.shape)}")
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
-        output, residual_output = torch.empty_like(input), torch.empty_like(input)
+        add = residual is not None
+        output = torch.empty_like(input)
+        residual_output = torch.empty_like(input) if add else None
         if (
             self.lifecycle.status == "capturing"
             and not torch.cuda.is_current_stream_capturing()
         ):
-            return output, residual_output
+            return (output, residual_output) if add else output
 
-        # THE CONFIG: the one given, else the tuned table's nearest input's (one
-        # kernel, or the split: our all-reduce, then the op on this rank's rows).
+        # THE CONFIG: the one given, else the tuned table's nearest input's, the
+        # add-norm's table with a residual, the norm's without (one kernel, or the
+        # split: our all-reduce, then the norm on this rank's rows).
         if config is None:
             rows, cols = input.shape
             _, picked = self.state.tuned_table.nearest(
-                "all_reduce_add_rms_norm",
+                "all_reduce_add_rms_norm" if add else "all_reduce_rms_norm",
                 self.arguments.quantization,
                 self.arguments.world,
                 rows,
                 cols,
             )
             assert isinstance(
-                picked, AllReduceAddRmsNormConfig | AllReduceAddRmsNormSplitConfig
+                picked,
+                AllReduceRmsNormConfig
+                | AllReduceRmsNormSplitConfig
+                | AllReduceAddRmsNormConfig
+                | AllReduceAddRmsNormSplitConfig,
             ), picked
             config = picked
-        launches: list[Config] = (
-            [config.all_reduce, config.rows]
-            if isinstance(config, AllReduceAddRmsNormSplitConfig)
-            else [config]
+        if add != isinstance(
+            config, AllReduceAddRmsNormConfig | AllReduceAddRmsNormSplitConfig
+        ):
+            raise AssertionError(
+                f"a config for the {'add-' if add else ''}norm's kernel is needed: "
+                f"{config}"
+            )
+        split = isinstance(
+            config, AllReduceRmsNormSplitConfig | AllReduceAddRmsNormSplitConfig
         )
+        launches: list[Config] = [config.all_reduce, config.rows] if split else [config]
         # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
         # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
         # call below its quantize_from_bytes exact itself.
@@ -1677,90 +1547,46 @@ class HipCustomCommunicator:
                     f"a quantized communicator given an exact config: {c}"
                 )
 
-        match config:
-            case AllReduceAddRmsNormConfig():
-                # ONE KERNEL, the fused op.
-                error = (
-                    torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
-                        state=self.state.handle,
-                        input=input,
-                        residual=residual,
-                        weight=weight,
-                        output=output,
-                        residual_output=residual_output,
-                        eps=eps,
-                        algorithm=config.algorithm,
-                        grid_x=config.grid_x,
-                        grid_y=config.grid_y,
-                        grid_z=config.grid_z,
-                        block_x=config.block_x,
-                        block_y=config.block_y,
-                        block_z=config.block_z,
-                        waves_per_eu=config.waves_per_eu,
-                        tile_m=config.tile_m,
-                        tile_n=config.tile_n,
-                        quantization=config.quantization,
-                        pack_bytes=config.pack_bytes,
-                        quantize_from_bytes=config.quantize_from_bytes,
-                    )
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config} on {input.shape}"
-                    )
-            case AllReduceAddRmsNormSplitConfig():
-                # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the add
-                # and norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the
-                # norm writes its rows over them in place (STANDARDS 3.5), no tensor of
-                # its own.
-                error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                    state=self.state.handle,
-                    input=input,
-                    output=output,
-                    algorithm=config.all_reduce.algorithm,
-                    grid_x=config.all_reduce.grid_x,
-                    grid_y=config.all_reduce.grid_y,
-                    grid_z=config.all_reduce.grid_z,
-                    block_x=config.all_reduce.block_x,
-                    block_y=config.all_reduce.block_y,
-                    block_z=config.all_reduce.block_z,
-                    waves_per_eu=config.all_reduce.waves_per_eu,
-                    tile_m=config.all_reduce.tile_m,
-                    tile_n=config.all_reduce.tile_n,
-                    quantization=config.all_reduce.quantization,
-                    pack_bytes=config.all_reduce.pack_bytes,
-                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config.all_reduce} on {input.shape}"
-                    )
-                error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
-                    state=self.state.handle,
-                    input=output,
-                    residual=residual,
-                    weight=weight,
-                    output=output,
-                    residual_output=residual_output,
-                    eps=eps,
-                    grid_x=config.rows.grid_x,
-                    grid_y=config.rows.grid_y,
-                    grid_z=config.rows.grid_z,
-                    block_x=config.rows.block_x,
-                    block_y=config.rows.block_y,
-                    block_z=config.rows.block_z,
-                    waves_per_eu=config.rows.waves_per_eu,
-                    tile_m=config.rows.tile_m,
-                    tile_n=config.rows.tile_n,
-                    quantization=config.rows.quantization,
-                    pack_bytes=config.rows.pack_bytes,
-                    quantize_from_bytes=config.rows.quantize_from_bytes,
-                )
-                if error is not None:
-                    raise RuntimeError(
-                        f"{Error(error).name}: {config.rows} on {input.shape}"
-                    )
-        return output, residual_output
+        # ONE C++ CALL: the fused kernel at the config's algorithm, or the split
+        # (algorithm "split": the all-reduce at its config, its body
+        # all_reduce_algorithm, then the norm at the rms_norm_ fields).
+        first = config.all_reduce if split else config
+        error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
+            state=self.state.handle,
+            input=input,
+            residual=residual,
+            weight=weight,
+            output=output,
+            residual_output=residual_output,
+            eps=eps,
+            algorithm="split" if split else config.algorithm,
+            grid_x=first.grid_x,
+            grid_y=first.grid_y,
+            grid_z=first.grid_z,
+            block_x=first.block_x,
+            block_y=first.block_y,
+            block_z=first.block_z,
+            waves_per_eu=first.waves_per_eu,
+            tile_m=first.tile_m,
+            tile_n=first.tile_n,
+            quantization=first.quantization,
+            pack_bytes=first.pack_bytes,
+            quantize_from_bytes=first.quantize_from_bytes,
+            all_reduce_algorithm=config.all_reduce.algorithm if split else None,
+            rms_norm_grid_x=config.rows.grid_x if split else None,
+            rms_norm_grid_y=config.rows.grid_y if split else None,
+            rms_norm_grid_z=config.rows.grid_z if split else None,
+            rms_norm_block_x=config.rows.block_x if split else None,
+            rms_norm_block_y=config.rows.block_y if split else None,
+            rms_norm_block_z=config.rows.block_z if split else None,
+            rms_norm_waves_per_eu=config.rows.waves_per_eu if split else None,
+            rms_norm_tile_m=config.rows.tile_m if split else None,
+            rms_norm_tile_n=config.rows.tile_n if split else None,
+            rms_norm_pack_bytes=config.rows.pack_bytes if split else None,
+        )
+        if error is not None:
+            raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
+        return (output, residual_output) if add else output
 
     @final
     def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
@@ -1962,64 +1788,6 @@ class HipCustomCommunicator:
     # ---- THE NORMS ON THIS RANK'S ROWS, no peer: the second kernel of an op as two
     # kernels of ours, a caller's to compose (our all-reduce, then one of these on its
     # sum). No table: a call gives its config, whole. ----
-
-    @final
-    def add_rms_norm(
-        self,
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-        *,
-        config: AddRmsNormConfig,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`vllm.ir.ops.fused_add_rms_norm(input, residual, weight, eps)` on this rank's
-        rows, `input` a sum, at the config given. Returns the normed result and the sum
-        plus residual."""
-        # REFUSED BEFORE C++ IS ASKED: a communicator that runs nothing, an input that
-        # is not [rows, cols].
-        if self.disabled:
-            raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
-        assert self.state is not None, "an open communicator has its state"
-        if input.dim() != 2:
-            raise RuntimeError(f"not_two_d: not {tuple(input.shape)}")
-
-        # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
-        output, residual_output = torch.empty_like(input), torch.empty_like(input)
-        if (
-            self.lifecycle.status == "capturing"
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            return output, residual_output
-
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: a norm on rows moves nothing quantized.
-        if config.quantization != "exact":
-            raise AssertionError(f"a norm on rows given an INT4 config: {config}")
-
-        error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
-            state=self.state.handle,
-            input=input,
-            residual=residual,
-            weight=weight,
-            output=output,
-            residual_output=residual_output,
-            eps=eps,
-            grid_x=config.grid_x,
-            grid_y=config.grid_y,
-            grid_z=config.grid_z,
-            block_x=config.block_x,
-            block_y=config.block_y,
-            block_z=config.block_z,
-            waves_per_eu=config.waves_per_eu,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            quantization=config.quantization,
-            pack_bytes=config.pack_bytes,
-            quantize_from_bytes=config.quantize_from_bytes,
-        )
-        if error is not None:
-            raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
-        return output, residual_output
 
     @final
     def add_attn_res_rms_norm(

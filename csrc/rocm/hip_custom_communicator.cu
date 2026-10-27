@@ -239,7 +239,6 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 
-
 // add_rms_norm (its kernel add_rms_norm).
 struct AddRmsNormBuildConfig {
   Dim3 block;
@@ -1879,13 +1878,16 @@ ErrorCode hip_custom_communicator_all_reduce(
 // all_reduce_rms_norm: at its config. One function: what Python passes, its
 // tensors stripped to pointers and strides, the preconditions, the kernel's
 // arguments, the launch, the postcondition.
-ErrorCode hip_custom_communicator_all_reduce_rms_norm(
-    int64_t state, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps, const std::string& algorithm_name,
-    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
-    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
-    int64_t tile_n, const std::string& quantization_name, int64_t pack_bytes,
+ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
+    int64_t state, torch::Tensor& input,
+    const std::optional<torch::Tensor>& residual, torch::Tensor& weight,
+    torch::Tensor& output, const std::optional<torch::Tensor>& residual_output,
+    double eps, const std::string& algorithm_name, int64_t grid_x,
+    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
+    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    const std::string& quantization_name, int64_t pack_bytes,
     std::optional<int64_t> quantize_from_bytes,
+    const std::optional<std::string>& all_reduce_algorithm_name,
     std::optional<int64_t> rms_norm_grid_x,
     std::optional<int64_t> rms_norm_grid_y,
     std::optional<int64_t> rms_norm_grid_z,
@@ -1896,7 +1898,6 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     std::optional<int64_t> rms_norm_tile_m,
     std::optional<int64_t> rms_norm_tile_n,
     std::optional<int64_t> rms_norm_pack_bytes) {
-  using namespace hip_custom_communicator;
   using namespace hip_custom_communicator;
   // ---- THE CALL FROM TORCH: its state, its tensors stripped to pointers and
   // strides, its config's ints. ----
@@ -1909,21 +1910,37 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     return error_code(Error::shape_mismatch);
   if (output.scalar_type() != input.scalar_type())
     return error_code(Error::dtype_mismatch);
+  // THE RESIDUAL, given with its output or neither: with it the op is vLLM's
+  // fused_add_rms_norm on the sum (out = rms_norm(sum + residual), residual_out
+  // = sum + residual), without it its rms_norm (out = rms_norm(sum)).
+  const bool add = residual.has_value();
+  if (residual_output.has_value() != add)
+    return error_code(Error::shape_mismatch);
+  if (add && (!residual->is_cuda() || !residual_output->is_cuda()))
+    return error_code(Error::not_on_device);
+  if (add && (residual->sizes() != input.sizes() ||
+              residual_output->sizes() != input.sizes()))
+    return error_code(Error::shape_mismatch);
+  if (add && (residual->scalar_type() != input.scalar_type() ||
+              residual_output->scalar_type() != input.scalar_type()))
+    return error_code(Error::dtype_mismatch);
   for (const int64_t v : {waves_per_eu, tile_m, tile_n, pack_bytes, grid_x,
                           grid_y, grid_z, block_x, block_y, block_z})
     if (v < std::numeric_limits<int>::min() ||
         v > std::numeric_limits<int>::max())
       return error_code(Error::field_out_of_range);
   // THE ALGORITHM: one fused kernel's (one_shot_pull, two_shot_pull,
-  // two_shot_push), or a SPLIT, `split_<the all-reduce's algorithm>`: our
-  // all-reduce kernel (at this config's fields, its checks and views written
-  // out here as all_reduce's are), then the RMSNorm on this rank's rows in
-  // place on its output (at the rms_norm_ fields), back to back on the stream.
-  // Every refusal, either path's, before any launch. The rms_norm_ fields are a
-  // split's alone: given to a fused algorithm, or missing from a split,
-  // refused.
-  constexpr std::string_view kSplit = "split_";
-  const bool split = algorithm_name.rfind(kSplit, 0) == 0;
+  // two_shot_push), or SPLIT: our all-reduce kernel (at this config's fields,
+  // its body all_reduce_algorithm, its checks and views written out here as
+  // all_reduce's are), then the norm on this rank's rows in place on its output
+  // (at the rms_norm_ fields; with a residual, the add and the norm), back to
+  // back on the stream. Every refusal, either path's, before any launch.
+  // all_reduce_algorithm and the rms_norm_ fields are a split's alone: given to
+  // a fused algorithm, or missing from a split, refused.
+  const bool split = algorithm_name == "split";
+  if (all_reduce_algorithm_name.has_value() != split)
+    return error_code(split ? Error::field_missing
+                            : Error::field_not_this_templates);
   for (const std::optional<int64_t>& field :
        {rms_norm_grid_x, rms_norm_grid_y, rms_norm_grid_z, rms_norm_block_x,
         rms_norm_block_y, rms_norm_block_z, rms_norm_waves_per_eu,
@@ -1947,6 +1964,17 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   const void* weight_ptr = weight.data_ptr();
   const int64_t weight_stride_n = weight.stride(0),
                 weight_size_n = weight.size(0);
+  // The residual's and its output's (none without a residual).
+  const void* residual_ptr = add ? residual->data_ptr() : nullptr;
+  const int64_t residual_stride_m = add ? residual->stride(0) : 0,
+                residual_stride_n = add ? residual->stride(1) : 0,
+                residual_size_m = add ? residual->size(0) : 0,
+                residual_size_n = add ? residual->size(1) : 0;
+  void* residual_output_ptr = add ? residual_output->data_ptr() : nullptr;
+  const int64_t residual_output_stride_m = add ? residual_output->stride(0) : 0,
+                residual_output_stride_n = add ? residual_output->stride(1) : 0,
+                residual_output_size_m = add ? residual_output->size(0) : 0,
+                residual_output_size_n = add ? residual_output->size(1) : 0;
   void* output_ptr = output.data_ptr();
   const int64_t output_stride_m = output.stride(0),
                 output_stride_n = output.stride(1);
@@ -1964,31 +1992,36 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   // ---- PRECONDITIONS, every Error the call can be refused for, in this order:
   // the config alone; the call against the config; the compiled kernel on this
   // device; the regions. Past this section the call runs. ----
-  // THE CONFIG'S NAMES: the fused kernel's algorithm, or the split's
-  // all-reduce's.
+  // THE CONFIG'S NAMES: the fused kernel's algorithm (the norm's kernel's or
+  // the add-norm's, by the residual), or the split's all-reduce's.
   AllReduceRmsNormAlgorithm algorithm{};
+  AllReduceAddRmsNormAlgorithm add_algorithm{};
   AllReduceAlgorithm all_reduce_algorithm{};
-  const std::string_view named =
-      split ? std::string_view(algorithm_name).substr(kSplit.size())
-            : std::string_view(algorithm_name);
-  if (split && named == "one_shot_pull")
-    all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
-  else if (split && named == "one_shot_push")
-    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
-  else if (split && named == "one_shot_push_staged")
-    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
-  else if (split && named == "two_shot_pull")
-    all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
-  else if (split && named == "two_shot_push")
-    all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
-  else if (!split && named == "one_shot_pull")
+  if (split) {
+    if (*all_reduce_algorithm_name == "one_shot_pull")
+      all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
+    else if (*all_reduce_algorithm_name == "one_shot_push")
+      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
+    else if (*all_reduce_algorithm_name == "one_shot_push_staged")
+      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
+    else if (*all_reduce_algorithm_name == "two_shot_pull")
+      all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
+    else if (*all_reduce_algorithm_name == "two_shot_push")
+      all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
+    else
+      return error_code(Error::no_such_kernel);
+  } else if (algorithm_name == "one_shot_pull") {
     algorithm = AllReduceRmsNormAlgorithm::one_shot_pull;
-  else if (!split && named == "two_shot_pull")
+    add_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull;
+  } else if (algorithm_name == "two_shot_pull") {
     algorithm = AllReduceRmsNormAlgorithm::two_shot_pull;
-  else if (!split && named == "two_shot_push")
+    add_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull;
+  } else if (algorithm_name == "two_shot_push") {
     algorithm = AllReduceRmsNormAlgorithm::two_shot_push;
-  else
+    add_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push;
+  } else {
     return error_code(Error::no_such_kernel);
+  }
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";
@@ -2033,26 +2066,52 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     return error_code(Error::not_aligned);
   // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
   // rows on whole packs.
-  if (input_stride_n != 1 || output_stride_n != 1 || weight_stride_n != 1)
+  if (input_stride_n != 1 || output_stride_n != 1 || weight_stride_n != 1 ||
+      (add && (residual_stride_n != 1 || residual_output_stride_n != 1)))
     return error_code(Error::inner_stride_not_one);
   if (input_stride_m * e % pack_bytes != 0 ||
-      output_stride_m * e % pack_bytes != 0)
+      output_stride_m * e % pack_bytes != 0 ||
+      (add && (residual_stride_m * e % pack_bytes != 0 ||
+               residual_output_stride_m * e % pack_bytes != 0)))
     return error_code(Error::row_stride_not_packs);
-  // THE OUTPUT APART FROM THE INPUT AND THE WEIGHT: their bytes do not meet.
+  // THE OUTPUTS APART FROM THE INPUTS: no output's bytes meet an input's (the
+  // input, the residual, the weight), nor each other's.
   if (m > 0 && n > 0) {
-    const char* output_first = static_cast<const char*>(output_ptr);
-    const char* output_last =
-        output_first +
-        ((m - 1) * output_stride_m + (n - 1) * output_stride_n + 1) * e;
-    const char* input_first = static_cast<const char*>(input_ptr);
+    const auto first = [](const void* p) {
+      return static_cast<const char*>(p);
+    };
+    const auto last = [&](const void* p, int64_t stride_m, int64_t stride_n,
+                          int64_t rows, int64_t elem) {
+      return first(p) + ((rows - 1) * stride_m + (n - 1) * stride_n + 1) * elem;
+    };
+    const auto meet = [&](const void* a, const char* a_last, const void* b,
+                          const char* b_last) {
+      return a != nullptr && b != nullptr && first(a) < b_last &&
+             first(b) < a_last;
+    };
     const char* input_last =
-        input_first +
-        ((m - 1) * input_stride_m + (n - 1) * input_stride_n + 1) * e;
-    const char* weight_first = static_cast<const char*>(weight_ptr);
+        last(input_ptr, input_stride_m, input_stride_n, m, e);
     const char* weight_last =
-        weight_first + ((n - 1) * weight_stride_n + 1) * weight.element_size();
-    if ((input_first < output_last && output_first < input_last) ||
-        (weight_first < output_last && output_first < weight_last))
+        last(weight_ptr, 0, weight_stride_n, 1, weight.element_size());
+    const char* residual_last =
+        add ? last(residual_ptr, residual_stride_m, residual_stride_n, m, e)
+            : nullptr;
+    const char* output_last =
+        last(output_ptr, output_stride_m, output_stride_n, m, e);
+    const char* residual_output_last =
+        add ? last(residual_output_ptr, residual_output_stride_m,
+                   residual_output_stride_n, m, e)
+            : nullptr;
+    for (const auto& [out, out_last] :
+         {std::pair{static_cast<const void*>(output_ptr), output_last},
+          std::pair{static_cast<const void*>(residual_output_ptr),
+                    residual_output_last}})
+      if (meet(input_ptr, input_last, out, out_last) ||
+          meet(weight_ptr, weight_last, out, out_last) ||
+          meet(residual_ptr, residual_last, out, out_last))
+        return error_code(Error::inputs_overlap_outputs);
+    if (meet(output_ptr, output_last, residual_output_ptr,
+             residual_output_last))
       return error_code(Error::inputs_overlap_outputs);
   }
   // WHAT THE CALL MOVES: INT4 where the config is and, for the split's
@@ -2065,6 +2124,7 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   // its path: the fused kernel's, or the split's all-reduce's and its norm's.
   void* kernel = nullptr;
   void* rms_norm_kernel = nullptr;
+  int64_t scales_stride_m = 0, scales_size_m = 0;
   Dim3 rms_norm_grid{}, rms_norm_block{};
   bool in_place = false;
   int64_t staging_need = 0, partials_need = 0;
@@ -2239,8 +2299,9 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     rms_norm_block = Dim3{static_cast<int>(*rms_norm_block_x),
                           static_cast<int>(*rms_norm_block_y),
                           static_cast<int>(*rms_norm_block_z)};
-    // THE SPLIT'S NORM ON ROWS, at the rms_norm_ fields: its config, the call
-    // against it, its compiled kernel on this device.
+    // THE SPLIT'S NORM ON ROWS, at the rms_norm_ fields (with a residual, the
+    // add and the norm): its config, the call against it, its compiled kernel
+    // on this device.
     // THE GRID: x alone, at least a block (it waits on no peer: any grid runs).
     if (*rms_norm_grid_y != 1 || *rms_norm_grid_z != 1 || *rms_norm_grid_x < 1)
       return error_code(Error::launch_out_of_range);
@@ -2264,22 +2325,37 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     // rows on whole packs.
     if (output_stride_n != 1 || weight_stride_n != 1)
       return error_code(Error::inner_stride_not_one);
-    if (output_stride_m * e % *rms_norm_pack_bytes != 0)
+    if (output_stride_m * e % *rms_norm_pack_bytes != 0 ||
+        (add && (residual_stride_m * e % *rms_norm_pack_bytes != 0 ||
+                 residual_output_stride_m * e % *rms_norm_pack_bytes != 0)))
       return error_code(Error::row_stride_not_packs);
     // THE INSTANCE: the norm compiled at this config, on this device, for this
-    // call (builds.py's kRmsNormInstances); a row wider than the tile its
-    // CHUNKED instance.
+    // call (builds.py's kRmsNormInstances, or kAddRmsNormInstances with a
+    // residual); a row wider than the tile its CHUNKED instance.
     const bool rms_norm_chunked = n > *rms_norm_tile_n;
-    for (const auto& i : kRmsNormInstances)
-      if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
-          i.block_z == *rms_norm_block_z &&
-          i.waves_per_eu == *rms_norm_waves_per_eu &&
-          i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
-          i.quantization == Quantization::exact &&
-          i.pack_bytes == *rms_norm_pack_bytes &&
-          i.wave_size == s.device.wave_size && i.dtype == dtype &&
-          i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
-        rms_norm_kernel = i.kernel;
+    if (add) {
+      for (const auto& i : kAddRmsNormInstances)
+        if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
+            i.block_z == *rms_norm_block_z &&
+            i.waves_per_eu == *rms_norm_waves_per_eu &&
+            i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
+            i.quantization == Quantization::exact &&
+            i.pack_bytes == *rms_norm_pack_bytes &&
+            i.wave_size == s.device.wave_size && i.dtype == dtype &&
+            i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
+          rms_norm_kernel = i.kernel;
+    } else {
+      for (const auto& i : kRmsNormInstances)
+        if (i.block_x == *rms_norm_block_x && i.block_y == *rms_norm_block_y &&
+            i.block_z == *rms_norm_block_z &&
+            i.waves_per_eu == *rms_norm_waves_per_eu &&
+            i.tile_m == *rms_norm_tile_m && i.tile_n == *rms_norm_tile_n &&
+            i.quantization == Quantization::exact &&
+            i.pack_bytes == *rms_norm_pack_bytes &&
+            i.wave_size == s.device.wave_size && i.dtype == dtype &&
+            i.weight_dtype == weight_dtype && i.chunked == rms_norm_chunked)
+          rms_norm_kernel = i.kernel;
+    }
     if (rms_norm_kernel == nullptr) return error_code(Error::not_built);
     // THE KERNEL ON THIS DEVICE, as its compiler left it (it waits on no peer:
     // no residency).
@@ -2296,8 +2372,8 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     if (static_cast<int64_t>(rms_norm_attributes.localSizeBytes) >
         s.device.scratch_a_lane)
       return error_code(Error::scratch_too_large);
-  } else {
-    // ---- THE FUSED KERNEL ----
+  } else if (!add) {
+    // ---- THE FUSED NORM KERNEL (no residual) ----
     // WHAT THE CALL PICKS: INT4 where the config is (it always quantizes); in
     // place, the exact pull, every rank's input read where its table says; a
     // row wider than the tile, the build's CHUNKED instance; an INT4 row with a
@@ -2381,6 +2457,99 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
       staging_need = std::max(staging_need, int4_payload_bytes(m, n));
       partials_need = std::max(partials_need, int4_payload_bytes(1, m * n));
     }
+  } else {
+    // ---- THE FUSED ADD-NORM KERNEL (a residual) ----
+    // WHAT THE CALL PICKS: in place, the exact pull; a row wider than the tile,
+    // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance.
+    in_place = add_algorithm != AllReduceAddRmsNormAlgorithm::two_shot_push &&
+               !quantize_int4;
+    const bool chunked = n > tile_n;
+    const bool tail = quantize_int4 && int4_tail(add_algorithm, m, n, s.world);
+    // THE INSTANCE: the kernel compiled at this config, on this device, for
+    // this call (builds.py's kAllReduceAddRmsNormInstances, a row each).
+    for (const auto& i : kAllReduceAddRmsNormInstances)
+      if (i.algorithm == add_algorithm && i.block_x == block_x &&
+          i.block_y == block_y && i.block_z == block_z &&
+          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
+          i.tile_n == tile_n &&
+          i.quantization ==
+              (int4_config ? Quantization::int4 : Quantization::exact) &&
+          i.pack_bytes == pack_bytes && i.world == s.world &&
+          i.wave_size == s.device.wave_size && i.dtype == dtype &&
+          i.weight_dtype == weight_dtype && i.chunked == chunked &&
+          i.tail == tail && i.quantize_int4 == quantize_int4)
+        kernel = i.kernel;
+    if (kernel == nullptr) return error_code(Error::not_built);
+    // THE KERNEL ON THIS DEVICE, as its compiler left it.
+    hipFuncAttributes attributes;
+    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (block_x > attributes.maxThreadsPerBlock)
+      return error_code(Error::block_too_large);
+    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
+        s.device.lds_bytes)
+      return error_code(Error::lds_too_large);
+    if (static_cast<int64_t>(attributes.localSizeBytes) >
+        s.device.scratch_a_lane)
+      return error_code(Error::scratch_too_large);
+    // THE GRID RESIDENT AT ONCE (a peer barrier spins on every peer's block).
+    int blocks_a_cu = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            shared_memory_bytes) != hipSuccess)
+      return error_code(Error::hip_failed);
+    if (grid_x > blocks_a_cu * s.device.compute_units)
+      return error_code(Error::grid_not_resident);
+    // ---- ITS VIEWS OF THE REGIONS, in elements: a row is n, or the INT4
+    // pulled two-shot's payload row, whole groups (it walks whole groups a
+    // thread). The staging holds the input's rows, or that two-shot's INT4
+    // inbox, WORLD slots of an owner's ceil(m / WORLD) rows. The partials what
+    // a two-shot keeps: the push every row's columns; the pull its rank's rows,
+    // EXACT each row after its scale's slot (kScaleSlotBytes, the row whole
+    // slots: scale_slot_row, so every row's scale is aligned at any pack), INT4
+    // the row alone, its scales in the scales region (max_rows rows). ----
+    const bool pull_two_shot =
+        add_algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull;
+    const bool push_two_shot =
+        add_algorithm == AllReduceAddRmsNormAlgorithm::two_shot_push;
+    const bool groups_a_thread = quantize_int4 && pull_two_shot;
+    const bool scale_slot = pull_two_shot && !quantize_int4;
+    const int64_t row =
+        groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
+    const int64_t owned_rows = (m + s.world - 1) / s.world;
+    const int64_t packs = n * e / pack_bytes;
+    // What a two-shot keeps, as the exchange was sized for it: the push every
+    // row; the pull its owned rows, each its scale's slot and the row.
+    const int64_t kept =
+        push_two_shot   ? m * packs * pack_bytes
+        : pull_two_shot ? owned_rows * (scale_slot_row(packs * pack_bytes) +
+                                        kScaleSlotBytes)
+                        : 0;
+    partials_stride_m =
+        scale_slot ? scale_slot_row(row * e) / e + kScaleSlotBytes / e : row;
+    partials_stride_n = 1;
+    partials_size_m = kept / (partials_stride_m * e);
+    partials_size_n = partials_stride_m;
+    if (pull_two_shot && !scale_slot && owned_rows > s.max_rows)
+      return error_code(Error::partials_too_small);
+    scales_stride_m = 1;
+    scales_size_m = pull_two_shot && !scale_slot ? owned_rows : 0;
+    staging_stride_m = row, staging_stride_n = 1,
+    staging_size_m = groups_a_thread ? s.world * owned_rows : m,
+    staging_size_n = row;
+    // WHAT THE REGIONS MUST HOLD: its input whole and what it keeps; INT4, the
+    // payloads (the pull's its staged rows' and its owned rows', the push's the
+    // call's).
+    staging_need = m * n * e, partials_need = kept;
+    if (quantize_int4 && groups_a_thread) {
+      staging_need =
+          std::max(staging_need, int4_payload_bytes(staging_size_m, row));
+      partials_need =
+          std::max(partials_need, int4_payload_bytes(owned_rows, row));
+    } else if (quantize_int4) {
+      staging_need = std::max(staging_need, int4_payload_bytes(m, n));
+      partials_need = std::max(partials_need, int4_payload_bytes(1, kept / e));
+    }
   }
   // THE REGIONS HOLD THE CALL: what the kernel stages and keeps, and each
   // view's end, its last element's (an empty view reads nothing). The kernels
@@ -2402,6 +2571,9 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
   if (std::max(staging_need, staging_end) > s.symmetric.staging_bytes)
     return error_code(Error::staging_too_small);
   if (std::max(partials_need, partials_end) > s.symmetric.partials_bytes)
+    return error_code(Error::partials_too_small);
+  if (scales_size_m * scales_stride_m * int64_t{sizeof(float)} >
+      s.symmetric.scales_bytes)
     return error_code(Error::partials_too_small);
   // EVERY RANK'S INPUT, where the kernel reads it: in place through an input
   // table (the exact pulls: `world` addresses), else in every rank's staging;
@@ -2436,8 +2608,9 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
     }
     peer_inputs_size = s.world, peer_inputs_stride_n = 1;
   }
-  // ---- THE LAUNCH, by its path: the split's all-reduce, then its norm on the
-  // sum in place, back to back; or the fused kernel. ----
+  // ---- THE LAUNCH, by its path: the split's all-reduce, then its norm (or
+  // add-norm) on the sum in place, back to back; or the fused norm kernel, or
+  // the fused add-norm kernel. ----
   if (split) {
     // THE LAUNCH: the instance's kernel, at the call's dtypes.
     const auto launch = [&]<typename T, typename W>() {
@@ -2483,8 +2656,34 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
           output_stride_m, output_stride_n, static_cast<int>(output_size_m),
           static_cast<int>(output_size_n), eps);
     };
-    if (dtype == at::ScalarType::BFloat16 &&
+    const auto launch_add_rms_norm = [&]<typename T, typename W>() {
+      const auto typed =
+          reinterpret_cast<AddRmsNormKernel<T, W>>(rms_norm_kernel);
+      typed<<<dim3_of(rms_norm_grid), dim3_of(rms_norm_block),
+              shared_memory_bytes, stream>>>(
+          static_cast<const T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          static_cast<const T*>(residual_ptr), residual_stride_m,
+          residual_stride_n, static_cast<int>(residual_size_m),
+          static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
+          weight_stride_n, static_cast<int>(weight_size_n),
+          static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          static_cast<T*>(residual_output_ptr), residual_output_stride_m,
+          residual_output_stride_n, static_cast<int>(residual_output_size_m),
+          static_cast<int>(residual_output_size_n), eps);
+    };
+    if (add && dtype == at::ScalarType::BFloat16 &&
         weight_dtype == at::ScalarType::Float)
+      launch_add_rms_norm.template operator()<c10::BFloat16, float>();
+    else if (add && dtype == at::ScalarType::BFloat16)
+      launch_add_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
+    else if (add && weight_dtype == at::ScalarType::Float)
+      launch_add_rms_norm.template operator()<c10::Half, float>();
+    else if (add)
+      launch_add_rms_norm.template operator()<c10::Half, c10::Half>();
+    else if (dtype == at::ScalarType::BFloat16 &&
+             weight_dtype == at::ScalarType::Float)
       launch_rms_norm.template operator()<c10::BFloat16, float>();
     else if (dtype == at::ScalarType::BFloat16)
       launch_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
@@ -2492,8 +2691,8 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
       launch_rms_norm.template operator()<c10::Half, float>();
     else
       launch_rms_norm.template operator()<c10::Half, c10::Half>();
-  } else {
-    // THE LAUNCH: the instance's kernel, at the call's dtypes.
+  } else if (!add) {
+    // THE NORM KERNEL'S LAUNCH, at the call's dtypes.
     const auto launch = [&]<typename T, typename W>() {
       const auto typed = reinterpret_cast<AllReduceRmsNormKernel<T, W>>(kernel);
       typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
@@ -2524,235 +2723,48 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
       launch.template operator()<c10::Half, float>();
     else
       launch.template operator()<c10::Half, c10::Half>();
+  } else {
+    // THE ADD-NORM KERNEL'S LAUNCH, at the call's dtypes.
+    const auto launch = [&]<typename T, typename W>() {
+      const auto typed =
+          reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
+      typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
+          static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
+          static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+          reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
+          peer_inputs_stride_m, peer_inputs_stride_n,
+          static_cast<const T*>(residual_ptr), residual_stride_m,
+          residual_stride_n, static_cast<int>(residual_size_m),
+          static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
+          weight_stride_n, static_cast<int>(weight_size_n),
+          static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+          static_cast<T*>(residual_output_ptr), residual_output_stride_m,
+          residual_output_stride_n, static_cast<int>(residual_output_size_m),
+          static_cast<int>(residual_output_size_n),
+          s.symmetric.partials_ptr_array, s.world, partials_stride_m,
+          partials_stride_n, static_cast<int>(partials_size_m),
+          static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
+          s.world, scales_stride_m, static_cast<int>(scales_size_m),
+          s.symmetric.staging_ptr_array, s.world, staging_stride_m,
+          staging_stride_n, static_cast<int>(staging_size_m),
+          static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
+          s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
+          int64_t{1}, int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
+          s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
+          s.timeout_ticks, eps);
+    };
+    if (dtype == at::ScalarType::BFloat16 &&
+        weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::BFloat16, float>();
+    else if (dtype == at::ScalarType::BFloat16)
+      launch.template operator()<c10::BFloat16, c10::BFloat16>();
+    else if (weight_dtype == at::ScalarType::Float)
+      launch.template operator()<c10::Half, float>();
+    else
+      launch.template operator()<c10::Half, c10::Half>();
   }
   // POSTCONDITION: the launches went in.
-  if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
-  return std::nullopt;
-}
-
-// all_reduce_add_rms_norm: at its config. all_reduce_add_rms_norm: out,
-// residual_out = fused_add_rms_norm(all_reduce(inp), residual, weight), vLLM's
-// roundings exactly. One function: what Python passes, its tensors stripped to
-// pointers and strides, the preconditions, the kernel's arguments, the launch,
-// the postcondition.
-ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
-    int64_t state, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    const std::string& algorithm_name, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
-  using namespace hip_custom_communicator;
-  // THE CALL FROM TORCH: its state, its tensors, its config's ints.
-  if (state == 0) return error_code(Error::not_open);
-  if (const std::optional<Error> e =
-          norm_tensors(input, &residual, weight, output, &residual_output,
-                       /*in_place=*/false))
-    return error_code(e);
-  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y,
-                 grid_z, block_x, block_y, block_z}))
-    return error_code(Error::field_out_of_range);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
-  const void* input_ptr = input.data_ptr();
-  const int64_t input_stride_m = input.stride(0);
-  const int64_t input_stride_n = input.stride(1);
-  const int64_t input_size_m = input.size(0);
-  const int64_t input_size_n = input.size(1);
-  const void* residual_ptr = residual.data_ptr();
-  const int64_t residual_stride_m = residual.stride(0);
-  const int64_t residual_stride_n = residual.stride(1);
-  const int64_t residual_size_m = residual.size(0);
-  const int64_t residual_size_n = residual.size(1);
-  const void* weight_ptr = weight.data_ptr();
-  const int64_t weight_stride_n = weight.stride(0);
-  const int64_t weight_size_n = weight.size(0);
-  void* output_ptr = output.data_ptr();
-  const int64_t output_stride_m = output.stride(0);
-  const int64_t output_stride_n = output.stride(1);
-  const int64_t output_size_m = output.size(0);
-  const int64_t output_size_n = output.size(1);
-  void* residual_output_ptr = residual_output.data_ptr();
-  const int64_t residual_output_stride_m = residual_output.stride(0);
-  const int64_t residual_output_stride_n = residual_output.stride(1);
-  const int64_t residual_output_size_m = residual_output.size(0);
-  const int64_t residual_output_size_n = residual_output.size(1);
-  const at::ScalarType dtype = input.scalar_type();
-  const at::ScalarType weight_dtype = weight.scalar_type();
-  const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y),
-                  static_cast<int>(grid_z)};
-  const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y),
-                   static_cast<int>(block_z)};
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  // ---- PRECONDITIONS: the config, the call, then its instance. The first
-  // Error refuses the call; past this section the call runs. ----
-  const std::optional<AllReduceAddRmsNormAlgorithm> named =
-      algorithm_named<AllReduceAddRmsNormBuildConfig>(algorithm_name);
-  if (!named) return error_code(Error::no_such_kernel);
-  const AllReduceAddRmsNormAlgorithm algorithm = *named;
-  if (quantization_name != "exact" && quantization_name != "int4")
-    return error_code(Error::no_such_quantization);
-  const AllReduceAddRmsNormBuildConfig build{
-      .algorithm = algorithm,
-      .block = block,
-      .waves_per_eu = static_cast<int>(waves_per_eu),
-      .tile_m = static_cast<int>(tile_m),
-      .tile_n = static_cast<int>(tile_n),
-      .quantization = quantization_name == "int4" ? Quantization::int4
-                                                  : Quantization::exact,
-      .pack_bytes = static_cast<int>(pack_bytes)};
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e =
-          refused(true, s.world, s.symmetric.staging_bytes,
-                  s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
-                  grid, quantize_from_bytes, dtype, m, n))
-    return error_code(e);
-  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
-  // rows on whole packs of the build's.
-  if (output_stride_n != 1 || residual_output_stride_n != 1 ||
-      input_stride_n != 1 || residual_stride_n != 1)
-    return error_code(Error::inner_stride_not_one);
-  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      residual_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      residual_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
-    return error_code(Error::row_stride_not_packs);
-  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
-  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
-  // none), at its row stride: the exact pull two-shot's row is its scale's pack
-  // then the row (partials_need); the INT4 build's rows are the row alone, its
-  // scales in the scales region.
-  const bool scale_slot =
-      algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull &&
-      build.quantization == Quantization::exact;
-  // The scale slot's row whole slots (scale_slot_row), so every row's scale is
-  // aligned at any pack.
-  const int64_t slot = scale_slot ? kScaleSlotBytes / elem_bytes(dtype) : 0;
-  const int64_t row = payload_row(algorithm, build.quantization, n);
-  const int64_t partials_stride_m =
-      scale_slot
-          ? scale_slot_row(row * elem_bytes(dtype)) / elem_bytes(dtype) + slot
-          : row;
-  const int64_t partials_rows =
-      n > 0 ? partials_need(algorithm, m,
-                            n * elem_bytes(dtype) / build.pack_bytes, s.world,
-                            build.pack_bytes) /
-                  (partials_stride_m * elem_bytes(dtype))
-            : 0;
-  const int shared_memory_bytes = 0;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  const bool chunked = n > build.tile_n;
-  // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-  const bool tail = build.quantization == Quantization::int4 &&
-                    int4_tail(algorithm, m, n, s.world);
-  // THE INT4 PULL TWO-SHOT'S SCALES, a rank's rows of them, in the scales
-  // region (max_rows rows).
-  if (algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull && !scale_slot &&
-      (m + s.world - 1) / s.world > s.max_rows)
-    return error_code(Error::partials_too_small);
-  void* kernel = nullptr;
-  // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kAllReduceAddRmsNormInstances, a row each).
-  for (const auto& i : kAllReduceAddRmsNormInstances)
-    if (i.algorithm == build.algorithm && i.block_x == build.block.x &&
-        i.block_y == build.block.y && i.block_z == build.block.z &&
-        i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
-        i.tile_n == build.tile_n && i.tile_k == 1 &&
-        i.quantization == build.quantization &&
-        i.pack_bytes == build.pack_bytes && i.world == s.world &&
-        i.wave_size == s.device.wave_size && i.dtype == dtype &&
-        i.weight_dtype == weight_dtype && i.contiguous == false &&
-        i.chunked == chunked && i.tail == tail &&
-        i.quantize_int4 == (build.quantization == Quantization::int4 &&
-                            build.pack_bytes == kPackBytes))
-      kernel = i.kernel;
-  if (kernel == nullptr) return error_code(Error::not_built);
-  if (const std::optional<Error> e =
-          check_kernel(s, kernel, grid, block, shared_memory_bytes, true))
-    return error_code(e);
-
-  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
-  // ----
-  // ITS VIEWS OF THE REGIONS, each [m, n] (the pushed one-shot's inbox [slot,
-  // m, n]), in elements: zeros where it reads none.
-  int64_t partials_stride_n = 0, partials_size_m = 0, partials_size_n = 0,
-          staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0,
-          staging_size_n = 0, scales_stride_m = 0, scales_size_m = 0;
-  bool in_place = false;
-  partials_stride_n = 1;
-  partials_size_m = partials_rows;
-  partials_size_n = partials_stride_m;
-  scales_stride_m = 1;
-  scales_size_m =
-      algorithm == AllReduceAddRmsNormAlgorithm::two_shot_pull && !scale_slot
-          ? (m + s.world - 1) / s.world
-          : 0;
-  staging_stride_m = payload_row(algorithm, build.quantization, n);
-  staging_stride_n = 1;
-  staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
-  staging_size_n = payload_row(algorithm, build.quantization, n);
-  in_place = !is_push(algorithm) && build.quantization == Quantization::exact;
-  // EVERY VIEW INSIDE ITS REGION (view_fits).
-  if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
-                 partials_stride_n, elem_bytes(dtype),
-                 s.symmetric.partials_bytes) ||
-      !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n,
-                 staging_stride_n, elem_bytes(dtype),
-                 s.symmetric.staging_bytes) ||
-      !view_fits(1, 0, scales_size_m, scales_stride_m, 1, 1, 4,
-                 s.max_rows * int64_t{sizeof(float)}))
-    return error_code(Error::view_past_region);
-  // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input
-  // in place (an exact pull), or none where it reads the staging.
-  void* const* table = nullptr;
-  int64_t table_stride_m = staging_stride_m;
-  if (in_place)
-    if (const std::optional<Error> e = input_table(
-            s, input_ptr, input_stride_m, input_size_m, input_size_n,
-            elem_bytes(dtype), stream, table, table_stride_m))
-      return error_code(e);
-  const int table_size = in_place ? s.world : 0;
-  const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
-  // THE LAUNCH: the instance's kernel, at the call's dtypes.
-  const auto launch = [&]<typename T, typename W>() {
-    const auto typed =
-        reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
-    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
-        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
-        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        reinterpret_cast<const T* const*>(table), table_size, table_stride_m,
-        table_stride_n, static_cast<const T*>(residual_ptr), residual_stride_m,
-        residual_stride_n, static_cast<int>(residual_size_m),
-        static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
-        weight_stride_n, static_cast<int>(weight_size_n),
-        static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
-        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        static_cast<T*>(residual_output_ptr), residual_output_stride_m,
-        residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n),
-        s.symmetric.partials_ptr_array, s.world, partials_stride_m,
-        partials_stride_n, static_cast<int>(partials_size_m),
-        static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
-        s.world, scales_stride_m, static_cast<int>(scales_size_m),
-        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-        staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
-        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
-  };
-  if (dtype == at::ScalarType::BFloat16 &&
-      weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::BFloat16, float>();
-  else if (dtype == at::ScalarType::BFloat16)
-    launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else if (weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::Half, float>();
-  else
-    launch.template operator()<c10::Half, c10::Half>();
-  // POSTCONDITION: the launch went in.
   if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
   return std::nullopt;
 }
@@ -3004,146 +3016,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else
-    launch.template operator()<c10::Half, c10::Half>();
-  // POSTCONDITION: the launch went in.
-  if (hipGetLastError() != hipSuccess) return error_code(Error::hip_failed);
-  return std::nullopt;
-}
-
-// add_rms_norm: this rank's rows added and normed (the second kernel of an op
-// Python composes), at its config. add_rms_norm: out, residual_out =
-// fused_add_rms_norm(inp, residual, weight), vLLM's roundings exactly, on this
-// rank's rows. One function: what Python passes, its tensors stripped to
-// pointers and strides, the preconditions, the kernel's arguments, the launch,
-// the postcondition.
-ErrorCode hip_custom_communicator_add_rms_norm(
-    int64_t state, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
-  using namespace hip_custom_communicator;
-  // THE CALL FROM TORCH: its state, its tensors, its config's ints.
-  if (state == 0) return error_code(Error::not_open);
-  if (const std::optional<Error> e =
-          norm_tensors(input, &residual, weight, output, &residual_output,
-                       /*in_place=*/true))
-    return error_code(e);
-  if (!all_ints({waves_per_eu, tile_m, tile_n, pack_bytes, grid_x, grid_y,
-                 grid_z, block_x, block_y, block_z}))
-    return error_code(Error::field_out_of_range);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
-  const void* input_ptr = input.data_ptr();
-  const int64_t input_stride_m = input.stride(0);
-  const int64_t input_stride_n = input.stride(1);
-  const int64_t input_size_m = input.size(0);
-  const int64_t input_size_n = input.size(1);
-  const void* residual_ptr = residual.data_ptr();
-  const int64_t residual_stride_m = residual.stride(0);
-  const int64_t residual_stride_n = residual.stride(1);
-  const int64_t residual_size_m = residual.size(0);
-  const int64_t residual_size_n = residual.size(1);
-  const void* weight_ptr = weight.data_ptr();
-  const int64_t weight_stride_n = weight.stride(0);
-  const int64_t weight_size_n = weight.size(0);
-  void* output_ptr = output.data_ptr();
-  const int64_t output_stride_m = output.stride(0);
-  const int64_t output_stride_n = output.stride(1);
-  const int64_t output_size_m = output.size(0);
-  const int64_t output_size_n = output.size(1);
-  void* residual_output_ptr = residual_output.data_ptr();
-  const int64_t residual_output_stride_m = residual_output.stride(0);
-  const int64_t residual_output_stride_n = residual_output.stride(1);
-  const int64_t residual_output_size_m = residual_output.size(0);
-  const int64_t residual_output_size_n = residual_output.size(1);
-  const at::ScalarType dtype = input.scalar_type();
-  const at::ScalarType weight_dtype = weight.scalar_type();
-  const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y),
-                  static_cast<int>(grid_z)};
-  const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y),
-                   static_cast<int>(block_z)};
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  // ---- PRECONDITIONS: the config, the call, then its instance. The first
-  // Error refuses the call; past this section the call runs. ----
-  if (quantization_name != "exact" && quantization_name != "int4")
-    return error_code(Error::no_such_quantization);
-  const AddRmsNormBuildConfig build{
-      .block = block,
-      .waves_per_eu = static_cast<int>(waves_per_eu),
-      .tile_m = static_cast<int>(tile_m),
-      .tile_n = static_cast<int>(tile_n),
-      .quantization = quantization_name == "int4" ? Quantization::int4
-                                                  : Quantization::exact,
-      .pack_bytes = static_cast<int>(pack_bytes)};
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
-                  quantize_from_bytes, dtype, m, n))
-    return error_code(e);
-  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
-  // rows on whole packs of the build's.
-  if (output_stride_n != 1 || residual_output_stride_n != 1 ||
-      input_stride_n != 1 || residual_stride_n != 1)
-    return error_code(Error::inner_stride_not_one);
-  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      residual_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      residual_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
-    return error_code(Error::row_stride_not_packs);
-  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
-  const int shared_memory_bytes = 0;
-  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-  const bool chunked = n > build.tile_n;
-  void* kernel = nullptr;
-  // THE INSTANCE: the kernel compiled at this build, on this device, for this
-  // call (builds.py's kAddRmsNormInstances, a row each).
-  for (const auto& i : kAddRmsNormInstances)
-    if (i.algorithm == AddRmsNormAlgorithm::rows &&
-        i.block_x == build.block.x && i.block_y == build.block.y &&
-        i.block_z == build.block.z && i.waves_per_eu == build.waves_per_eu &&
-        i.tile_m == build.tile_m && i.tile_n == build.tile_n && i.tile_k == 1 &&
-        i.quantization == build.quantization &&
-        i.pack_bytes == build.pack_bytes && i.world == 0 &&
-        i.wave_size == s.device.wave_size && i.dtype == dtype &&
-        i.weight_dtype == weight_dtype && i.contiguous == false &&
-        i.chunked == chunked && i.tail == false &&
-        i.quantize_int4 == (build.quantization == Quantization::int4 &&
-                            build.pack_bytes == kPackBytes))
-      kernel = i.kernel;
-  if (kernel == nullptr) return error_code(Error::not_built);
-  if (const std::optional<Error> e =
-          check_kernel(s, kernel, grid, block, shared_memory_bytes, false))
-    return error_code(e);
-
-  // ---- THE LAUNCH: the buffers, the views of their regions, and the instance.
-  // ----
-  // THE LAUNCH: the instance's kernel, at the call's dtypes.
-  const auto launch = [&]<typename T, typename W>() {
-    const auto typed = reinterpret_cast<AddRmsNormKernel<T, W>>(kernel);
-    typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
-        static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
-        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        static_cast<const T*>(residual_ptr), residual_stride_m,
-        residual_stride_n, static_cast<int>(residual_size_m),
-        static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
-        weight_stride_n, static_cast<int>(weight_size_n),
-        static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
-        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        static_cast<T*>(residual_output_ptr), residual_output_stride_m,
-        residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), eps);
-  };
-  if (dtype == at::ScalarType::BFloat16 &&
-      weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::BFloat16, float>();
-  else if (dtype == at::ScalarType::BFloat16)
-    launch.template operator()<c10::BFloat16, c10::BFloat16>();
-  else if (weight_dtype == at::ScalarType::Float)
-    launch.template operator()<c10::Half, float>();
   else
     launch.template operator()<c10::Half, c10::Half>();
   // POSTCONDITION: the launch went in.

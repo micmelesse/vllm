@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3's all-reduces fused into the ops that consume them, when
 HipCustomCommunicator owns the TP all-reduce: the MoE latent's all-reduce with
-its RMSNorm (`all_reduce_rms_norm`, in the latent tail), and each AttnRes with
-the all-reduce of the delta it adds (`all_reduce_add_attn_res_rms_norm`).
+its RMSNorm (`all_reduce_add_rms_norm`, no residual, in the latent tail), and each
+AttnRes with the all-reduce of the delta it adds
+(`all_reduce_add_attn_res_rms_norm`).
 Attention and the MLP then leave their outputs unreduced; one all-reduce at each
 point, as before. `KimiLinearModel` decides once (`fuse_all_reduces`) and its
 decoder layers take these paths; the MTP block's layer never does."""
@@ -68,7 +69,7 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
     ) -> torch.Tensor:
         backend = _communicator()
         assert backend is not None, (
-            "the all_reduce_rms_norm path runs only with HipCustomCommunicator live"
+            "the all_reduce_add_rms_norm path runs only with HipCustomCommunicator live"
         )
         transform = self.routed_output_transform
         assert transform is not None
@@ -77,9 +78,10 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
                 f"the fused latent tail needs an RMSNorm: {transform.norm!r}"
             )
         # The op raises, naming why, for an input it cannot run.
-        latent = backend.all_reduce_rms_norm(
+        latent = backend.all_reduce_add_rms_norm(
             fused_output, transform.norm.weight, transform.norm.variance_epsilon
         )
+        assert isinstance(latent, torch.Tensor)
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size

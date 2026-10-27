@@ -113,7 +113,7 @@ def test_all_reduce(monkeypatch: pytest.MonkeyPatch, tp_size, quantization):
 
 
 @ray.remote(num_gpus=1, max_calls=1)
-def all_reduce_rms_norm_ranks(
+def all_reduce_add_rms_norm_no_residual_ranks(
     monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port
 ):
     from vllm.ir.ops import rms_norm
@@ -149,10 +149,10 @@ def all_reduce_rms_norm_ranks(
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
                     want = rms_norm(summed, weight, EPS)
-                    assert comm.should_allreduce_rms_norm(x, weight)
+                    assert comm.should_allreduce_add_rms_norm(x, weight)
 
                     # Eager.
-                    out = comm.all_reduce_rms_norm(x, weight, EPS)
+                    out = comm.all_reduce_add_rms_norm(x, weight, EPS)
                     if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
@@ -163,9 +163,9 @@ def all_reduce_rms_norm_ranks(
                     # A CUDA graph, replayed on fresh inputs.
                     graph = torch.cuda.CUDAGraph()
                     with comm.capture():
-                        comm.all_reduce_rms_norm(x, weight, EPS)
+                        comm.all_reduce_add_rms_norm(x, weight, EPS)
                         with torch.cuda.graph(graph):
-                            out = comm.all_reduce_rms_norm(x, weight, EPS)
+                            out = comm.all_reduce_add_rms_norm(x, weight, EPS)
                     x.copy_(x + 1)
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
@@ -184,11 +184,15 @@ def all_reduce_rms_norm_ranks(
 
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
 @pytest.mark.parametrize("quantization", ["NONE", "INT4"])
-def test_all_reduce_rms_norm(monkeypatch: pytest.MonkeyPatch, tp_size, quantization):
+def test_all_reduce_add_rms_norm_no_residual(
+    monkeypatch: pytest.MonkeyPatch, tp_size, quantization
+):
     if tp_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", quantization)
-    multi_process_parallel(monkeypatch, tp_size, 1, all_reduce_rms_norm_ranks)
+    multi_process_parallel(
+        monkeypatch, tp_size, 1, all_reduce_add_rms_norm_no_residual_ranks
+    )
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -236,11 +240,11 @@ def all_reduce_add_rms_norm_ranks(
                     want_out, want_residual = fused_add_rms_norm(
                         summed, residual.clone(), weight, EPS
                     )
-                    assert comm.should_allreduce_add_rms_norm(x, weight)
+                    assert comm.should_allreduce_add_rms_norm(x, weight, residual)
 
                     # Eager.
                     out, residual_out = comm.all_reduce_add_rms_norm(
-                        x, residual, weight, EPS
+                        x, weight, EPS, residual=residual
                     )
                     for got, want in [(out, want_out), (residual_out, want_residual)]:
                         if comm.arguments.quantization == "int4":
@@ -253,10 +257,10 @@ def all_reduce_add_rms_norm_ranks(
                     # A CUDA graph, replayed on fresh inputs.
                     graph = torch.cuda.CUDAGraph()
                     with comm.capture():
-                        comm.all_reduce_add_rms_norm(x, residual, weight, EPS)
+                        comm.all_reduce_add_rms_norm(x, weight, EPS, residual=residual)
                         with torch.cuda.graph(graph):
                             out, residual_out = comm.all_reduce_add_rms_norm(
-                                x, residual, weight, EPS
+                                x, weight, EPS, residual=residual
                             )
                     x.copy_(x + 1)
                     summed = x.clone()
