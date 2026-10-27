@@ -785,9 +785,6 @@ static_assert(build_t<OpType::all_reduce>::op == OpType::all_reduce &&
 
 
 // THE FIELDS EVERY BUILD HAS.
-constexpr OpType op_of(const BuildConfig& b) {
-  return std::visit([](const auto& f) { return f.op; }, b);
-}
 // Its algorithm's name, as its kernel's `algorithms` names it.
 constexpr std::string_view algorithm_name(const BuildConfig& b) {
   return std::visit([](const auto& f) -> std::string_view {
@@ -825,9 +822,6 @@ constexpr Dim3 block_of(const BuildConfig& b) {
 constexpr int waves_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.waves_per_eu; }, b);
 }
-constexpr int quantization_of(const BuildConfig& b) {
-  return std::visit([](const auto& f) { return f.quantization; }, b);
-}
 // WHAT A BUILD'S INSTANCE IS COMPILED MOVING: its quantization, but an INT4 build at a pack
 // narrower than the widest compiles its exact body (INT4's word is a pack of 8 values,
 // common.cuh's QUANTIZATION), which never runs: the call is refused by name
@@ -838,11 +832,6 @@ constexpr int compiled_quantization(const B& b) {
 }
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
-// A row of `elems` of `dtype` in packs of `pack` bytes, the last short where the row is not
-// whole packs (a build whose pack does not divide a call's row is refused, row_not_packs).
-constexpr int64_t packs_of(int64_t elems, DType dtype, int64_t pack) {
-  return (elems * elem_bytes(dtype) + pack - 1) / pack;
-}  // a block's tile's payload, at most
 constexpr int64_t unfenced_bytes(int world) {
   return 2 * int64_t{kUnfencedBlocks} * world * kUnfencedSlotBytes * (kLineBytes / kLinePayloadBytes);
 }
@@ -985,7 +974,7 @@ static_assert(every_op_built(), "an op's kernel lists no builds");
 constexpr bool builds_their_ops() {
   for (const Op& o : kOps)
     for (const BuildConfig& b : o.builds)
-      if (op_of(b) != o.type) return false;
+      if (std::visit([](const auto& f) { return f.op; }, b) != o.type) return false;
   return true;
 }
 static_assert(builds_their_ops(), "an op lists another op's build");
@@ -1220,7 +1209,7 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
         return std::nullopt;
       }
     }
-    const int64_t packs = packs_of(n, dtype, pack);
+    const int64_t packs = (n * elem_bytes(dtype) + pack - 1) / pack;  // the last short
     // An INT4 payload lies in the region that holds it exact (common.cuh's
     // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
     // most one row of the partials's elements (its every view's bound); the flat walk's
@@ -1493,7 +1482,6 @@ bool all_ints(std::initializer_list<int64_t> vs) {
   return true;
 }
 
-hipStream_t current_stream() { return at::cuda::getCurrentCUDAStream(); }
 
 // The ops' tensors: on device; their layouts are their strides, checked behind
 // the interface.
@@ -1666,15 +1654,6 @@ std::optional<Error> attn_res_tensors(
   return std::nullopt;
 }
 
-// A [rows, cols] TENSOR'S ARGUMENTS, none's a null pointer and zeros.
-struct Rows {
-  void* ptr;
-  int64_t stride_m, stride_n, size_m, size_n;
-};
-Rows rows_of(const std::optional<torch::Tensor>& t) {
-  if (!t) return {nullptr, 0, 0, 0, 0};
-  return {t->data_ptr(), t->stride(0), t->stride(1), t->size(0), t->size(1)};
-}
 }  // namespace
 
 // =================================================================================================
@@ -2074,7 +2053,7 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   const DType dtype = *found_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   const std::optional<AllReduceAlgorithm> named = algorithm_named<AllReduceBuildConfig>(algorithm_name);
@@ -2278,7 +2257,7 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(int64_t state,
   const DType weight_dtype = *found_weight_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   const std::optional<AllReduceRmsNormAlgorithm> named = algorithm_named<AllReduceRmsNormBuildConfig>(algorithm_name);
@@ -2446,7 +2425,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(int64_t state,
   const DType weight_dtype = *found_weight_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   const std::optional<AllReduceAddRmsNormAlgorithm> named = algorithm_named<AllReduceAddRmsNormBuildConfig>(algorithm_name);
@@ -2612,7 +2591,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks))
     return error_code(e);
-  const Rows prefix_rows = rows_of(prefix), block_rows = rows_of(block_output);
   const std::optional<DType> found_dtype = dtype_of_tensor(input);
   if (!found_dtype) return error_code(Error::dtype_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
@@ -2622,11 +2600,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
   const int64_t input_stride_n = input.stride(1);
   const int64_t input_size_m = input.size(0);
   const int64_t input_size_n = input.size(1);
-  const void* prefix_ptr = prefix_rows.ptr;
-  const int64_t prefix_stride_m = prefix_rows.stride_m;
-  const int64_t prefix_stride_n = prefix_rows.stride_n;
-  const int64_t prefix_size_m = prefix_rows.size_m;
-  const int64_t prefix_size_n = prefix_rows.size_n;
+  const void* prefix_ptr = prefix ? prefix->data_ptr() : nullptr;
+  const int64_t prefix_stride_m = prefix ? prefix->stride(0) : 0;
+  const int64_t prefix_stride_n = prefix ? prefix->stride(1) : 0;
+  const int64_t prefix_size_m = prefix ? prefix->size(0) : 0;
+  const int64_t prefix_size_n = prefix ? prefix->size(1) : 0;
   const void* blocks_ptr = blocks.data_ptr();
   const int64_t blocks_stride_m = blocks.stride(0);
   const int64_t blocks_stride_r = blocks.stride(1);
@@ -2653,15 +2631,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int64_t state
   const int64_t output_stride_n = output.stride(1);
   const int64_t output_size_m = output.size(0);
   const int64_t output_size_n = output.size(1);
-  void* block_output_ptr = block_rows.ptr;
-  const int64_t block_output_stride_m = block_rows.stride_m;
-  const int64_t block_output_stride_n = block_rows.stride_n;
-  const int64_t block_output_size_m = block_rows.size_m;
-  const int64_t block_output_size_n = block_rows.size_n;
+  void* block_output_ptr = block_output ? block_output->data_ptr() : nullptr;
+  const int64_t block_output_stride_m = block_output ? block_output->stride(0) : 0;
+  const int64_t block_output_stride_n = block_output ? block_output->stride(1) : 0;
+  const int64_t block_output_size_m = block_output ? block_output->size(0) : 0;
+  const int64_t block_output_size_n = block_output ? block_output->size(1) : 0;
   const DType dtype = *found_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   const std::optional<AllReduceAddAttnResRmsNormAlgorithm> named = algorithm_named<AllReduceAddAttnResRmsNormBuildConfig>(algorithm_name);
@@ -2850,7 +2828,7 @@ ErrorCode hip_custom_communicator_rms_norm(int64_t state, torch::Tensor& input, 
   const DType weight_dtype = *found_weight_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   if (quantization_name != "exact" && quantization_name != "int4")
@@ -2951,7 +2929,7 @@ ErrorCode hip_custom_communicator_add_rms_norm(int64_t state, torch::Tensor& inp
   const DType weight_dtype = *found_weight_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   if (quantization_name != "exact" && quantization_name != "int4")
@@ -3031,7 +3009,6 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks))
     return error_code(e);
-  const Rows prefix_rows = rows_of(prefix), block_rows = rows_of(block_output);
   const std::optional<DType> found_dtype = dtype_of_tensor(input);
   if (!found_dtype) return error_code(Error::dtype_not_built);
   if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x, grid_y, grid_z, block_x, block_y, block_z})) return error_code(Error::field_out_of_range);
@@ -3041,11 +3018,11 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
   const int64_t input_stride_n = input.stride(1);
   const int64_t input_size_m = input.size(0);
   const int64_t input_size_n = input.size(1);
-  const void* prefix_ptr = prefix_rows.ptr;
-  const int64_t prefix_stride_m = prefix_rows.stride_m;
-  const int64_t prefix_stride_n = prefix_rows.stride_n;
-  const int64_t prefix_size_m = prefix_rows.size_m;
-  const int64_t prefix_size_n = prefix_rows.size_n;
+  const void* prefix_ptr = prefix ? prefix->data_ptr() : nullptr;
+  const int64_t prefix_stride_m = prefix ? prefix->stride(0) : 0;
+  const int64_t prefix_stride_n = prefix ? prefix->stride(1) : 0;
+  const int64_t prefix_size_m = prefix ? prefix->size(0) : 0;
+  const int64_t prefix_size_n = prefix ? prefix->size(1) : 0;
   const void* blocks_ptr = blocks.data_ptr();
   const int64_t blocks_stride_m = blocks.stride(0);
   const int64_t blocks_stride_r = blocks.stride(1);
@@ -3072,15 +3049,15 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(int64_t state, torch::Te
   const int64_t output_stride_n = output.stride(1);
   const int64_t output_size_m = output.size(0);
   const int64_t output_size_n = output.size(1);
-  void* block_output_ptr = block_rows.ptr;
-  const int64_t block_output_stride_m = block_rows.stride_m;
-  const int64_t block_output_stride_n = block_rows.stride_n;
-  const int64_t block_output_size_m = block_rows.size_m;
-  const int64_t block_output_size_n = block_rows.size_n;
+  void* block_output_ptr = block_output ? block_output->data_ptr() : nullptr;
+  const int64_t block_output_stride_m = block_output ? block_output->stride(0) : 0;
+  const int64_t block_output_stride_n = block_output ? block_output->stride(1) : 0;
+  const int64_t block_output_size_m = block_output ? block_output->size(0) : 0;
+  const int64_t block_output_size_n = block_output ? block_output->size(1) : 0;
   const DType dtype = *found_dtype;
   const Dim3 grid{static_cast<int>(grid_x), static_cast<int>(grid_y), static_cast<int>(grid_z)};
   const Dim3 block{static_cast<int>(block_x), static_cast<int>(block_y), static_cast<int>(block_z)};
-  const hipStream_t stream = current_stream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   // ---- PRECONDITIONS: the config, the call, then its instance. The first Error refuses the
   // call; past this section the call runs. ----
   if (quantization_name != "exact" && quantization_name != "int4")
