@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import Any, ClassVar, Literal, cast, final, get_args
+from typing import Any, ClassVar, Literal, TextIO, cast, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -1445,25 +1445,70 @@ class HipCustomCommunicator:
     out-of-place.
     """
 
-    state: State = Closed()
+    # ---- ITS FIELDS, every one an instance holds, declared here: a default is "nothing
+    # held", so a disabled or closed communicator is still safe to read and close. ----
 
-    @final
-    @property
-    def disabled(self) -> bool:
-        """The flag every vLLM communicator has: no call may run. A BROKEN one
-        raises instead: its peers' state is half-done (a capture that failed part
-        way), so a quiet fallback would leave the next call on a rank to hang."""
-        match self.state:
-            case Broken(error, detail):
-                raise CommunicatorError(
-                    Error.broken,
-                    f"{error.name}: {detail}. Close it and build a new one on every "
-                    f"rank.",
-                )
-            case Disabled() | Abandoned() | Closed():
-                return True
-            case Open() | Capturing():
-                return False
+    # WHAT THE CALLER GAVE (`__init__`): the groups, the device, how long a kernel waits
+    # on a peer, the largest call served, what the plain calls move, and the tuned
+    # tables' file.
+    cpu_group: ProcessGroup
+    device_group: ProcessGroup
+    device: torch.device
+    timeout_seconds: float
+    max_rows: int
+    max_cols: int
+    quantization: Quantization
+    _tuned_path: Path
+    # What a communicator serving that box holds (`capacity_of`), for `should`.
+    capacity: Capacity
+    # ITS STATE (`State`), the lock it moves under, and one teardown at a time (close,
+    # and abandon).
+    state: State = Closed()
+    _lock: threading.Lock
+    _teardown: threading.Lock
+    # The device's arch, and its tuned table the plain calls look up, parsed at open.
+    arch: str
+    tuned_configs: TunedConfigs
+    # What every op is handed: this rank, the world, the buffers' layout, a wait's
+    # bound in the device wall clock's ticks (its rate `_khz`, which the fault record
+    # counts its wait in too), and whether each launch is checked after
+    # (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1).
+    _rank: int = 0
+    _world: int = 1
+    _layout: Layout
+    _timeout_ticks: int = 0
+    _khz: int = 0
+    _checked: bool = False
+    # THE SAME, AS C++ HOLDS IT (its CommsState, every op's first argument): made once
+    # the buffers are, freed with them.
+    _state: int | None = None
+    # EACH CONFIG AS C++ HOLDS IT (its op's own struct), by the config: the table's
+    # made at open, a forced one's at its first call (`_config_handle`); freed with the
+    # state.
+    _configs: dict[Config, int]
+    # THE PEER MEMORY, three buffers a rank, as addresses. HOST: the status words, as
+    # the host and the device reach them. SHARED: this rank's (OWNED), and each peer's
+    # as its IPC opening gave it (BORROWED), by rank. PRIVATE: this rank's (OWNED).
+    _status_host: int | None = None
+    _status_device: int | None = None
+    _shared: int | None = None
+    _peers: dict[int, int]
+    _private: int | None = None
+    # THE CAPTURED LAUNCHES: the next free table slot, those awaiting registration
+    # (slot, input address), and every peer allocation opened for one, by its IPC handle
+    # (BORROWED).
+    _next_slot: int = 1
+    _pending: list[tuple[int, int]]
+    _opened_inputs: dict[tuple[int, ...], int]
+    # THE WATCHDOG, its thread while open and what tells it to stop; whether there is a
+    # fault record for it to read (`_fault`).
+    _watchdog: threading.Thread | None = None
+    _stop_watching: threading.Event
+    _faults: ClassVar[bool] = True
+    # DEBUG MODE's file, every call a line (`_debug`); None, off.
+    _debug_out: TextIO | None = None
+
+    # ---- MAKING IT: the constructor, and the open it runs. ----
 
     @final
     def __init__(
@@ -1516,7 +1561,7 @@ class HipCustomCommunicator:
             max_cols = served_cols if max_cols is None else max_cols
         self.max_rows = max_rows
         self.max_cols = max_cols
-        self.quantization: Quantization = (
+        self.quantization = (
             configured_quantization() if quantization is None else quantization
         )
         debugging = configured_debug() if debug is None else debug
@@ -1551,19 +1596,209 @@ class HipCustomCommunicator:
         # One teardown at a time: close, and abandon (a signal, exit).
         self._teardown = threading.Lock()
         # Nothing held yet: no peer mapping, no captured launch.
-        self._peers: dict[int, int] = {}
-        self._pending: list[tuple[int, int]] = []
-        self._opened_inputs: dict[tuple[int, ...], int] = {}
+        self._peers = {}
+        self._pending = []
+        self._opened_inputs = {}
         # EACH CONFIG AS C++ HOLDS IT (its op's own struct), by the config: the table's
         # made at open, a forced one's at its first call (`_config_handle`).
-        self._configs: dict[Config, int] = {}
+        self._configs = {}
         self._stop_watching = threading.Event()
         self._watchdog = None
         self._debug_out = None
         if state is not None:
             self.state = state
 
-    # ---- What the CALLER uses. Concrete: this class owns the order. ----
+    def _open(self) -> Open | Disabled:
+        """Open the peer memory. A collective, so every rank must reach it.
+
+        Eager, and before any capture: doing this inside a cudagraph capture is not
+        recoverable. An open that raises frees what it made, alone, and raises.
+        """
+        # THE TUNED TABLE for this device's arch, checked: none, and the communicator is
+        # disabled, as on a device it does not support.
+        found = supported(self.device, self.device_group.size())
+        if isinstance(found, Error):
+            return Disabled(found)
+        tuned_configs = parse_tuned_configs(self._tuned_path, found.arch)
+        if tuned_configs is None:
+            return Disabled(Error.no_tuned_table)
+        self.tuned_configs = tuned_configs
+        self.arch = found.arch
+        # THE GROUPS: one world, this rank the same in both.
+        if (
+            self.cpu_group.size() != self.device_group.size()
+            or self.cpu_group.rank() != self.device_group.rank()
+        ):
+            return Disabled(Error.groups_disagree)
+        if torch.cuda.current_device() != self.device.index:
+            raise CommunicatorError(
+                Error.wrong_device,
+                f"the current device is {torch.cuda.current_device()}, not the "
+                f"communicator's {self.device.index}",
+            )
+        self._rank = self.device_group.rank()
+        self._world = self.device_group.size()
+        self._layout = layout_of(self.max_rows, self.max_cols, self._world)
+        self._khz = torch.ops._rocm_C.hip_custom_communicator_wall_clock_khz(
+            self.device.index
+        )
+        self._timeout_ticks = int(self.timeout_seconds * self._khz * 1000)
+        checked = os.environ.get("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED", "")
+        self._checked = checked == "1"
+        self._next_slot = 1
+        try:
+            self._open_buffers()
+            self._state = torch.ops._rocm_C.hip_custom_communicator_state(
+                rank=self._rank,
+                world=self._world,
+                shared_buffer=self._shared,
+                private_buffer=self._private,
+                status_device=self._status_device,
+                timeout_ticks=self._timeout_ticks,
+                max_rows=self.max_rows,
+                staging_bytes=self._layout.staging_bytes,
+                partials_bytes=self._layout.partials_bytes,
+                checked_after_launch=self._checked,
+            )
+            # EVERY CONFIG THE TABLE LISTS, made and checked: a table C++ refuses a
+            # config of fails the open, naming it.
+            for config in tuned_configs.configs:
+                self._configs[config] = _make_config(config)
+        except BaseException:
+            self._release_peers()
+            self._release_own()
+            self._release_status()
+            raise
+        _install_exit_hooks()
+        logger.info(
+            "HipCustomCommunicator ready: exchange sized for %d rows of %d "
+            "(partials %.1f MiB, staging %.1f MiB), quantization=%s",
+            self.capacity.max_rows,
+            self.capacity.max_cols,
+            self.capacity.partials_bytes / 2**20,
+            self.capacity.staging_bytes / 2**20,
+            self.quantization,
+        )
+        return Open()
+
+    def _open_buffers(self) -> None:
+        """THE THREE BUFFERS made, the shared ones exchanged (a collective over the CPU
+        group), and the private one written. Each step an assert that raises naming
+        it."""
+        ops = torch.ops._rocm_C
+        layout = self._layout
+        # HOST: the status words, zeroed.
+        self._status_host, self._status_device = ops.hip_custom_communicator_alloc_host(
+            4 * layout.status_fields
+        )
+        # SHARED: zeroed, then each region's guard set, before any peer can see it; this
+        # rank's signals read back zero.
+        self._shared = ops.hip_custom_communicator_alloc(layout.shared_bytes, True)
+        for begin, end in (
+            (layout.staging_guard, layout.staging_guard_end),
+            (layout.partials_guard, layout.partials_guard_end),
+            (layout.unfenced_guard, layout.unfenced_guard_end),
+        ):
+            ops.hip_custom_communicator_fill_words(
+                self._shared + begin, layout.guard_word, (end - begin) // 4
+            )
+        nonzero = sum(
+            w != 0
+            for w in ops.hip_custom_communicator_read_words(
+                self._shared + layout.signals, 64
+            )
+        )
+        if nonzero:
+            raise CommunicatorError(
+                Error.signals_not_cleared,
+                f"{nonzero} of this rank's first 64 signal words after the memset",
+            )
+        # PRIVATE: zeroed.
+        self._private = ops.hip_custom_communicator_alloc(layout.private_bytes, False)
+        # THE EXCHANGE, one collective over the CPU group: every rank's shared buffer's
+        # IPC handle, its host, its GPU and its pid.
+        props = torch.cuda.get_device_properties(self.device)
+        me = {
+            "handle": ops.hip_custom_communicator_ipc_handle(self._shared),
+            "host": socket.gethostname(),
+            "gpu": str(getattr(props, "uuid", "")),
+            "pid": os.getpid(),
+        }
+        everyone: list[Any] = [None] * self._world
+        torch.distributed.all_gather_object(everyone, me, group=self.cpu_group)
+        # EVERY PEER'S GPU, where this process sees it (by its UUID), reachable from
+        # ours: a rank that cannot reach a peer's GPU is refused here, by name, not at
+        # its first call.
+        here = {
+            str(getattr(torch.cuda.get_device_properties(d), "uuid", "")): d
+            for d in range(torch.cuda.device_count())
+        }
+        for r, peer in enumerate(everyone):
+            d = here.get(peer["gpu"])
+            if r == self._rank or d is None or d == self.device.index:
+                continue
+            if not torch.cuda.can_device_access_peer(self.device.index, d):
+                raise CommunicatorError(
+                    Error.peer_not_accessible,
+                    f"device {self.device.index} cannot access rank {r}'s device {d}",
+                )
+        for r, peer in enumerate(everyone):
+            if r == self._rank:
+                continue
+            if peer["host"] != me["host"]:
+                logger.warning(
+                    "HipCustomCommunicator open: rank %d is on another host", r
+                )
+            elif peer["gpu"] and peer["gpu"] == me["gpu"]:
+                logger.warning(
+                    "HipCustomCommunicator open: rank %d (pid %d) is on this rank's "
+                    "GPU",
+                    r,
+                    peer["pid"],
+                )
+        # EVERY PEER'S SHARED BUFFER opened (BORROWED); ours is not. Each base, as this
+        # process reaches it, the base of device memory.
+        for r, peer in enumerate(everyone):
+            if peer["handle"][-1] != 0:
+                raise CommunicatorError(
+                    Error.peer_buffer_not_base,
+                    f"rank {r}'s, at offset {peer['handle'][-1]} of its allocation",
+                )
+            if r != self._rank:
+                self._peers[r] = ops.hip_custom_communicator_ipc_open(peer["handle"])
+        bases = [
+            self._shared if r == self._rank else self._peers[r]
+            for r in range(self._world)
+        ]
+        for r, base in enumerate(bases):
+            if ops.hip_custom_communicator_pointer_device(base) < 0:
+                raise CommunicatorError(
+                    Error.peer_buffer_not_base,
+                    f"rank {r}'s, as this process opened it, is not a device base",
+                )
+        # THE PRIVATE BUFFER WRITTEN: each region's device array of every rank's address
+        # of it (0 past the world), and the input tables' slot 0, the eager table: every
+        # rank's staging.
+        if len(_REGION_ARRAYS) != layout.region_ptr_arrays:
+            raise CommunicatorError(
+                Error.layout_disagrees,
+                f"C++ has {layout.region_ptr_arrays} region arrays, Python names "
+                f"{len(_REGION_ARRAYS)}",
+            )
+        arrays = [0] * (layout.region_ptr_arrays * layout.max_ranks)
+        for a, region in enumerate(_REGION_ARRAYS):
+            for r, base in enumerate(bases):
+                arrays[a * layout.max_ranks + r] = base + getattr(layout, region)
+        ops.hip_custom_communicator_write_words(
+            self._private + layout.private_region_ptr_arrays, arrays
+        )
+        eager = [base + layout.staging for base in bases]
+        ops.hip_custom_communicator_write_words(
+            self._private + layout.private_tables,
+            eager + [0] * (layout.max_ranks - self._world),
+        )
+
+    # ---- WHAT THE CALLER USES, in its order. Concrete: this class owns the order. ----
     #
     # Each `should_` asks the module's `should` of the op's own tensors: whether a
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
@@ -1576,95 +1811,22 @@ class HipCustomCommunicator:
     # refused for; a call its `should_` admitted is never refused.
 
     @final
-    def _debug(
-        self,
-        op: str,
-        tensors: Mapping[str, torch.Tensor | None],
-        values: Mapping[str, int | float],
-        configs: Sequence[Config],
-        tuned_input: TunedInput | None,
-    ) -> None:
-        """THE CALL'S LINE IN DEBUG MODE (`debug`), printed and appended to the
-        process's file (`debug_path`) before it launches: when, the rank and the world,
-        the op, the communicator's quantization, whether a graph is being captured,
-        every tensor's shape, dtype and
-        strides (null where one is not given), the call's values, the configs it
-        launches in order (each field by name), and the table input their pick was
-        tuned at (null for a forced call). Off, nothing: no work on the call's path."""
-        if self._debug_out is None:
-            return
-        line = {
-            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "rank": self.device_group.rank(),
-            "world": self.device_group.size(),
-            "op": op,
-            "quantization": self.quantization,
-            "captured": torch.cuda.is_current_stream_capturing(),
-            "tensors": {
-                name: None
-                if t is None
-                else {
-                    "shape": list(t.shape),
-                    "dtype": str(t.dtype).removeprefix("torch."),
-                    "stride": list(t.stride()),
-                }
-                for name, t in tensors.items()
-            },
-            "values": dict(values),
-            "configs": [_record(c) for c in configs],
-            "table_input": (
-                None
-                if tuned_input is None
-                else asdict(tuned_input) | {"op": _QUALIFIED + tuned_input.op}
-            ),
-        }
-        logger.info(
-            "%s rank %d: %s %s %s launches %s (its pick tuned at %s)",
-            type(self).__name__,
-            line["rank"],
-            op,
-            self.quantization,
-            line["tensors"],
-            line["configs"],
-            line["table_input"],
-        )
-        self._debug_out.write(json.dumps(line) + "\n")
-
-    @final
-    def tuned(self, op: Op, rows: int, cols: int) -> list[Config]:
-        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order: its
-        table's nearest input's configs (`TunedConfigs.nearest`)."""
-        _, config = self.tuned_configs.nearest(
-            op, self.quantization, self.device_group.size(), rows, cols
-        )
-        if isinstance(config, SplitConfig):
-            return [config.all_reduce, config.rows]
-        return [config]
-
-    @final
-    def kernel_config(
-        self,
-        kernel: str,
-        algorithm: Algorithm,
-        rows: int,
-        cols: int,
-        quantization: Quantization = "exact",
-    ) -> Config | None:
-        """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` for `rows` x `cols` moving
-        `quantization` (`TunedConfigs.kernel_config`), or None."""
-        return self.tuned_configs.kernel_config(
-            kernel, algorithm, rows, cols, quantization, self.device_group.size()
-        )
-
-    @final
-    def _config_handle(self, config: Config) -> int:
-        """`config` AS C++ HOLDS IT: the table's, made at open; a forced one's, made at
-        its first call and kept. Raises naming the Error C++ refuses it for."""
-        handle = self._configs.get(config)
-        if handle is None:
-            handle = _make_config(config)
-            self._configs[config] = handle
-        return handle
+    @property
+    def disabled(self) -> bool:
+        """The flag every vLLM communicator has: no call may run. A BROKEN one
+        raises instead: its peers' state is half-done (a capture that failed part
+        way), so a quiet fallback would leave the next call on a rank to hang."""
+        match self.state:
+            case Broken(error, detail):
+                raise CommunicatorError(
+                    Error.broken,
+                    f"{error.name}: {detail}. Close it and build a new one on every "
+                    f"rank.",
+                )
+            case Disabled() | Abandoned() | Closed():
+                return True
+            case Open() | Capturing():
+                return False
 
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
@@ -2468,69 +2630,8 @@ class HipCustomCommunicator:
             raise CommunicatorError(Error(error), f"{_record(config)} on {input.shape}")
         return prefix_output, output
 
-    @final
-    def close(self) -> None:
-        """Release what this communicator holds, NOW. Idempotent, and safe to call on a
-        disabled one.
-
-        Deterministic release rather than waiting to be collected, because the
-        collection is what cannot be relied on: dropping the last reference frees a
-        backend's IPC handles and device buffers through its destructor, but an
-        exception TRACEBACK holds the frames that hold the communicator -- so a failing
-        call is exactly when `del` does not release. This does.
-
-        A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
-        every rank's device finishes, a handshake over the CPU group, every rank
-        closes its peers' IPC mappings, a second handshake, then each frees its own
-        (`_on_close`). Each handshake
-        is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
-        costs at most that, never a hang: the failed handshake is logged and the
-        teardown carries on alone. Ordering that matters is the caller's -- close
-        before the process group is destroyed, and after any captured graph is gone.
-        """
-        if isinstance(self.state, Closed):
-            return
-        if isinstance(self.state, Capturing):
-            raise CommunicatorError(
-                Error.close_while_capturing,
-                "the graph being recorded would replay against released buffers; "
-                "leave the capture first",
-            )
-        # THE WATCHDOG STOPS FIRST: it reads the status words, which `_on_close`
-        # frees.
-        self._stop_watching.set()
-        if self._watchdog is not None:
-            self._watchdog.join()
-        with self._lock:
-            self.state = Closed()
-        self._on_close()
-        if self._debug_out is not None:
-            self._debug_out.close()
-            self._debug_out = None
-
-    @final
-    def __enter__(self) -> "HipCustomCommunicator":
-        return self
-
-    @final
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    def __del__(self) -> None:
-        # WARNS, never releases. Doing GPU or IPC work here would run at an arbitrary
-        # moment -- interpreter shutdown included, where the runtime may already be gone
-        # -- so this only reports that a release was left to chance. Same bargain as an
-        # unclosed file's ResourceWarning. At shutdown the exit hook has already moved
-        # it to Abandoned, which holds nothing.
-        if self.state.holds:
-            warnings.warn(
-                f"{type(self).__name__} was never closed; its peer handles and buffers "
-                f"were left to garbage collection. Use `with make_communicator(...) as "
-                f"comm:` "
-                f"or call `close()`.",
-                ResourceWarning,
-                stacklevel=2,
-            )
+    # ---- A CAPTURE, and what tools and tests read: what a plain call launches, a
+    # kernel's tuned config, the status, the signals, the check after a call. ----
 
     @final
     @contextmanager
@@ -2558,291 +2659,157 @@ class HipCustomCommunicator:
                 self.state = Open()
 
     @final
-    def _abandoned(self, wait_s: float = ABANDON_WAIT_S) -> None:
-        """ABANDONED, from the exit hook (`abandon_open`): torn down ALONE, never
-        waiting on a peer (STANDARDS 3.5). The watchdog told to stop (not joined: a
-        signal handler may be running this); every wait on this rank told to leave
-        (`_abort`); the device given `wait_s` to finish; every BORROWED peer mapping
-        closed; and, only once the device finished, our own shared and private buffers
-        freed (freeing memory a running kernel reads would fault it). The status words
-        stay: the watchdog may still read them. A no-op while another teardown runs."""
-        with self._lock:
-            if not self.state.holds:
-                return
-            self.state = Abandoned()
-        self._stop_watching.set()
-        if self._shared is None and self._private is None:
-            return
-        if not self._teardown.acquire(blocking=False):
-            return
-        try:
-            self._abort()
-            finished = _synchronized_within(self.device, wait_s)
-            self._release_peers()
-            if finished:
-                self._release_own()
-        finally:
-            self._teardown.release()
-
-    # ---- A FAULT, AND WHAT IS LOGGED WHEN ONE BREAKS IT. ----
-
-    def _watch(self) -> None:
-        """THE WATCHDOG, its own thread while open: reads the backend's fault record
-        and breaks the communicator on the first. A graph replay runs none of our host
-        code, so this is the only place a fault in one surfaces."""
-        while not self._stop_watching.wait(_WATCH_S):
-            fault = self._fault()
-            if fault is not None:
-                self._break(Error.faulted, f"a kernel's wait gave up: {fault}")
-                return
+    def tuned(self, op: Op, rows: int, cols: int) -> list[Config]:
+        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order: its
+        table's nearest input's configs (`TunedConfigs.nearest`)."""
+        _, config = self.tuned_configs.nearest(
+            op, self.quantization, self.device_group.size(), rows, cols
+        )
+        if isinstance(config, SplitConfig):
+            return [config.all_reduce, config.rows]
+        return [config]
 
     @final
-    def _break(self, error: Error, detail: str) -> None:
-        """Broken, once: every later call raises (`disabled`), every wait still on the
-        device leaves (`_abort`), and the cause and the status go to the log."""
-        with self._lock:
-            if isinstance(self.state, Broken | Abandoned | Closed):
-                return
-            self.state = Broken(error, detail)
-        self._abort()
-        logger.error(
-            "%s broken: %s: %s. %s",
-            type(self).__name__,
-            error.name,
-            detail,
-            self.status(),
+    def kernel_config(
+        self,
+        kernel: str,
+        algorithm: Algorithm,
+        rows: int,
+        cols: int,
+        quantization: Quantization = "exact",
+    ) -> Config | None:
+        """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` for `rows` x `cols` moving
+        `quantization` (`TunedConfigs.kernel_config`), or None."""
+        return self.tuned_configs.kernel_config(
+            kernel, algorithm, rows, cols, quantization, self.device_group.size()
         )
 
-    # ---- THE PEER MEMORY'S LIFE: three buffers a rank, this class's, as addresses.
-    # ----
-
-    # Declared here so a disabled communicator is still safe to hold and close: None,
-    # nothing held. HOST: the status words, as the host and the device reach them.
-    _status_host: int | None = None
-    _status_device: int | None = None
-    # SHARED: this rank's (OWNED), and each peer's as its IPC opening gave it
-    # (BORROWED), by rank.
-    _shared: int | None = None
-    # PRIVATE: this rank's (OWNED).
-    _private: int | None = None
-    # THE CAPTURED LAUNCHES: the next free table slot, those awaiting registration
-    # (slot, input address), and every peer allocation opened for one, by its IPC handle
-    # (BORROWED).
-    _next_slot: int = 1
-    # What every op is handed: this rank, the world, the buffers' layout, a wait's bound
-    # in the device wall clock's ticks, and whether each launch is checked after
-    # (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1).
-    _rank: int = 0
-    _world: int = 1
-    _layout: Layout
-    _timeout_ticks: int = 0
-    _checked: bool = False
-    # THE SAME, AS C++ HOLDS IT (its CommsState, every op's first argument): made once
-    # the buffers are, freed with them.
-    _state: int | None = None
-    # The thread that reads the fault record, while the communicator is open.
-    _watchdog: threading.Thread | None = None
-    # The device wall clock's rate, which the fault record counts its wait in.
-    _khz: int = 0
-    capacity: Capacity
-    # The device's arch, whose tuned table the communicator runs.
-    arch: str
-    # The tuned tables' file the communicator was given.
-    _tuned_path: Path
-    # The arch's tuned table the plain calls look up, parsed at open.
-    tuned_configs: TunedConfigs
-    # Whether there is a fault record for the watchdog to read (`_fault`).
-    _faults: ClassVar[bool] = True
-
-    def _open(self) -> Open | Disabled:
-        """Open the peer memory. A collective, so every rank must reach it.
-
-        Eager, and before any capture: doing this inside a cudagraph capture is not
-        recoverable. An open that raises frees what it made, alone, and raises.
-        """
-        # THE TUNED TABLE for this device's arch, checked: none, and the communicator is
-        # disabled, as on a device it does not support.
-        found = supported(self.device, self.device_group.size())
-        if isinstance(found, Error):
-            return Disabled(found)
-        tuned_configs = parse_tuned_configs(self._tuned_path, found.arch)
-        if tuned_configs is None:
-            return Disabled(Error.no_tuned_table)
-        self.tuned_configs = tuned_configs
-        self.arch = found.arch
-        # THE GROUPS: one world, this rank the same in both.
-        if (
-            self.cpu_group.size() != self.device_group.size()
-            or self.cpu_group.rank() != self.device_group.rank()
-        ):
-            return Disabled(Error.groups_disagree)
-        if torch.cuda.current_device() != self.device.index:
-            raise CommunicatorError(
-                Error.wrong_device,
-                f"the current device is {torch.cuda.current_device()}, not the "
-                f"communicator's {self.device.index}",
-            )
-        self._rank = self.device_group.rank()
-        self._world = self.device_group.size()
-        self._layout = layout_of(self.max_rows, self.max_cols, self._world)
-        self._khz = torch.ops._rocm_C.hip_custom_communicator_wall_clock_khz(
-            self.device.index
+    def status(self) -> Status:
+        """This rank's status, read from host-mapped memory, so it never waits on the
+        device: valid even while a kernel is hung."""
+        if self._status_host is None:
+            return Status(abort=False, fault=None)
+        words = torch.ops._rocm_C.hip_custom_communicator_read_host(
+            self._status_host, self._layout.status_fields
         )
-        self._timeout_ticks = int(self.timeout_seconds * self._khz * 1000)
-        checked = os.environ.get("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED", "")
-        self._checked = checked == "1"
-        self._next_slot = 1
-        try:
-            self._open_buffers()
-            self._state = torch.ops._rocm_C.hip_custom_communicator_state(
-                rank=self._rank,
-                world=self._world,
-                shared_buffer=self._shared,
-                private_buffer=self._private,
-                status_device=self._status_device,
-                timeout_ticks=self._timeout_ticks,
-                max_rows=self.max_rows,
-                staging_bytes=self._layout.staging_bytes,
-                partials_bytes=self._layout.partials_bytes,
-                checked_after_launch=self._checked,
-            )
-            # EVERY CONFIG THE TABLE LISTS, made and checked: a table C++ refuses a
-            # config of fails the open, naming it.
-            for config in tuned_configs.configs:
-                self._configs[config] = _make_config(config)
-        except BaseException:
-            self._release_peers()
-            self._release_own()
-            self._release_status()
-            raise
-        _install_exit_hooks()
-        logger.info(
-            "HipCustomCommunicator ready: exchange sized for %d rows of %d "
-            "(partials %.1f MiB, staging %.1f MiB), quantization=%s",
-            self.capacity.max_rows,
-            self.capacity.max_cols,
-            self.capacity.partials_bytes / 2**20,
-            self.capacity.staging_bytes / 2**20,
-            self.quantization,
+        return Status(
+            abort=words[_STATUS_ABORT] != 0, fault=_fault_of(words, self._khz)
         )
-        return Open()
 
-    def _open_buffers(self) -> None:
-        """THE THREE BUFFERS made, the shared ones exchanged (a collective over the CPU
-        group), and the private one written. Each step an assert that raises naming
-        it."""
-        ops = torch.ops._rocm_C
+    def signals(self) -> list[Flag]:
+        """Every flag of this rank's signals, each `clear` between launches. Every
+        launch on the device finished first, here (read mid-launch, a barrier shows its
+        peers' flags set and this rank's not yet cleared); a hung launch hangs this
+        query too (`status()` is readable while a kernel waits)."""
+        if self._shared is None:
+            return []
+        torch.cuda.synchronize(self.device)
         layout = self._layout
-        # HOST: the status words, zeroed.
-        self._status_host, self._status_device = ops.hip_custom_communicator_alloc_host(
-            4 * layout.status_fields
+        words = torch.ops._rocm_C.hip_custom_communicator_read_words(
+            self._shared + layout.signals, layout.signals_bytes // 4
         )
-        # SHARED: zeroed, then each region's guard set, before any peer can see it; this
-        # rank's signals read back zero.
-        self._shared = ops.hip_custom_communicator_alloc(layout.shared_bytes, True)
-        for begin, end in (
-            (layout.staging_guard, layout.staging_guard_end),
-            (layout.partials_guard, layout.partials_guard_end),
-            (layout.unfenced_guard, layout.unfenced_guard_end),
-        ):
-            ops.hip_custom_communicator_fill_words(
-                self._shared + begin, layout.guard_word, (end - begin) // 4
-            )
-        nonzero = sum(
-            w != 0
-            for w in ops.hip_custom_communicator_read_words(
-                self._shared + layout.signals, 64
-            )
-        )
-        if nonzero:
-            raise CommunicatorError(
-                Error.signals_not_cleared,
-                f"{nonzero} of this rank's first 64 signal words after the memset",
-            )
-        # PRIVATE: zeroed.
-        self._private = ops.hip_custom_communicator_alloc(layout.private_bytes, False)
-        # THE EXCHANGE, one collective over the CPU group: every rank's shared buffer's
-        # IPC handle, its host, its GPU and its pid.
-        props = torch.cuda.get_device_properties(self.device)
-        me = {
-            "handle": ops.hip_custom_communicator_ipc_handle(self._shared),
-            "host": socket.gethostname(),
-            "gpu": str(getattr(props, "uuid", "")),
-            "pid": os.getpid(),
-        }
-        everyone: list[Any] = [None] * self._world
-        torch.distributed.all_gather_object(everyone, me, group=self.cpu_group)
-        # EVERY PEER'S GPU, where this process sees it (by its UUID), reachable from
-        # ours: a rank that cannot reach a peer's GPU is refused here, by name, not at
-        # its first call.
-        here = {
-            str(getattr(torch.cuda.get_device_properties(d), "uuid", "")): d
-            for d in range(torch.cuda.device_count())
-        }
-        for r, peer in enumerate(everyone):
-            d = here.get(peer["gpu"])
-            if r == self._rank or d is None or d == self.device.index:
-                continue
-            if not torch.cuda.can_device_access_peer(self.device.index, d):
-                raise CommunicatorError(
-                    Error.peer_not_accessible,
-                    f"device {self.device.index} cannot access rank {r}'s device {d}",
-                )
-        for r, peer in enumerate(everyone):
-            if r == self._rank:
-                continue
-            if peer["host"] != me["host"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d is on another host", r
-                )
-            elif peer["gpu"] and peer["gpu"] == me["gpu"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d (pid %d) is on this rank's "
-                    "GPU",
-                    r,
-                    peer["pid"],
-                )
-        # EVERY PEER'S SHARED BUFFER opened (BORROWED); ours is not. Each base, as this
-        # process reaches it, the base of device memory.
-        for r, peer in enumerate(everyone):
-            if peer["handle"][-1] != 0:
-                raise CommunicatorError(
-                    Error.peer_buffer_not_base,
-                    f"rank {r}'s, at offset {peer['handle'][-1]} of its allocation",
-                )
-            if r != self._rank:
-                self._peers[r] = ops.hip_custom_communicator_ipc_open(peer["handle"])
-        bases = [
-            self._shared if r == self._rank else self._peers[r]
-            for r in range(self._world)
+        parity = layout.max_blocks * layout.max_ranks
+        return [
+            Flag(p, b, w, FlagState(words[p * parity + b * layout.max_ranks + w]))
+            for p in range(2)
+            for b in range(layout.max_blocks)
+            for w in range(layout.max_ranks)
         ]
-        for r, base in enumerate(bases):
-            if ops.hip_custom_communicator_pointer_device(base) < 0:
-                raise CommunicatorError(
-                    Error.peer_buffer_not_base,
-                    f"rank {r}'s, as this process opened it, is not a device base",
-                )
-        # THE PRIVATE BUFFER WRITTEN: each region's device array of every rank's address
-        # of it (0 past the world), and the input tables' slot 0, the eager table: every
-        # rank's staging.
-        if len(_REGION_ARRAYS) != layout.region_ptr_arrays:
+
+    def check_after(self, what: str) -> None:
+        """EVERY EXPECTATION AFTER LAUNCHES, as C++ checks after each launch in its checked mode
+        (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1), for launches it could not check
+        itself: a CUDA graph's replays (`what` names them). Every launch on the device
+        finished, then no write past a region of this rank's shared buffer (its guards),
+        no fault or abort in its status, every signal clear (read between two barriers
+        of every rank: a collective, every rank calls it). Raises CommunicatorError
+        naming the first that fails."""
+        if self._shared is None:
+            return
+        broken = self._guards_broken()
+        if broken:
+            raise CommunicatorError(Error.guard_overwritten, f"after {what}: {broken}")
+        status = self.status()
+        if status.abort or status.fault is not None:
+            raise CommunicatorError(Error.faulted, f"after {what}: {status}")
+        # EVERY SIGNAL CLEAR once every rank finished and none started its next launch: read
+        # between two barriers of every rank (a faster peer's next launch would set its first
+        # barrier's flags here: the tests' _assert_clean).
+        torch.distributed.barrier(group=self.cpu_group)
+        left = [f for f in self.signals() if f.state is not FlagState.clear]
+        torch.distributed.barrier(group=self.cpu_group)
+        if left:
             raise CommunicatorError(
-                Error.layout_disagrees,
-                f"C++ has {layout.region_ptr_arrays} region arrays, Python names "
-                f"{len(_REGION_ARRAYS)}",
+                Error.signals_left_set, f"after {what}: {len(left)}, {left[:4]}"
             )
-        arrays = [0] * (layout.region_ptr_arrays * layout.max_ranks)
-        for a, region in enumerate(_REGION_ARRAYS):
-            for r, base in enumerate(bases):
-                arrays[a * layout.max_ranks + r] = base + getattr(layout, region)
-        ops.hip_custom_communicator_write_words(
-            self._private + layout.private_region_ptr_arrays, arrays
+
+    # ---- THE HELPERS, after their callers: a config's handle, debug mode, a capture,
+    # the handshake, the watchdog and a fault. ----
+
+    @final
+    def _config_handle(self, config: Config) -> int:
+        """`config` AS C++ HOLDS IT: the table's, made at open; a forced one's, made at
+        its first call and kept. Raises naming the Error C++ refuses it for."""
+        handle = self._configs.get(config)
+        if handle is None:
+            handle = _make_config(config)
+            self._configs[config] = handle
+        return handle
+
+    @final
+    def _debug(
+        self,
+        op: str,
+        tensors: Mapping[str, torch.Tensor | None],
+        values: Mapping[str, int | float],
+        configs: Sequence[Config],
+        tuned_input: TunedInput | None,
+    ) -> None:
+        """THE CALL'S LINE IN DEBUG MODE (`debug`), printed and appended to the
+        process's file (`debug_path`) before it launches: when, the rank and the world,
+        the op, the communicator's quantization, whether a graph is being captured,
+        every tensor's shape, dtype and
+        strides (null where one is not given), the call's values, the configs it
+        launches in order (each field by name), and the table input their pick was
+        tuned at (null for a forced call). Off, nothing: no work on the call's path."""
+        if self._debug_out is None:
+            return
+        line = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "rank": self.device_group.rank(),
+            "world": self.device_group.size(),
+            "op": op,
+            "quantization": self.quantization,
+            "captured": torch.cuda.is_current_stream_capturing(),
+            "tensors": {
+                name: None
+                if t is None
+                else {
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype).removeprefix("torch."),
+                    "stride": list(t.stride()),
+                }
+                for name, t in tensors.items()
+            },
+            "values": dict(values),
+            "configs": [_record(c) for c in configs],
+            "table_input": (
+                None
+                if tuned_input is None
+                else asdict(tuned_input) | {"op": _QUALIFIED + tuned_input.op}
+            ),
+        }
+        logger.info(
+            "%s rank %d: %s %s %s launches %s (its pick tuned at %s)",
+            type(self).__name__,
+            line["rank"],
+            op,
+            self.quantization,
+            line["tensors"],
+            line["configs"],
+            line["table_input"],
         )
-        eager = [base + layout.staging for base in bases]
-        ops.hip_custom_communicator_write_words(
-            self._private + layout.private_tables,
-            eager + [0] * (layout.max_ranks - self._world),
-        )
+        self._debug_out.write(json.dumps(line) + "\n")
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
@@ -2897,6 +2864,145 @@ class HipCustomCommunicator:
             return False
         return True
 
+    def _watch(self) -> None:
+        """THE WATCHDOG, its own thread while open: reads the backend's fault record
+        and breaks the communicator on the first. A graph replay runs none of our host
+        code, so this is the only place a fault in one surfaces."""
+        while not self._stop_watching.wait(_WATCH_S):
+            fault = self._fault()
+            if fault is not None:
+                self._break(Error.faulted, f"a kernel's wait gave up: {fault}")
+                return
+
+    @final
+    def _break(self, error: Error, detail: str) -> None:
+        """Broken, once: every later call raises (`disabled`), every wait still on the
+        device leaves (`_abort`), and the cause and the status go to the log."""
+        with self._lock:
+            if isinstance(self.state, Broken | Abandoned | Closed):
+                return
+            self.state = Broken(error, detail)
+        self._abort()
+        logger.error(
+            "%s broken: %s: %s. %s",
+            type(self).__name__,
+            error.name,
+            detail,
+            self.status(),
+        )
+
+    def _fault(self) -> Fault | None:
+        """The fault this rank's status records, for the watchdog."""
+        return self.status().fault
+
+    def _abort(self) -> None:
+        """Every wait on this rank leaves at its next check: for a communicator the host
+        has given up on."""
+        if self._status_host is not None:
+            torch.ops._rocm_C.hip_custom_communicator_write_host(
+                self._status_host, _STATUS_ABORT, 1
+            )
+
+    def _guards_broken(self) -> str:
+        """THIS RANK'S GUARDS, every launch finished: "" where every word is the guard
+        word, else the first region a write went past, and where."""
+        if self._shared is None:
+            return ""
+        torch.cuda.synchronize(self.device)
+        layout = self._layout
+        for name, begin, end in (
+            ("staging", layout.staging_guard, layout.staging_guard_end),
+            ("partials", layout.partials_guard, layout.partials_guard_end),
+            ("unfenced", layout.unfenced_guard, layout.unfenced_guard_end),
+        ):
+            words = torch.ops._rocm_C.hip_custom_communicator_read_words(
+                self._shared + begin, (end - begin) // 4
+            )
+            for i, w in enumerate(words):
+                if w != layout.guard_word:
+                    return (
+                        f"the {name} guard's word {i} of {len(words)} is {w} (a "
+                        f"write past the {name} region)"
+                    )
+        return ""
+
+    # ---- ITS END: close, a collective, and what it frees; the abandon at exit; the
+    # context manager's. ----
+
+    @final
+    def close(self) -> None:
+        """Release what this communicator holds, NOW. Idempotent, and safe to call on a
+        disabled one.
+
+        Deterministic release rather than waiting to be collected, because the
+        collection is what cannot be relied on: dropping the last reference frees a
+        backend's IPC handles and device buffers through its destructor, but an
+        exception TRACEBACK holds the frames that hold the communicator -- so a failing
+        call is exactly when `del` does not release. This does.
+
+        A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
+        every rank's device finishes, a handshake over the CPU group, every rank
+        closes its peers' IPC mappings, a second handshake, then each frees its own
+        (`_on_close`). Each handshake
+        is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
+        costs at most that, never a hang: the failed handshake is logged and the
+        teardown carries on alone. Ordering that matters is the caller's -- close
+        before the process group is destroyed, and after any captured graph is gone.
+        """
+        if isinstance(self.state, Closed):
+            return
+        if isinstance(self.state, Capturing):
+            raise CommunicatorError(
+                Error.close_while_capturing,
+                "the graph being recorded would replay against released buffers; "
+                "leave the capture first",
+            )
+        # THE WATCHDOG STOPS FIRST: it reads the status words, which `_on_close`
+        # frees.
+        self._stop_watching.set()
+        if self._watchdog is not None:
+            self._watchdog.join()
+        with self._lock:
+            self.state = Closed()
+        self._on_close()
+        if self._debug_out is not None:
+            self._debug_out.close()
+            self._debug_out = None
+
+    def _on_close(self) -> None:
+        """CLOSE, A COLLECTIVE (STANDARDS 3.5, "lifetimes are collective"): every rank
+        calls it together. (a) every launch on this device finished, so nothing of ours
+        reads or writes a peer's memory; (b) handshake: every rank has stopped; (c)
+        every borrowed mapping closed; (d) handshake: every rank has closed its mappings
+        of ours (skipped when (b) failed: a peer that missed it would pair this one with
+        its own first); (e) our own buffers freed. A handshake that fails (a peer that
+        did not arrive within the bound) is logged and the teardown carries on alone.
+        After an abandon, only what it left. Idempotent."""
+        with self._teardown:
+            if self._shared is None and self._private is None:
+                self._release_status()
+                return
+            try:
+                torch.cuda.synchronize(self.device)
+            except RuntimeError as e:
+                # A KERNEL FAULT IS STICKY: logged, and the teardown carries on (a
+                # process must not die holding its peers' memory open).
+                logger.error(
+                    "HipCustomCommunicator close: the device did not finish: %s", e
+                )
+            stopped = self._barrier()
+            self._release_peers()
+            done = stopped and self._barrier()
+            self._release_own()
+            self._release_status()
+        if not (stopped and done):
+            logger.error(
+                "HipCustomCommunicator close: a peer did not arrive at the %s "
+                "handshake within %.0f s; it finished alone",
+                "first" if not stopped else "second",
+                self.timeout_seconds,
+            )
+
     def _release_peers(self) -> None:
         """EVERY BORROWED MAPPING closed: the peers' shared buffers and their captured
         inputs. Idempotent; carries on past an error."""
@@ -2941,132 +3047,55 @@ class HipCustomCommunicator:
             self._status_host = None
             self._status_device = None
 
-    def _on_close(self) -> None:
-        """CLOSE, A COLLECTIVE (STANDARDS 3.5, "lifetimes are collective"): every rank
-        calls it together. (a) every launch on this device finished, so nothing of ours
-        reads or writes a peer's memory; (b) handshake: every rank has stopped; (c)
-        every borrowed mapping closed; (d) handshake: every rank has closed its mappings
-        of ours (skipped when (b) failed: a peer that missed it would pair this one with
-        its own first); (e) our own buffers freed. A handshake that fails (a peer that
-        did not arrive within the bound) is logged and the teardown carries on alone.
-        After an abandon, only what it left. Idempotent."""
-        with self._teardown:
-            if self._shared is None and self._private is None:
-                self._release_status()
+    @final
+    def _abandoned(self, wait_s: float = ABANDON_WAIT_S) -> None:
+        """ABANDONED, from the exit hook (`abandon_open`): torn down ALONE, never
+        waiting on a peer (STANDARDS 3.5). The watchdog told to stop (not joined: a
+        signal handler may be running this); every wait on this rank told to leave
+        (`_abort`); the device given `wait_s` to finish; every BORROWED peer mapping
+        closed; and, only once the device finished, our own shared and private buffers
+        freed (freeing memory a running kernel reads would fault it). The status words
+        stay: the watchdog may still read them. A no-op while another teardown runs."""
+        with self._lock:
+            if not self.state.holds:
                 return
-            try:
-                torch.cuda.synchronize(self.device)
-            except RuntimeError as e:
-                # A KERNEL FAULT IS STICKY: logged, and the teardown carries on (a
-                # process must not die holding its peers' memory open).
-                logger.error(
-                    "HipCustomCommunicator close: the device did not finish: %s", e
-                )
-            stopped = self._barrier()
-            self._release_peers()
-            done = stopped and self._barrier()
-            self._release_own()
-            self._release_status()
-        if not (stopped and done):
-            logger.error(
-                "HipCustomCommunicator close: a peer did not arrive at the %s "
-                "handshake within %.0f s; it finished alone",
-                "first" if not stopped else "second",
-                self.timeout_seconds,
-            )
-
-    def status(self) -> Status:
-        """This rank's status, read from host-mapped memory, so it never waits on the
-        device: valid even while a kernel is hung."""
-        if self._status_host is None:
-            return Status(abort=False, fault=None)
-        words = torch.ops._rocm_C.hip_custom_communicator_read_host(
-            self._status_host, self._layout.status_fields
-        )
-        return Status(
-            abort=words[_STATUS_ABORT] != 0, fault=_fault_of(words, self._khz)
-        )
-
-    def signals(self) -> list[Flag]:
-        """Every flag of this rank's signals, each `clear` between launches. Every
-        launch on the device finished first, here (read mid-launch, a barrier shows its
-        peers' flags set and this rank's not yet cleared); a hung launch hangs this
-        query too (`status()` is readable while a kernel waits)."""
-        if self._shared is None:
-            return []
-        torch.cuda.synchronize(self.device)
-        layout = self._layout
-        words = torch.ops._rocm_C.hip_custom_communicator_read_words(
-            self._shared + layout.signals, layout.signals_bytes // 4
-        )
-        parity = layout.max_blocks * layout.max_ranks
-        return [
-            Flag(p, b, w, FlagState(words[p * parity + b * layout.max_ranks + w]))
-            for p in range(2)
-            for b in range(layout.max_blocks)
-            for w in range(layout.max_ranks)
-        ]
-
-    def _guards_broken(self) -> str:
-        """THIS RANK'S GUARDS, every launch finished: "" where every word is the guard
-        word, else the first region a write went past, and where."""
-        if self._shared is None:
-            return ""
-        torch.cuda.synchronize(self.device)
-        layout = self._layout
-        for name, begin, end in (
-            ("staging", layout.staging_guard, layout.staging_guard_end),
-            ("partials", layout.partials_guard, layout.partials_guard_end),
-            ("unfenced", layout.unfenced_guard, layout.unfenced_guard_end),
-        ):
-            words = torch.ops._rocm_C.hip_custom_communicator_read_words(
-                self._shared + begin, (end - begin) // 4
-            )
-            for i, w in enumerate(words):
-                if w != layout.guard_word:
-                    return (
-                        f"the {name} guard's word {i} of {len(words)} is {w} (a "
-                        f"write past the {name} region)"
-                    )
-        return ""
-
-    def check_after(self, what: str) -> None:
-        """EVERY EXPECTATION AFTER LAUNCHES, as C++ checks after each launch in its checked mode
-        (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_CHECKED=1), for launches it could not check
-        itself: a CUDA graph's replays (`what` names them). Every launch on the device
-        finished, then no write past a region of this rank's shared buffer (its guards),
-        no fault or abort in its status, every signal clear (read between two barriers
-        of every rank: a collective, every rank calls it). Raises CommunicatorError
-        naming the first that fails."""
-        if self._shared is None:
+            self.state = Abandoned()
+        self._stop_watching.set()
+        if self._shared is None and self._private is None:
             return
-        broken = self._guards_broken()
-        if broken:
-            raise CommunicatorError(Error.guard_overwritten, f"after {what}: {broken}")
-        status = self.status()
-        if status.abort or status.fault is not None:
-            raise CommunicatorError(Error.faulted, f"after {what}: {status}")
-        # EVERY SIGNAL CLEAR once every rank finished and none started its next launch: read
-        # between two barriers of every rank (a faster peer's next launch would set its first
-        # barrier's flags here: the tests' _assert_clean).
-        torch.distributed.barrier(group=self.cpu_group)
-        left = [f for f in self.signals() if f.state is not FlagState.clear]
-        torch.distributed.barrier(group=self.cpu_group)
-        if left:
-            raise CommunicatorError(
-                Error.signals_left_set, f"after {what}: {len(left)}, {left[:4]}"
-            )
+        if not self._teardown.acquire(blocking=False):
+            return
+        try:
+            self._abort()
+            finished = _synchronized_within(self.device, wait_s)
+            self._release_peers()
+            if finished:
+                self._release_own()
+        finally:
+            self._teardown.release()
 
-    def _fault(self) -> Fault | None:
-        """The fault this rank's status records, for the watchdog."""
-        return self.status().fault
+    @final
+    def __enter__(self) -> "HipCustomCommunicator":
+        return self
 
-    def _abort(self) -> None:
-        """Every wait on this rank leaves at its next check: for a communicator the host
-        has given up on."""
-        if self._status_host is not None:
-            torch.ops._rocm_C.hip_custom_communicator_write_host(
-                self._status_host, _STATUS_ABORT, 1
+    @final
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # WARNS, never releases. Doing GPU or IPC work here would run at an arbitrary
+        # moment -- interpreter shutdown included, where the runtime may already be gone
+        # -- so this only reports that a release was left to chance. Same bargain as an
+        # unclosed file's ResourceWarning. At shutdown the exit hook has already moved
+        # it to Abandoned, which holds nothing.
+        if self.state.holds:
+            warnings.warn(
+                f"{type(self).__name__} was never closed; its peer handles and buffers "
+                f"were left to garbage collection. Use `with make_communicator(...) as "
+                f"comm:` "
+                f"or call `close()`.",
+                ResourceWarning,
+                stacklevel=2,
             )
 
 
