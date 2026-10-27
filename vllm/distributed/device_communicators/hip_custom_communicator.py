@@ -57,6 +57,25 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# WHAT THIS MODULE EXPORTS: the communicator; what it raises (CommunicatorError, its
+# Error the reason); and the configs its ops take (`config=`, a forced call's: the
+# tuner's, the tests'). Everything else is its own.
+__all__ = [
+    "HipCustomCommunicator",
+    "CommunicatorError",
+    "Error",
+    "AllReduceConfig",
+    "AllReduceRmsNormConfig",
+    "AllReduceAddRmsNormConfig",
+    "AllReduceAddAttnResRmsNormConfig",
+    "RmsNormConfig",
+    "AddRmsNormConfig",
+    "AddAttnResRmsNormConfig",
+    "AllReduceRmsNormSplitConfig",
+    "AllReduceAddRmsNormSplitConfig",
+    "AllReduceAddAttnResRmsNormSplitConfig",
+]
+
 
 # ---- CONSTANTS: the names and numbers the module is built on. ----
 
@@ -765,75 +784,18 @@ class Arguments:
 # ---- HELPERS: free functions, each taking what it uses. ----
 
 
-def should(
-    op: Op,
-    input: torch.Tensor,
-    max_rows: int,
-    max_cols: int,
-    weight: torch.Tensor | None = None,
-) -> bool:
-    """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
-    runs on an open communicator whose exchange was sized for `max_rows` rows of at most
-    `max_cols`: [rows, cols] in a dtype the kernels are compiled at, a norm's weight in
-    its dtype or fp32, whole packs a row, inside that box (C++ sized every region for
-    the box at every dtype, so a call inside it fits). Python alone, no C++ call, as
-    vLLM's `should_custom_ar`; C++ refuses no call this admits."""
-    if (
-        input.dtype not in _INPUT_DTYPES
-        or not input.is_contiguous()
-        or input.numel() == 0
-        or input.dim() != 2
-    ):
-        return False
-    if weight is not None and weight.dtype not in (input.dtype, *_WEIGHT_DTYPES):
-        return False
-    rows, row = input.shape
-    return (
-        row * input.element_size() % _PACK_BYTES == 0
-        and rows <= max_rows
-        and row <= max_cols
-    )
-
-
-def config_of_record(c: Mapping[str, Any]) -> Config:
-    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as its
-    kernel's config: its algorithm one of the kernel's, and a field the class holds
-    (a norm on rows' algorithm, tile_k without K) the class's."""
-    cls = _CONFIGS[c["kernel"]]
-    if c["algorithm"] not in cls.algorithms:
-        raise ValueError(f"{c['kernel']} has no algorithm {c['algorithm']}")
-    own = {f.name for f in fields(cls)}
-    for k in ("algorithm", "tile_k"):
-        if k not in own and c[k] != getattr(cls, k):
-            raise ValueError(f"{c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}")
-    return cls(**{k: c[k] for k in _CONFIG_KEYS if k in own})
-
-
-def record_refused(op: Op, c: Mapping[str, Any]) -> Error | None:
-    """WHAT A CONFIG AS THE TABLE HOLDS IT (`c`, `_CONFIG_KEYS`) FORCED ON `op` IS
-    REFUSED FOR, or None (a caller holding configs flat, gd's): another op's kernel or
-    an algorithm its kernel lacks, no_such_kernel; tile_k on a kernel without K,
-    field_not_this_templates."""
-    cls = _CONFIGS.get(c["kernel"])
-    if cls is None or c["kernel"] != op or c["algorithm"] not in cls.algorithms:
-        return Error.no_such_kernel
-    if "tile_k" not in {f.name for f in fields(cls)} and c["tile_k"] != cls.tile_k:
-        return Error.field_not_this_templates
-    return None
-
-
 def parse_tuned_table(path: Path, arch: str) -> TunedTable | None:
     """THE TUNED TABLE AT `path` ON `arch` (the file, a table an arch: gd's
     `TunedTables`), parsed and checked, or None where the file holds none for it. A
     table that is not sound raises, naming the entry: its keys `_TABLE_KEYS`; every
     config its op's (qualified), every field `_CONFIG_KEYS` names in that order, read as
-    its op's config (`config_of_record`; builds.py compiles every config, and C++
-    refuses a config it did not, not_built); every input one of `TUNED_OPS`, in a
-    mode, at a world, with a width and tokens, tuned once; every pick one input's, its
-    configs one kernel of the input's op, or our all-reduce then the op's norm on rows,
-    an exact input's moving
-    nothing quantized, a quantized one's all-reduce INT4; every tuned op an input in
-    each mode at every world the table tunes (the lookup reads one there)."""
+    its op's config (its algorithm one of its kernel's; builds.py compiles every
+    config, and C++ refuses a config it did not, not_built); every input one of
+    `TUNED_OPS`, in a mode, at a world, with a width and tokens, tuned once; every pick
+    one input's, its configs one kernel of the input's op, or our all-reduce then the
+    op's norm on rows, an exact input's moving nothing quantized, a quantized one's
+    all-reduce INT4; every tuned op an input in each mode at every world the table
+    tunes (the lookup reads one there)."""
     tables = json.loads(path.read_text())
     if arch not in tables:
         return None
@@ -857,10 +819,20 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | None:
                 f"{where}: quantize_from_bytes is null for an exact config, an INT4 "
                 "one's count of bytes"
             )
-        try:
-            config = config_of_record(c)
-        except ValueError as e:
-            raise ValueError(f"{where}: {e}") from None
+        # AS ITS KERNEL'S CONFIG: its algorithm one of the kernel's, and a field the
+        # class holds (a norm on rows' algorithm, tile_k without K) the class's.
+        cls = _CONFIGS[c["kernel"]]
+        if c["algorithm"] not in cls.algorithms:
+            raise ValueError(
+                f"{where}: {c['kernel']} has no algorithm {c['algorithm']}"
+            )
+        own = {f.name for f in fields(cls)}
+        for k in ("algorithm", "tile_k"):
+            if k not in own and c[k] != getattr(cls, k):
+                raise ValueError(
+                    f"{where}: {c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}"
+                )
+        config = cls(**{k: c[k] for k in _CONFIG_KEYS if k in own})
         configs.append(config)
     picks: dict[TunedInput, Config | SplitConfig] = {}
     for i, k in enumerate(raw["picks"]):
@@ -1282,12 +1254,21 @@ class HipCustomCommunicator:
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce(input)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
+        # kernels are compiled at, whole packs a
+        # row, inside the box the exchange was sized for (C++ sized every region for
+        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
+        # C++ refuses no call this admits.
         return (
             not self.disabled
             and self.state is not None
-            and should(
-                "all_reduce", input, self.arguments.max_rows, self.arguments.max_cols
-            )
+            and input.dtype in _INPUT_DTYPES
+            and input.is_contiguous()
+            and input.dim() == 2
+            and input.numel() > 0
+            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[0] <= self.arguments.max_rows
+            and input.shape[1] <= self.arguments.max_cols
         )
 
     @final
@@ -1363,16 +1344,22 @@ class HipCustomCommunicator:
         self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
+        # kernels are compiled at, its weight in its dtype or fp32, whole packs a
+        # row, inside the box the exchange was sized for (C++ sized every region for
+        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
+        # C++ refuses no call this admits.
         return (
             not self.disabled
             and self.state is not None
-            and should(
-                "all_reduce_rms_norm",
-                input,
-                self.arguments.max_rows,
-                self.arguments.max_cols,
-                weight,
-            )
+            and input.dtype in _INPUT_DTYPES
+            and input.is_contiguous()
+            and input.dim() == 2
+            and input.numel() > 0
+            and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
+            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[0] <= self.arguments.max_rows
+            and input.shape[1] <= self.arguments.max_cols
         )
 
     @final
@@ -1522,16 +1509,22 @@ class HipCustomCommunicator:
         self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(input, ..., weight, ...)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
+        # kernels are compiled at, its weight in its dtype or fp32, whole packs a
+        # row, inside the box the exchange was sized for (C++ sized every region for
+        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
+        # C++ refuses no call this admits.
         return (
             not self.disabled
             and self.state is not None
-            and should(
-                "all_reduce_add_rms_norm",
-                input,
-                self.arguments.max_rows,
-                self.arguments.max_cols,
-                weight,
-            )
+            and input.dtype in _INPUT_DTYPES
+            and input.is_contiguous()
+            and input.dim() == 2
+            and input.numel() > 0
+            and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
+            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[0] <= self.arguments.max_rows
+            and input.shape[1] <= self.arguments.max_cols
         )
 
     @final
@@ -1690,15 +1683,21 @@ class HipCustomCommunicator:
     @final
     def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(input, ...)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
+        # kernels are compiled at, whole packs a
+        # row, inside the box the exchange was sized for (C++ sized every region for
+        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
+        # C++ refuses no call this admits.
         return (
             not self.disabled
             and self.state is not None
-            and should(
-                "all_reduce_add_attn_res_rms_norm",
-                input,
-                self.arguments.max_rows,
-                self.arguments.max_cols,
-            )
+            and input.dtype in _INPUT_DTYPES
+            and input.is_contiguous()
+            and input.dim() == 2
+            and input.numel() > 0
+            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[0] <= self.arguments.max_rows
+            and input.shape[1] <= self.arguments.max_cols
         )
 
     @final
