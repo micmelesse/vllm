@@ -468,9 +468,8 @@ struct CommsState {
 
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names = std::vector<std::string>;
-using OpenWire =
-    std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>,
-               std::string, std::vector<int64_t>>;
+using OpenWire = std::tuple<std::optional<int64_t>, int64_t,
+                            std::vector<int64_t>, std::string>;
 using GraphMetaWire = std::tuple<std::optional<int64_t>, std::vector<int64_t>,
                                  std::vector<int64_t>>;
 // AN ERROR CODE ACROSS THE BOUNDARY: none when the call ran, else the Error's
@@ -1120,10 +1119,9 @@ std::optional<Error> attn_res_tensors(
 // OPEN: the state of a communicator at `rank` of `world` on `device`, serving
 // `max_rows` rows of at most `max_cols` columns, a wait giving up after
 // `timeout_seconds`: (the Error it is refused for, or none; the handle, 0 where
-// refused; this rank's regions' IPC handles, their bytes; the device's arch;
-// the capacity: max_rows, max_cols, the partials' and staging's bytes, then
-// each op's most bytes a call). A device the build does not run on is refused,
-// nothing allocated: the caller does not run here.
+// refused; this rank's regions' IPC handles, their bytes; the device's arch). A
+// device the build does not run on is refused, nothing allocated: the caller
+// does not run here.
 OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
                                       int64_t device, int64_t max_rows,
                                       int64_t max_cols,
@@ -1133,21 +1131,21 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   // build's target with our kernels' code object on it (a kernel's attributes
   // answer exactly when it does). ----
   if (!all_ints({rank, world, device}))
-    return {error_code(Error::field_out_of_range), 0, {}, "", {}};
+    return {error_code(Error::field_out_of_range), 0, {}, ""};
   if (rank < 0 || rank >= world || !world_built(static_cast<int>(world)))
-    return {error_code(Error::world_not_built), 0, {}, "", {}};
+    return {error_code(Error::world_not_built), 0, {}, ""};
   if (max_rows < 1 || max_cols < 1)
-    return {error_code(Error::field_not_positive), 0, {}, "", {}};
+    return {error_code(Error::field_not_positive), 0, {}, ""};
   hipDeviceProp_t prop;
   if (hipGetDeviceProperties(&prop, static_cast<int>(device)) != hipSuccess) {
     (void)hipGetLastError();
-    return {error_code(Error::device_not_built), 0, {}, "", {}};
+    return {error_code(Error::device_not_built), 0, {}, ""};
   }
   const std::string name = prop.gcnArchName;
   const std::string arch =
       name.substr(0, name.find(':'));  // gfx950:sramecc+:xnack-
   if (hipSetDevice(static_cast<int>(device)) != hipSuccess)
-    return {error_code(Error::hip_failed), 0, {}, "", {}};
+    return {error_code(Error::hip_failed), 0, {}, ""};
   // THE BUILD RUNS HERE where the device has our code object: a compiled
   // kernel's attributes answer exactly then.
   hipFuncAttributes attrs;
@@ -1155,7 +1153,7 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
       hipFuncGetAttributes(&attrs, kAllReduceInstances[0].kernel);
   (void)hipGetLastError();
   if (found != hipSuccess)
-    return {error_code(Error::device_not_built), 0, {}, "", {}};
+    return {error_code(Error::device_not_built), 0, {}, ""};
   int khz = 0, lds = 0, cus = 0, threads_a_cu = 0, wave = 0;
   size_t scratch = 0;
   if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
@@ -1170,7 +1168,7 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
                             hipDeviceAttributeMaxThreadsPerMultiProcessor,
                             static_cast<int>(device)) != hipSuccess ||
       hipDeviceGetLimit(&scratch, hipExtLimitScratchMax) != hipSuccess)
-    return {error_code(Error::hip_failed), 0, {}, "", {}};
+    return {error_code(Error::hip_failed), 0, {}, ""};
 
   // ---- THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own
   // buffers are sized from the problem it serves*): each region holds its
@@ -1327,37 +1325,12 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   if (!made || hipDeviceSynchronize() != hipSuccess) {
     (void)hipGetLastError();
     (void)hip_custom_communicator_free(reinterpret_cast<int64_t>(s));
-    return {error_code(Error::hip_failed), 0, {}, "", {}};
+    return {error_code(Error::hip_failed), 0, {}, ""};
   }
 
-  // ---- THE ANSWER: the handle, the regions' IPC handles' bytes, the arch, the
-  // capacity: the box, the regions, and each op's most bytes a call (its
-  // partials a call's bytes at most, its staging the whole call). ----
-  std::vector<int64_t> capacity{max_rows, max_cols, partials_bytes,
-                                staging_bytes};
-  // EACH OP'S MOST BYTES A CALL, in Python's Op order: an all-reduce's the most
-  // its partials hold at its algorithms' widest keep a byte, at most its
-  // staging; a norm on rows', which keeps nothing, its staging.
-  const auto most_bytes = [&](const auto& algorithms) {
-    int64_t per_byte = 0;
-    for (const auto& a : algorithms)
-      per_byte = std::max(
-          per_byte, partials_need(a.algorithm, 1, 1, static_cast<int>(world),
-                                  kPackBytes) /
-                        kPackBytes);
-    return per_byte == 0 ? staging_bytes
-                         : std::min(partials_bytes / per_byte, staging_bytes);
-  };
-  capacity.push_back(most_bytes(AllReduceBuildConfig::algorithms));
-  capacity.push_back(most_bytes(AllReduceRmsNormBuildConfig::algorithms));
-  capacity.push_back(most_bytes(AllReduceAddRmsNormBuildConfig::algorithms));
-  capacity.push_back(
-      most_bytes(AllReduceAddAttnResRmsNormBuildConfig::algorithms));
-  capacity.push_back(staging_bytes);  // rms_norm
-  capacity.push_back(staging_bytes);  // add_rms_norm
-  capacity.push_back(staging_bytes);  // add_attn_res_rms_norm
-  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, s->device.arch,
-          capacity};
+  // ---- THE ANSWER: the handle, the regions' IPC handles' bytes, the arch.
+  // ----
+  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, s->device.arch};
 }
 
 // CONNECT: the symmetric memory joined: every peer's regions opened from their

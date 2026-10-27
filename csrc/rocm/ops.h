@@ -59,8 +59,7 @@ void paged_attention(
 // each op once, on the state, its tensors and values, then its config's fields
 // as plain values. EVERY ERROR IS A VALUE: each returns the Error's number it
 // was refused for, or none (hip_custom_communicator.cu); none raises.
-std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string,
-           std::vector<int64_t>>
+std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string>
 hip_custom_communicator_open(int64_t rank, int64_t world, int64_t device,
                              int64_t max_rows, int64_t max_cols,
                              double timeout_seconds);

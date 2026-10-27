@@ -104,7 +104,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "hip_custom_communicator_open(int rank, int world, int device, int "
       "max_rows, int max_cols, float timeout_seconds) -> (int?, int, int[], "
-      "str, int[])",
+      "str)",
       &hip_custom_communicator_open);
   rocm_ops.def(
       "hip_custom_communicator_connect(int state, int[] handles) -> int?",

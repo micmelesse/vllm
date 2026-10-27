@@ -15,7 +15,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     CommunicatorError,
     Error,
     HipCustomCommunicator,
-    parse_tuned_configs,
+    parse_tuned_table,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -527,7 +527,7 @@ def test_tuned_table():
     every op has a pick at Kimi-K3's decode and prefill sizes."""
     import vllm._rocm_C  # noqa: F401
 
-    tuned = parse_tuned_configs(_TABLE, "gfx950")
+    tuned = parse_tuned_table(_TABLE, "gfx950")
     assert tuned is not None, "no tuned table for gfx950"
     for op in [
         "all_reduce",
