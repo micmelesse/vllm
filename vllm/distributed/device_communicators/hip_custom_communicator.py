@@ -474,7 +474,8 @@ class AllReduceAddAttnResRmsNormConfig:
 
 @dataclass(frozen=True)
 class RmsNormConfig:
-    """THE RMSNORM ON THIS RANK'S ROWS' CONFIG."""
+    """THE RMSNORM ON THIS RANK'S ROWS' CONFIG: the second launch of
+    all_reduce_rms_norm's split (its rms_norm_ fields), no op of its own."""
 
     kernel: ClassVar[str] = "rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)

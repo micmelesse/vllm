@@ -239,16 +239,6 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 
-// rms_norm (its kernel rms_norm).
-struct RmsNormBuildConfig {
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const RmsNormBuildConfig&) const = default;
-};
 
 // add_rms_norm (its kernel add_rms_norm).
 struct AddRmsNormBuildConfig {
