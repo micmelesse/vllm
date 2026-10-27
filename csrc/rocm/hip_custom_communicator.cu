@@ -731,19 +731,6 @@ constexpr void every_algorithm(F&& f) {
     f(a.algorithm);
 }
 
-// A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its
-// rows starting on whole packs of `pack` bytes, the build's ({stride_m,
-// stride_n} a buffer, in elements of `dtype`; a vector's stride_m 0).
-inline std::optional<Error> layout_refused(
-    at::ScalarType dtype, int64_t pack,
-    std::initializer_list<std::pair<int64_t, int64_t>> strides) {
-  for (const auto& [m, n] : strides) {
-    if (n != 1) return Error::inner_stride_not_one;
-    if (m * elem_bytes(dtype) % pack != 0) return Error::row_stride_not_packs;
-  }
-  return std::nullopt;
-}
-
 // THE CHECK OF A CALL'S CONFIG (its build, of its op's type B, its grid, and
 // the bytes it quantizes from) on a call of `m` rows of `n`: the world and the
 // dtype built; the config's ranges, each the hardware's (STANDARDS 3.2): the
@@ -1986,14 +1973,14 @@ ErrorCode hip_custom_communicator_all_reduce_rms_norm(
                   s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
                   grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{output_stride_m, output_stride_n},
-                          {input_stride_m, input_stride_n}}))
-    return error_code(e);
-  if (const std::optional<Error> e = layout_refused(
-          weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (output_stride_n != 1 || input_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none).
   const int64_t partials_rows =
@@ -2179,16 +2166,17 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
                   s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
                   grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{output_stride_m, output_stride_n},
-                          {residual_output_stride_m, residual_output_stride_n},
-                          {input_stride_m, input_stride_n},
-                          {residual_stride_m, residual_stride_n}}))
-    return error_code(e);
-  if (const std::optional<Error> e = layout_refused(
-          weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (output_stride_n != 1 || residual_output_stride_n != 1 ||
+      input_stride_n != 1 || residual_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      residual_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      residual_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none), at its row stride: the exact pull two-shot's row is its scale's pack
   // then the row (partials_need); the INT4 build's rows are the row alone, its
@@ -2429,32 +2417,33 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
                   s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
                   grid, quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{input_stride_m, input_stride_n},
-                          {blocks_stride_m, blocks_stride_n},
-                          {blocks_stride_r, blocks_stride_n},
-                          {0, norm_weight_stride_n},
-                          {0, qk_weight_stride_n},
-                          {prefix_output_stride_m, prefix_output_stride_n},
-                          {output_stride_m, output_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (input_stride_n != 1 || blocks_stride_n != 1 ||
+      norm_weight_stride_n != 1 || qk_weight_stride_n != 1 ||
+      prefix_output_stride_n != 1 || output_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      blocks_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      blocks_stride_r * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      prefix_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
   // THE OPTIONAL BUFFERS, checked only when given: a missing one is a null
   // pointer with zero strides, which is no layout at all (a prefix-less call
   // was refused as `inner_stride_not_one`, 2026-10-13).
-  if (prefix_ptr != nullptr)
-    if (const std::optional<Error> e = layout_refused(
-            dtype, build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
-      return error_code(e);
-  if (output_norm_weight_ptr != nullptr)
-    if (const std::optional<Error> e = layout_refused(
-            dtype, build.pack_bytes, {{0, output_norm_weight_stride_n}}))
-      return error_code(e);
-  if (block_output_ptr != nullptr)
-    if (const std::optional<Error> e =
-            layout_refused(dtype, build.pack_bytes,
-                           {{block_output_stride_m, block_output_stride_n}}))
-      return error_code(e);
+  if (prefix_ptr != nullptr && prefix_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (prefix_ptr != nullptr &&
+      prefix_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (output_norm_weight_ptr != nullptr && output_norm_weight_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (block_output_ptr != nullptr && block_output_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (block_output_ptr != nullptr &&
+      block_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none).
   const int64_t partials_rows =
@@ -2640,14 +2629,14 @@ ErrorCode hip_custom_communicator_rms_norm(
           refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{output_stride_m, output_stride_n},
-                          {input_stride_m, input_stride_n}}))
-    return error_code(e);
-  if (const std::optional<Error> e = layout_refused(
-          weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (output_stride_n != 1 || input_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
@@ -2772,16 +2761,17 @@ ErrorCode hip_custom_communicator_add_rms_norm(
           refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{output_stride_m, output_stride_n},
-                          {residual_output_stride_m, residual_output_stride_n},
-                          {input_stride_m, input_stride_n},
-                          {residual_stride_m, residual_stride_n}}))
-    return error_code(e);
-  if (const std::optional<Error> e = layout_refused(
-          weight_dtype, build.pack_bytes, {{0, weight_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (output_stride_n != 1 || residual_output_stride_n != 1 ||
+      input_stride_n != 1 || residual_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      residual_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      residual_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (weight_stride_n != 1) return error_code(Error::inner_stride_not_one);
   const int shared_memory_bytes = 0;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   const bool chunked = n > build.tile_n;
@@ -2939,31 +2929,32 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
           refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
                   quantize_from_bytes, dtype, m, n))
     return error_code(e);
-  if (const std::optional<Error> e =
-          layout_refused(dtype, build.pack_bytes,
-                         {{input_stride_m, input_stride_n},
-                          {blocks_stride_m, blocks_stride_n},
-                          {blocks_stride_r, blocks_stride_n},
-                          {0, norm_weight_stride_n},
-                          {0, qk_weight_stride_n},
-                          {prefix_output_stride_m, prefix_output_stride_n},
-                          {output_stride_m, output_stride_n}}))
-    return error_code(e);
+  // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
+  // rows on whole packs of the build's.
+  if (input_stride_n != 1 || blocks_stride_n != 1 ||
+      norm_weight_stride_n != 1 || qk_weight_stride_n != 1 ||
+      prefix_output_stride_n != 1 || output_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      blocks_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      blocks_stride_r * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      prefix_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
+      output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
   // THE OPTIONAL BUFFERS, checked only when given
   // (all_reduce_add_attn_res_rms_norm's).
-  if (prefix_ptr != nullptr)
-    if (const std::optional<Error> e = layout_refused(
-            dtype, build.pack_bytes, {{prefix_stride_m, prefix_stride_n}}))
-      return error_code(e);
-  if (output_norm_weight_ptr != nullptr)
-    if (const std::optional<Error> e = layout_refused(
-            dtype, build.pack_bytes, {{0, output_norm_weight_stride_n}}))
-      return error_code(e);
-  if (block_output_ptr != nullptr)
-    if (const std::optional<Error> e =
-            layout_refused(dtype, build.pack_bytes,
-                           {{block_output_stride_m, block_output_stride_n}}))
-      return error_code(e);
+  if (prefix_ptr != nullptr && prefix_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (prefix_ptr != nullptr &&
+      prefix_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
+  if (output_norm_weight_ptr != nullptr && output_norm_weight_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (block_output_ptr != nullptr && block_output_stride_n != 1)
+    return error_code(Error::inner_stride_not_one);
+  if (block_output_ptr != nullptr &&
+      block_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+    return error_code(Error::row_stride_not_packs);
   // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS
   // (attn_res.cuh's attn_res_wide): [tile_m][num_blocks + 1] floats.
   const int shared_memory_bytes =
