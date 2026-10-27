@@ -548,6 +548,10 @@ struct CommsState {
   uint64_t timeout_ticks = 0;
   int64_t staging_bytes = 0;   // the staging region's: the largest call's input or payload
   int64_t partials_bytes = 0;  // the partials region's: the most any two-shot keeps
+  // THE DEVICE'S LIMITS a launch is checked against (open asks them once): a block's LDS, its
+  // compute units, the threads a CU holds, and a lane's scratch, the device's scratch over its
+  // every lane by kScratchShares.
+  int64_t lds_bytes = 0, compute_units = 0, threads_a_cu = 0, scratch_a_lane = 0;
   // THE ARENA'S LAYOUT, byte offsets: the signals (the barrier flags), the staging (what this
   // rank publishes: an eager call's copy, an INT4 payload, a pushed two-shot's inbox), the partials
   // (its share's sums; the add-RMSNorm pull's INT4 row scales at their end), the unfenced region
@@ -1736,9 +1740,17 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world, int64_t devic
   (void)hipGetLastError();
   if (found != hipSuccess) return {error_code(Error::device_not_built), 0, {}, "", {}};
   if (arch != kTargetArch) return {error_code(Error::device_not_tuned), 0, {}, "", {}};
-  int khz = 0;
+  int khz = 0, lds = 0, cus = 0, threads_a_cu = 0;
+  size_t scratch = 0;
   if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, static_cast<int>(device)) !=
-      hipSuccess)
+          hipSuccess ||
+      hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock,
+                            static_cast<int>(device)) != hipSuccess ||
+      hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount,
+                            static_cast<int>(device)) != hipSuccess ||
+      hipDeviceGetAttribute(&threads_a_cu, hipDeviceAttributeMaxThreadsPerMultiProcessor,
+                            static_cast<int>(device)) != hipSuccess ||
+      hipDeviceGetLimit(&scratch, hipExtLimitScratchMax) != hipSuccess)
     return {error_code(Error::hip_failed), 0, {}, "", {}};
 
   // ---- THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own buffers are sized from
@@ -1780,6 +1792,10 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world, int64_t devic
   s->device = static_cast<int>(device);
   s->max_rows = max_rows;
   s->timeout_ticks = static_cast<uint64_t>(timeout_seconds * khz * 1000);
+  s->lds_bytes = lds;
+  s->compute_units = cus;
+  s->threads_a_cu = threads_a_cu;
+  s->scratch_a_lane = static_cast<int64_t>(scratch) / (int64_t{cus} * threads_a_cu) / kScratchShares;
   s->staging_bytes = staging_bytes;
   s->partials_bytes = partials_bytes;
   const auto aligned = [](int64_t bytes) { return (bytes + 4095) / 4096 * 4096; };
@@ -2085,8 +2101,25 @@ ErrorCode hip_custom_communicator_all_reduce(int64_t state, torch::Tensor& input
   const void* kernel = nullptr;
   if (!with_instance<OpType::all_reduce>(build, s.world, dtype, dtype, contiguous, /*chunked=*/false, tail, quantize_int4, [&]<Instance I>() { kernel = kernel_pointer<I>(); }))
     return error_code(Error::tile_not_built);
-  if (const std::optional<Error> failed = check_kernel(kernel, grid, block, shared_memory_bytes, true))
-    return error_code(failed);
+  // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block and the LDS at the
+  // launch; the scratch only when the dispatch runs, aborting the queue and the process with it
+  // (the tune's crashes, 2026-10-24: AttnRes at 64 threads, tile 4x16384x4, 21 KiB a lane).
+  hipFuncAttributes attributes;
+  if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess) return error_code(Error::hip_failed);
+  if (block_x > attributes.maxThreadsPerBlock) return error_code(Error::block_too_large);
+  if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes > s.lds_bytes)
+    return error_code(Error::lds_too_large);
+  if (static_cast<int64_t>(attributes.localSizeBytes) > s.scratch_a_lane)
+    return error_code(Error::scratch_too_large);
+  // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on every peer arrives,
+  // so a grid past the blocks the device holds at once can hang (HIP never refuses it). The
+  // blocks a CU holds from the kernel's registers, LDS and the CU's wave slots, times the CUs.
+  int blocks_a_cu = 0;
+  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_a_cu, kernel,
+                                                   static_cast<int>(block_x),
+                                                   shared_memory_bytes) != hipSuccess)
+    return error_code(Error::hip_failed);
+  if (grid_x > blocks_a_cu * s.compute_units) return error_code(Error::grid_not_resident);
   // ---- ITS VIEWS OF THE REGIONS, by its algorithm, in elements: a view [m, n] at strides
   // [stride_m, stride_n] (the line push's inbox [slot, m, n]); an empty view (size 0) where it
   // reads none. The kernels find a one-shot's payload in the staging from the input's sizes.
