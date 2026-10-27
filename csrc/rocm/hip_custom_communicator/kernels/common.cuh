@@ -84,11 +84,16 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // 2026-10-16T03-10-32Z).
 // =================================================================================================
 
-constexpr int kInt4Group = 32;           // elements a group
-constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's values
-constexpr int kInt4WordBytes = 4;        // a pack's values
-constexpr int kInt4ScaleBytes = 2;       // a group's scale
+// THE FORMAT'S DEFINITION (the quantization `int4`), its one statement: a group of 32 values and
+// its fp16 scale, its values a word of 8 a pack. Not a tunable: a group size is the format's
+// accuracy and bytes (a scale's 2 bytes a group's 16), and 32 is the size whose words fill a
+// quad's packs (above); another size is another format, with its own name and layout.
+constexpr int kInt4Group = 32;           // values a group
+constexpr int kInt4WordBytes = 4;        // a pack's values, 8 of 4 bits
+constexpr int kInt4ScaleBytes = 2;       // a group's scale, fp16
 constexpr uint32_t kInt4ZeroWord = 0x88888888u;  // a word of zeros (each value stored q + 8)
+// A GROUP'S PACKS: a pack is a word of its group's values.
+constexpr int kInt4GroupPacks = kInt4Group / (2 * kInt4WordBytes);
 
 // THE ADD-RMSNORM PULL TWO-SHOT'S SCALE SLOT: each partials row's fp32 scale in a slot before the
 // row, kScaleSlotBytes whatever the build's pack, and the row whole slots (scale_slot_row), so
@@ -126,8 +131,8 @@ __host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 // (two words) and the flag twice (the line's two halves each carry it: a reader trusts the line
 // only whole). AN INT4 LINE is a pack's word (8 values) and its group's scale (fp32 bits): one
 // line a pack, half an exact line's bytes a value.
-constexpr int kLineBytes = 16;
-constexpr int kLinePayloadBytes = 8;
+constexpr int kLineBytes = 16;  // the widest store (global_store_dwordx4): an ISA fact
+constexpr int kLinePayloadBytes = kLineBytes / 2;  // a half for the payload, a half for the flag
 
 // =================================================================================================
 // THE STATUS: barrier's fault protocol, which the host reads (the communicator's watchdog)
@@ -175,7 +180,7 @@ enum class StatusField : int {
                 // word
   elapsed_high,  // and the high
 };
-constexpr int kStatusFields = 10;
+constexpr int kStatusFields = static_cast<int>(StatusField::elapsed_high) + 1;  // its last's
 
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
