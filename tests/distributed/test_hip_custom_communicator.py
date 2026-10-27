@@ -79,7 +79,7 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
 
                     # Eager.
                     out = comm.all_reduce(x)
-                    if comm.quantization == "int4":
+                    if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
                         assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -97,7 +97,7 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
                     dist.all_reduce(want, group=group.device_group)
                     graph.replay()
                     torch.accelerator.synchronize()
-                    if comm.quantization == "int4":
+                    if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
                         assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -120,7 +120,7 @@ def test_all_reduce(monkeypatch: pytest.MonkeyPatch, tp_size, quantization):
 def all_reduce_rms_norm_ranks(
     monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port
 ):
-    import vllm.ir.ops
+    from vllm.ir.ops import rms_norm
 
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -152,12 +152,12 @@ def all_reduce_rms_norm_ranks(
                     weight.normal_(mean=1.0, std=0.1, generator=g.manual_seed(0))
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
-                    want = vllm.ir.ops.rms_norm(summed, weight, EPS)
+                    want = rms_norm(summed, weight, EPS)
                     assert comm.should_allreduce_rms_norm(x, weight)
 
                     # Eager.
                     out = comm.all_reduce_rms_norm(x, weight, EPS)
-                    if comm.quantization == "int4":
+                    if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
                         assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -173,10 +173,10 @@ def all_reduce_rms_norm_ranks(
                     x.copy_(x + 1)
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
-                    want = vllm.ir.ops.rms_norm(summed, weight, EPS)
+                    want = rms_norm(summed, weight, EPS)
                     graph.replay()
                     torch.accelerator.synchronize()
-                    if comm.quantization == "int4":
+                    if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
                         assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -199,7 +199,7 @@ def test_all_reduce_rms_norm(monkeypatch: pytest.MonkeyPatch, tp_size, quantizat
 def all_reduce_add_rms_norm_ranks(
     monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port
 ):
-    import vllm.ir.ops
+    from vllm.ir.ops import fused_add_rms_norm
 
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -237,7 +237,7 @@ def all_reduce_add_rms_norm_ranks(
                     # The reference first: fused_add_rms_norm writes its residual.
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
-                    want_out, want_residual = vllm.ir.ops.fused_add_rms_norm(
+                    want_out, want_residual = fused_add_rms_norm(
                         summed, residual.clone(), weight, EPS
                     )
                     assert comm.should_allreduce_add_rms_norm(x, weight)
@@ -247,7 +247,7 @@ def all_reduce_add_rms_norm_ranks(
                         x, residual, weight, EPS
                     )
                     for got, want in [(out, want_out), (residual_out, want_residual)]:
-                        if comm.quantization == "int4":
+                        if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
                             assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -265,13 +265,13 @@ def all_reduce_add_rms_norm_ranks(
                     x.copy_(x + 1)
                     summed = x.clone()
                     dist.all_reduce(summed, group=group.device_group)
-                    want_out, want_residual = vllm.ir.ops.fused_add_rms_norm(
+                    want_out, want_residual = fused_add_rms_norm(
                         summed, residual.clone(), weight, EPS
                     )
                     graph.replay()
                     torch.accelerator.synchronize()
                     for got, want in [(out, want_out), (residual_out, want_residual)]:
-                        if comm.quantization == "int4":
+                        if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
                             assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -386,7 +386,7 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                         (out_prefix, want_prefix),
                         (blocks, want_blocks),
                     ]:
-                        if comm.quantization == "int4":
+                        if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
                             assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
@@ -445,7 +445,7 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                         (out_prefix, want_prefix),
                         (blocks, want_blocks),
                     ]:
-                        if comm.quantization == "int4":
+                        if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
                             assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
