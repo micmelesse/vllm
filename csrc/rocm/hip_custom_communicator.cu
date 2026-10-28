@@ -135,13 +135,6 @@ enum class Error : int {
   field_missing = 37,
 };
 
-// A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what
-// is compiled in (its algorithm first, which of its kernel's bodies it is), and
-// its
-// LAUNCH, what is chosen at each call. A tuned kernel holds both, a forced call
-// gives both, and select hands both to the launch; no field is ever 0 for "left
-// to someone else".
-//
 // A LAUNCH DIMENSION, the kernel's dim3: x, y and z. Every kernel here indexes
 // x alone, so its configs hold y = z = 1; one that indexed y or z would widen
 // its space, nothing else.
@@ -150,98 +143,6 @@ struct Dim3 {
   int y = 1;
   int z = 1;
   bool operator==(const Dim3&) const = default;
-};
-
-// EACH OP'S BUILD, Triton's autotune config less the grid: the block, its
-// threads in each dimension (x: Triton's num_warps x 64), the waves a SIMD (an
-// EU) the compiler fits its registers to (__launch_bounds__'s second value,
-// Triton's waves_per_eu; 1 asks nothing), and the tile, TILE_M rows x TILE_N
-// columns in elements; TILE_K is the reduced dimension a step (AttnRes's
-// sources a step); `quantization`, what crosses the links (common.cuh's
-// QUANTIZATION): a two-shot's build is listed as it is and moving INT4 (two
-// configs of the table), forced like any field or named by a tuned point;
-// `pack_bytes`, a pack's bytes, the unit every load, sum and store moves
-// (PACK_BYTES: 16, the widest load, or 8, 4 or 2, a row's that is not whole
-// wider packs, so every row has a build whose loads are aligned: PyTorch's and
-// vLLM's vector width by alignment, tuned here like the tile). ONE TYPE AN OP,
-// so a config cannot cross ops: its op (`op`), the algorithms its kernel has by
-// name (`algorithms`, the table's and Python's), and its fields. A norm on this
-// rank's rows has one algorithm (it reads no peer), so its build has none.
-template <typename A>
-struct Named {
-  A algorithm;
-  const char* name;
-};
-
-// all_reduce: a tile a work item, the grid striding over the buffer's.
-struct AllReduceBuildConfig {
-  static constexpr Named<AllReduceAlgorithm> algorithms[] = {
-      {AllReduceAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAlgorithm::one_shot_push, "one_shot_push"},
-      {AllReduceAlgorithm::two_shot_pull, "two_shot_pull"},
-      {AllReduceAlgorithm::two_shot_push, "two_shot_push"},
-      {AllReduceAlgorithm::one_shot_push_staged, "one_shot_push_staged"}};
-  AllReduceAlgorithm algorithm;
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AllReduceBuildConfig&) const = default;
-};
-
-// all_reduce_add_rms_norm (its kernels all_reduce_rms_norm and
-// all_reduce_add_rms_norm, by the residual).
-struct AllReduceAddRmsNormBuildConfig {
-  static constexpr Named<AllReduceAddRmsNormKernelAlgorithm> algorithms[] = {
-      {AllReduceAddRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows,
-       "two_shot_pull_rows"},
-      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns,
-       "two_shot_pull_columns"},
-      {AllReduceAddRmsNormKernelAlgorithm::two_shot_push, "two_shot_push"}};
-  AllReduceAddRmsNormKernelAlgorithm algorithm;
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
-};
-
-// all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
-struct AllReduceAddAttnResRmsNormBuildConfig {
-  static constexpr Named<AllReduceAddAttnResRmsNormAlgorithm> algorithms[] = {
-      {AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_rows,
-       "two_shot_pull_rows"},
-      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns,
-       "two_shot_pull_columns"},
-      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_push, "two_shot_push"}};
-  AllReduceAddAttnResRmsNormAlgorithm algorithm;
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
-};
-
-// add_attn_res_rms_norm (its kernel add_attn_res_rms_norm): TILE_K sources a
-// step.
-struct AddAttnResRmsNormBuildConfig {
-  Dim3 block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int quantization = Quantization::exact;  // a Quantization
-  int pack_bytes = kPackBytes;             // a pack's bytes (PACK_BYTES)
-  bool operator==(const AddAttnResRmsNormBuildConfig&) const = default;
 };
 
 // =============================================================================
@@ -654,20 +555,6 @@ constexpr int64_t staged_rows(A algorithm, int quantization, int64_t m,
 }
 
 // =============================================================================
-// AN OP'S ALGORITHM BY NAME: the call names it, among its kernel's.
-// =============================================================================
-
-// AN ALGORITHM OF B'S KERNEL by its name, or none where the kernel has no such
-// algorithm.
-template <typename B>
-constexpr std::optional<decltype(B::algorithm)> algorithm_named(
-    std::string_view name) {
-  for (const auto& a : B::algorithms)
-    if (name == a.name) return a.algorithm;
-  return std::nullopt;
-}
-
-// =============================================================================
 // THE CHECK: the first Error config `c` meets on the call here, in this order,
 // or none. Every Error is a capability (a kernel that cannot take the input),
 // never "the unfused ops would be faster". Residency, which needs the compiled
@@ -691,11 +578,23 @@ constexpr int64_t partials_need(A algorithm, int64_t m, int64_t packs,
 // EVERY ALGORITHM OF EVERY KERNEL, `f` handed each (a norm on rows has none).
 template <typename F>
 constexpr void every_algorithm(F&& f) {
-  for (const auto& a : AllReduceBuildConfig::algorithms) f(a.algorithm);
-  for (const auto& a : AllReduceAddRmsNormBuildConfig::algorithms)
-    f(a.algorithm);
-  for (const auto& a : AllReduceAddAttnResRmsNormBuildConfig::algorithms)
-    f(a.algorithm);
+  for (const AllReduceAlgorithm a :
+       {AllReduceAlgorithm::one_shot_pull, AllReduceAlgorithm::one_shot_push,
+        AllReduceAlgorithm::two_shot_pull, AllReduceAlgorithm::two_shot_push,
+        AllReduceAlgorithm::one_shot_push_staged})
+    f(a);
+  for (const AllReduceAddRmsNormKernelAlgorithm a :
+       {AllReduceAddRmsNormKernelAlgorithm::one_shot_pull,
+        AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows,
+        AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns,
+        AllReduceAddRmsNormKernelAlgorithm::two_shot_push})
+    f(a);
+  for (const AllReduceAddAttnResRmsNormAlgorithm a :
+       {AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull,
+        AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_rows,
+        AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns,
+        AllReduceAddAttnResRmsNormAlgorithm::two_shot_push})
+    f(a);
 }
 
 // A LAUNCH'S INPUT TABLE (INPUT TABLES): eager, the input copied into this
@@ -872,100 +771,6 @@ bool overlapping(std::initializer_list<const torch::Tensor*> inputs,
 
 namespace {
 using hip_custom_communicator::Error;
-
-// A NORM CALL'S TENSORS, or the Error they are refused for: input [tokens,
-// hidden], output (and with a residual, residual and residual_output) its shape
-// and dtype, the weight 1-D of hidden at a pack (its dtype is the API's to
-// refuse), no input sharing an output's memory.
-std::optional<Error> norm_tensors(const torch::Tensor& input,
-                                  const torch::Tensor* residual,
-                                  const torch::Tensor& weight,
-                                  const torch::Tensor& output,
-                                  const torch::Tensor* residual_output,
-                                  bool in_place) {
-  if (!on_device({&input, &weight, &output})) return Error::not_on_device;
-  if (input.dim() != 2 || output.sizes() != input.sizes() ||
-      weight.dim() != 1 || weight.numel() != input.size(1))
-    return Error::shape_mismatch;
-  if (output.scalar_type() != input.scalar_type()) return Error::dtype_mismatch;
-  // The weight is read a pack at a time, a pack's worth of input's elements per
-  // load.
-  const int64_t weight_pack = hip_custom_communicator::kPackBytes /
-                              input.element_size() * weight.element_size();
-  if (reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack != 0)
-    return Error::not_aligned;
-  if (residual != nullptr) {
-    if (!on_device({residual, residual_output})) return Error::not_on_device;
-    if (residual->sizes() != input.sizes() ||
-        residual_output->sizes() != input.sizes())
-      return Error::shape_mismatch;
-    if (residual->scalar_type() != input.scalar_type() ||
-        residual_output->scalar_type() != input.scalar_type())
-      return Error::dtype_mismatch;
-  }
-  if (overlapping({&input, residual}, {&output, residual_output}, in_place) ||
-      overlapping({&weight}, {&output, residual_output}))
-    return Error::inputs_overlap_outputs;
-  return std::nullopt;
-}
-
-// AN ATTNRES CALL'S TENSORS, as every AttnRes op takes them: `input` (the
-// partial sum, or the delta) [tokens, hidden]; `prefix` (none: the sum starts
-// it), `prefix_output` and `output` its shape; `blocks` [tokens, sources,
-// hidden], its first `num_blocks` the sources read; `block_output` (none: no
-// block written) a [tokens, hidden] slot, by the standard not one of the
-// sources; every one input's dtype. Or the Error they are refused for.
-std::optional<Error> attn_res_tensors(
-    const torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
-    const torch::Tensor& blocks, const torch::Tensor& norm_weight,
-    const torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    const torch::Tensor& prefix_output, const torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks) {
-  if (!on_device(
-          {&input, &norm_weight, &qk_weight, &prefix_output, &output, &blocks}))
-    return Error::not_on_device;
-  if (input.dim() != 2) return Error::shape_mismatch;
-  const int64_t n = input.size(1);
-  if (prefix_output.sizes() != input.sizes() ||
-      output.sizes() != input.sizes() || blocks.dim() != 3 ||
-      blocks.size(0) != input.size(0) || blocks.size(2) != n ||
-      blocks.stride(2) != 1 || num_blocks < 0 || num_blocks > blocks.size(1) ||
-      norm_weight.dim() != 1 || norm_weight.numel() != n ||
-      qk_weight.dim() != 1 || qk_weight.numel() != n)
-    return Error::shape_mismatch;
-  std::vector<const torch::Tensor*> same = {&blocks, &norm_weight, &qk_weight,
-                                            &prefix_output, &output};
-  for (const std::optional<torch::Tensor>* o :
-       {&prefix, &output_norm_weight, &block_output})
-    if (*o) {
-      if (!on_device({&**o})) return Error::not_on_device;
-      same.push_back(&**o);
-    }
-  for (const torch::Tensor* t : same)
-    if (t->scalar_type() != input.scalar_type()) return Error::dtype_mismatch;
-  if ((prefix && prefix->sizes() != input.sizes()) ||
-      (block_output && (block_output->sizes() != input.sizes() ||
-                        block_output->stride(1) != 1)) ||
-      (output_norm_weight &&
-       (output_norm_weight->dim() != 1 || output_norm_weight->numel() != n)))
-    return Error::shape_mismatch;
-  // Its rows' and sources' strides are the API's to refuse (whole packs); its
-  // start is here.
-  if (reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
-          hip_custom_communicator::kPackBytes !=
-      0)
-    return Error::not_aligned;
-  // The sources read are the first num_blocks; block_output may be a later slot
-  // of the same stack.
-  const torch::Tensor sources = blocks.narrow(1, 0, num_blocks);
-  if (overlapping(
-          {&input, prefix ? &*prefix : nullptr, &sources, &norm_weight,
-           &qk_weight, output_norm_weight ? &*output_norm_weight : nullptr},
-          {&prefix_output, &output, block_output ? &*block_output : nullptr}))
-    return Error::inputs_overlap_outputs;
-  return std::nullopt;
-}
 
 }  // namespace
 
@@ -2496,10 +2301,49 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   using namespace hip_custom_communicator;
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
-  if (const std::optional<Error> e = attn_res_tensors(
-          input, prefix, blocks, norm_weight, qk_weight, output_norm_weight,
-          prefix_output, output, block_output, num_blocks))
-    return error_code(e);
+  // ITS TENSORS: on the device, their shapes and dtypes the input's, the
+  // blocks' start on a pack, no input sharing an output's memory.
+  if (!on_device(
+          {&input, &norm_weight, &qk_weight, &prefix_output, &output, &blocks}))
+    return error_code(Error::not_on_device);
+  if (input.dim() != 2) return error_code(Error::shape_mismatch);
+  const int64_t width = input.size(1);
+  if (prefix_output.sizes() != input.sizes() ||
+      output.sizes() != input.sizes() || blocks.dim() != 3 ||
+      blocks.size(0) != input.size(0) || blocks.size(2) != width ||
+      blocks.stride(2) != 1 || num_blocks < 0 || num_blocks > blocks.size(1) ||
+      norm_weight.dim() != 1 || norm_weight.numel() != width ||
+      qk_weight.dim() != 1 || qk_weight.numel() != width)
+    return error_code(Error::shape_mismatch);
+  std::vector<const torch::Tensor*> same = {&blocks, &norm_weight, &qk_weight,
+                                            &prefix_output, &output};
+  for (const std::optional<torch::Tensor>* o :
+       {&prefix, &output_norm_weight, &block_output})
+    if (*o) {
+      if (!on_device({&**o})) return error_code(Error::not_on_device);
+      same.push_back(&**o);
+    }
+  for (const torch::Tensor* t : same)
+    if (t->scalar_type() != input.scalar_type())
+      return error_code(Error::dtype_mismatch);
+  if ((prefix && prefix->sizes() != input.sizes()) ||
+      (block_output && (block_output->sizes() != input.sizes() ||
+                        block_output->stride(1) != 1)) ||
+      (output_norm_weight && (output_norm_weight->dim() != 1 ||
+                              output_norm_weight->numel() != width)))
+    return error_code(Error::shape_mismatch);
+  // Its rows' and sources' strides are the API's to refuse (whole packs); its
+  // start is here.
+  if (reinterpret_cast<uintptr_t>(blocks.data_ptr()) % kPackBytes != 0)
+    return error_code(Error::not_aligned);
+  // The sources read are the first num_blocks; block_output may be a later slot
+  // of the same stack.
+  const torch::Tensor sources = blocks.narrow(1, 0, num_blocks);
+  if (overlapping(
+          {&input, prefix ? &*prefix : nullptr, &sources, &norm_weight,
+           &qk_weight, output_norm_weight ? &*output_norm_weight : nullptr},
+          {&prefix_output, &output, block_output ? &*block_output : nullptr}))
+    return error_code(Error::inputs_overlap_outputs);
   if (!all_ints({waves_per_eu, tile_m, tile_n, tile_k, pack_bytes, grid_x,
                  grid_y, grid_z, block_x, block_y, block_z}))
     return error_code(Error::field_out_of_range);
@@ -2580,26 +2424,25 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     // ---- THE FUSED KERNEL ----
     // ---- PRECONDITIONS: the config, the call, then its instance. The first
     // Error refuses the call; past this section the call runs. ----
-    const std::optional<AllReduceAddAttnResRmsNormAlgorithm> named =
-        algorithm_named<AllReduceAddAttnResRmsNormBuildConfig>(algorithm_name);
-    if (!named) return error_code(Error::no_such_kernel);
-    const AllReduceAddAttnResRmsNormAlgorithm algorithm = *named;
+    AllReduceAddAttnResRmsNormAlgorithm algorithm;
+    if (algorithm_name == "one_shot_pull")
+      algorithm = AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull;
+    else if (algorithm_name == "two_shot_pull_rows")
+      algorithm = AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_rows;
+    else if (algorithm_name == "two_shot_pull_columns")
+      algorithm = AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns;
+    else if (algorithm_name == "two_shot_push")
+      algorithm = AllReduceAddAttnResRmsNormAlgorithm::two_shot_push;
+    else
+      return error_code(Error::no_such_kernel);
     if (quantization_name != "exact" && quantization_name != "int4")
       return error_code(Error::no_such_quantization);
-    const AllReduceAddAttnResRmsNormBuildConfig build{
-        .algorithm = algorithm,
-        .block = block,
-        .waves_per_eu = static_cast<int>(waves_per_eu),
-        .tile_m = static_cast<int>(tile_m),
-        .tile_n = static_cast<int>(tile_n),
-        .tile_k = static_cast<int>(tile_k),
-        .quantization = quantization_name == "int4" ? Quantization::int4
-                                                    : Quantization::exact,
-        .pack_bytes = static_cast<int>(pack_bytes)};
+    const int quantization =
+        quantization_name == "int4" ? Quantization::int4 : Quantization::exact;
     const int64_t m = input_size_m,
                   n = input_size_n;  // the problem's shape: the input's
     const int64_t e = elem_bytes(dtype);
-    const int64_t pack = build.pack_bytes;
+    const int64_t pack = pack_bytes;
     // THE WORLD AND THE DTYPE BUILT; THE CONFIG'S RANGES, each the hardware's
     // (STANDARDS 3.2): the grid x alone (the kernel's one dimension), at least
     // a block, at most the blocks the signals have slots for; the tile
@@ -2611,12 +2454,12 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     if (!dtype_built(dtype)) return error_code(Error::dtype_not_built);
     if (!x_alone(grid) || grid.x < 1 || grid.x > s.symmetric.max_blocks)
       return error_code(Error::launch_out_of_range);
-    if (build.tile_m < 1 || build.tile_n < 1 || build.tile_k < 1)
+    if (tile_m < 1 || tile_n < 1 || tile_k < 1)
       return error_code(Error::field_not_positive);
     if (pack < 2 || pack > kPackBytes || (pack & (pack - 1)) != 0 || pack < e)
       return error_code(Error::pack_out_of_range);
     if (n * e % pack != 0) return error_code(Error::row_not_packs);
-    const bool int4 = build.quantization == Quantization::int4;
+    const bool int4 = quantization == Quantization::int4;
     if (int4 && pack != kPackBytes)
       return error_code(Error::quantization_not_supported);
     // WHAT THE REGIONS MUST HOLD. An INT4 payload lies in the region that holds
@@ -2628,14 +2471,13 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     // one's is read where it is, refused alike, so the eager and captured calls
     // of one shape agree).
     const int64_t packs = (n * e + pack - 1) / pack;  // the last short
-    const int64_t row = payload_row(build.algorithm, Quantization::int4, n);
-    const int64_t partials =
-        partials_need(build.algorithm, m, packs, s.world, pack);
-    if (int4 && int4_payload_bytes(staged_rows(build.algorithm,
-                                               Quantization::int4, m, s.world),
-                                   row) > s.symmetric.staging_bytes)
+    const int64_t row = payload_row(algorithm, Quantization::int4, n);
+    const int64_t partials = partials_need(algorithm, m, packs, s.world, pack);
+    if (int4 && int4_payload_bytes(
+                    staged_rows(algorithm, Quantization::int4, m, s.world),
+                    row) > s.symmetric.staging_bytes)
       return error_code(Error::staging_too_small);
-    if (int4 && (int4_groups_a_thread(build.algorithm)
+    if (int4 && (int4_groups_a_thread(algorithm)
                      ? int4_payload_bytes((m + s.world - 1) / s.world, row)
                      : int4_payload_bytes(1, partials / e)) >
                     s.symmetric.partials_bytes)
@@ -2677,28 +2519,27 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS
     // (attn_res.cuh's attn_res_wide): [tile_m][num_blocks + 1] floats.
     const int shared_memory_bytes =
-        n > build.tile_n
-            ? static_cast<int>(build.tile_m * (num_blocks + 1) * sizeof(float))
-            : 0;
+        n > tile_n ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float))
+                   : 0;
     // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
-    const bool chunked = n > build.tile_n;
+    const bool chunked = n > tile_n;
     // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
-    const bool tail = build.quantization == Quantization::int4 &&
+    const bool tail = quantization == Quantization::int4 &&
                       int4_tail(algorithm, m, n, s.world);
     void* kernel = nullptr;
     // THE INSTANCE: the kernel compiled at this build, on this device, for this
     // call (builds.py's kAllReduceAddAttnResRmsNormInstances, a row each).
     for (const auto& i : kAllReduceAddAttnResRmsNormInstances)
-      if (i.algorithm == build.algorithm && i.block_x == build.block.x &&
-          i.block_y == build.block.y && i.block_z == build.block.z &&
-          i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
-          i.tile_n == build.tile_n && i.tile_k == build.tile_k &&
-          i.quantization == build.quantization && i.pack_bytes == pack &&
+      if (i.algorithm == algorithm && i.block_x == block.x &&
+          i.block_y == block.y && i.block_z == block.z &&
+          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
+          i.tile_n == tile_n && i.tile_k == tile_k &&
+          i.quantization == quantization && i.pack_bytes == pack &&
           i.world == s.world && i.wave_size == s.device.wave_size &&
           i.dtype == dtype && i.weight_dtype == dtype &&
           i.contiguous == false && i.chunked == chunked && i.tail == tail &&
           i.quantize_int4 ==
-              (build.quantization == Quantization::int4 && pack == kPackBytes))
+              (quantization == Quantization::int4 && pack == kPackBytes))
         kernel = i.kernel;
     if (kernel == nullptr) return error_code(Error::not_built);
     if (const std::optional<Error> e =
@@ -2714,19 +2555,19 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
             partials_size_n = 0, staging_stride_m = 0, staging_stride_n = 0,
             staging_size_m = 0, staging_size_n = 0;
     bool in_place = false;
-    const int64_t row_n = payload_row(algorithm, build.quantization, n);
+    const int64_t row_n = payload_row(algorithm, quantization, n);
     partials_stride_m = row_n;
     partials_stride_n = 1;
     partials_size_m = partials_rows;
     partials_size_n = row_n;
     staging_stride_m = row_n;
     staging_stride_n = 1;
-    staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
+    staging_size_m = staged_rows(algorithm, quantization, m, s.world);
     staging_size_n = row_n;
     // IN PLACE, every exact algorithm: the pushed two-shot's reduce-scatter
     // reads its peers' inputs through the input table too (reduce_scatter.cuh's
     // columns_push), as the norm's does.
-    in_place = build.quantization == Quantization::exact;
+    in_place = quantization == Quantization::exact;
     // EVERY VIEW INSIDE ITS REGION (view_fits).
     if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
                    partials_stride_n, e, s.symmetric.partials_bytes) ||
@@ -2795,12 +2636,20 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   // ---- THE SPLIT: our all-reduce at this config's fields into this rank's
   // sum, then AttnRes on its rows at the add_attn_res_rms_norm_ fields. Both
   // kernels' preconditions first, then the launches. ----
-  const std::optional<AllReduceAlgorithm> body =
-      algorithm_named<AllReduceBuildConfig>(
-          std::string_view(algorithm_name)
-              .substr(0, algorithm_name.size() - 6));
-  if (!body) return error_code(Error::no_such_kernel);
-  const AllReduceAlgorithm all_reduce_algorithm = *body;
+  const std::string body = algorithm_name.substr(0, algorithm_name.size() - 6);
+  AllReduceAlgorithm all_reduce_algorithm;
+  if (body == "one_shot_pull")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_pull;
+  else if (body == "one_shot_push")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
+  else if (body == "one_shot_push_staged")
+    all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
+  else if (body == "two_shot_pull")
+    all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
+  else if (body == "two_shot_push")
+    all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
+  else
+    return error_code(Error::no_such_kernel);
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";
@@ -2859,8 +2708,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   // tile in a slot's lines, a line a pack of at most kLinePayloadBytes (a
   // narrower pack its line alone: kernels/all_reduce.cuh), INT4 a line a word
   // of its tile's whole groups; a block's TILE_M rows of a bank's
-  // unfenced_blocks, a block its own slots (a grid past them is refused,
-  // never cut).
+  // unfenced_blocks, a block its own slots (a grid past them is refused, never
+  // cut).
   if (all_reduce_algorithm == AllReduceAlgorithm::one_shot_push) {
     const int64_t line_pack = std::min<int64_t>(pack_bytes, kLinePayloadBytes);
     const int64_t row_lines =
@@ -2870,9 +2719,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
         grid_x * tile_m > s.symmetric.unfenced_blocks)
       return error_code(Error::unfenced_too_small);
   }
-  // THE INSTANCE: the kernel compiled at this config, on this device, for
-  // this call (builds.py's kAllReduceInstances, a row each); a config the
-  // table did not build is refused here.
+  // THE INSTANCE: the kernel compiled at this config, on this device, for this
+  // call (builds.py's kAllReduceInstances, a row each); a config the table did
+  // not build is refused here.
   for (const auto& i : kAllReduceInstances)
     if (i.algorithm == all_reduce_algorithm && i.block_x == block_x &&
         i.block_y == block_y && i.block_z == block_z &&
@@ -2888,8 +2737,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   if (kernel == nullptr) return error_code(Error::not_built);
   // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
   // and the LDS at the launch; the scratch only when the dispatch runs,
-  // aborting the queue and the process with it (the tune's crashes,
-  // 2026-10-24: AttnRes at 64 threads, tile 4x16384x4, 21 KiB a lane).
+  // aborting the queue and the process with it (the tune's crashes, 2026-10-24:
+  // AttnRes at 64 threads, tile 4x16384x4, 21 KiB a lane).
   hipFuncAttributes attributes;
   if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
     return error_code(Error::hip_failed);
@@ -2900,8 +2749,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   if (static_cast<int64_t>(attributes.localSizeBytes) > s.device.scratch_a_lane)
     return error_code(Error::scratch_too_large);
   // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
-  // every peer arrives, so a grid past the blocks the device holds at once
-  // can hang (HIP never refuses it). The blocks a CU holds from the kernel's
+  // every peer arrives, so a grid past the blocks the device holds at once can
+  // hang (HIP never refuses it). The blocks a CU holds from the kernel's
   // registers, LDS and the CU's wave slots, times the CUs.
   int blocks_a_cu = 0;
   if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2909,16 +2758,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     return error_code(Error::hip_failed);
   if (grid_x > blocks_a_cu * s.device.compute_units)
     return error_code(Error::grid_not_resident);
-  // ---- ITS VIEWS OF THE REGIONS, by its all_reduce_algorithm, in elements:
-  // a view [m, n] at strides [stride_m, stride_n] (the line push's inbox
-  // [slot, m, n]); an empty view (size 0) where it reads none. The kernels
-  // find a one-shot's payload in the staging from the input's sizes.
-  // THE WHOLE CALL IN ONE PASS: the regions are sized from the largest call
-  // the server makes, so a call past them is refused, never cut into bands.
-  // Every exact kernel's input fits the staging whole (an eager call's host
-  // copy,
-  // INPUT TABLES; a captured call's is read where it is, refused alike, so
-  // the eager and captured calls of one shape agree). ----
+  // ---- ITS VIEWS OF THE REGIONS, by its all_reduce_algorithm, in elements: a
+  // view [m, n] at strides [stride_m, stride_n] (the line push's inbox [slot,
+  // m, n]); an empty view (size 0) where it reads none. The kernels find a
+  // one-shot's payload in the staging from the input's sizes.
+  // THE WHOLE CALL IN ONE PASS: the regions are sized from the largest call the
+  // server makes, so a call past them is refused, never cut into bands. Every
+  // exact kernel's input fits the staging whole (an eager call's host copy,
+  // INPUT TABLES; a captured call's is read where it is, refused alike, so the
+  // eager and captured calls of one shape agree). ----
   // The two-shots' exact share is the flat walk's, whole packs, rounded up: a
   // rank's slice of a row in the partials, and the pushed two-shot's inbox
   // [WORLD, slot] in the staging, its slot a share of the whole call.
@@ -2968,9 +2816,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       break;
     case AllReduceAlgorithm::one_shot_push:
       // THE UNFENCED REGION: [writer, row, n] payload elements, 2 *
-      // unfenced_blocks rows (bank, row) of unfenced_slot_bytes of payload
-      // each whatever the build (so a row is the same bytes at every build,
-      // its epoch its own), a writer's rows contiguous.
+      // unfenced_blocks rows (bank, row) of unfenced_slot_bytes of payload each
+      // whatever the build (so a row is the same bytes at every build, its
+      // epoch its own), a writer's rows contiguous.
       unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
                              (s.symmetric.unfenced_slot_bytes / e);
       unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
@@ -2980,8 +2828,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
       break;
     case AllReduceAlgorithm::one_shot_push_staged: {
-      // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot
-      // whole kInt4ScalesAlign), no partials.
+      // WORLD SLOTS OF AN INPUT in the staging (INT4: its payload, a slot whole
+      // kInt4ScalesAlign), no partials.
       const int64_t payload =
           quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
       const int64_t slot_bytes = quantize_int4
