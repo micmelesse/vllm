@@ -125,7 +125,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hip_custom_communicator_all_reduce(int state, Tensor input, Tensor! "
       "output, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, "
       "int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str "
-      "quantization, int pack_bytes, int? quantize_from_bytes) -> int?");
+      "quantization, int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA,
                 &hip_custom_communicator_all_reduce);
   rocm_ops.def(
@@ -133,8 +133,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "input, Tensor? residual, Tensor weight, Tensor! output, Tensor!? r"
       "esidual_output, float eps, str algorithm, int grid_x, int grid_y, "
       "int grid_z, int block_x, int block_y, int block_z, int waves_per_e"
-      "u, int tile_m, int tile_n, str quantization, int pack_bytes, int? "
-      "quantize_from_bytes, int? rms_norm_grid_x=None, int? rms_norm_grid"
+      "u, int tile_m, int tile_n, str quantization, int pack_bytes, "
+      "int? rms_norm_grid_x=None, int? rms_norm_grid"
       "_y=None, int? rms_norm_grid_z=None, int? rms_norm_block_x=None, in"
       "t? rms_norm_block_y=None, int? rms_norm_block_z=None, int? rms_nor"
       "m_waves_per_eu=None, int? rms_norm_tile_m=None, int? rms_norm_tile"
@@ -148,8 +148,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "output, Tensor!? block_output, int num_blocks, float eps, float "
       "output_eps, str algorithm, int grid_x, int grid_y, int grid_z, int "
       "block_x, int block_y, int block_z, int waves_per_eu, int tile_m, int "
-      "tile_n, int tile_k, str quantization, int pack_bytes, int? "
-      "quantize_from_bytes) -> int?");
+      "tile_n, int tile_k, str quantization, int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm",
                 torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
@@ -160,7 +159,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor!? block_output, int num_blocks, float eps, float output_eps, int "
       "grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, "
       "int waves_per_eu, int tile_m, int tile_n, int tile_k, str quantization, "
-      "int pack_bytes, int? quantize_from_bytes) -> int?");
+      "int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_add_attn_res_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_add_attn_res_rms_norm);
 #endif  // VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR

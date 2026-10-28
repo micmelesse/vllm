@@ -77,8 +77,7 @@ std::optional<int64_t> hip_custom_communicator_all_reduce(
     const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
+    const std::string& quantization, int64_t pack_bytes);
 std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t state, torch::Tensor& input,
     const std::optional<torch::Tensor>& residual, torch::Tensor& weight,
@@ -87,7 +86,6 @@ std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes,
     std::optional<int64_t> rms_norm_grid_x,
     std::optional<int64_t> rms_norm_grid_y,
     std::optional<int64_t> rms_norm_grid_z,
@@ -108,8 +106,7 @@ std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     double eps, double output_eps, const std::string& algorithm, int64_t grid_x,
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
     int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    int64_t tile_k, const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
+    int64_t tile_k, const std::string& quantization, int64_t pack_bytes);
 std::optional<int64_t> hip_custom_communicator_add_attn_res_rms_norm(
     int64_t state, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
@@ -120,5 +117,4 @@ std::optional<int64_t> hip_custom_communicator_add_attn_res_rms_norm(
     double eps, double output_eps, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
-    const std::string& quantization, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes);
+    const std::string& quantization, int64_t pack_bytes);

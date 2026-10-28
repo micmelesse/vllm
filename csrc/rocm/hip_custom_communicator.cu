@@ -68,8 +68,9 @@
 namespace hip_custom_communicator {
 
 // WHAT A CONFIG MOVES ACROSS THE LINKS, the host's alone: a config's
-// `quantization` field. A kernel takes QUANTIZE_INT4 (bool), which the host
-// derives per call from it and quantize_from_bytes.
+// `quantization` field. A kernel takes QUANTIZE_INT4 (bool): the config's
+// quantization, every call (an INT4 config always quantizes, an exact one
+// never).
 namespace Quantization {
 constexpr int exact = 0;
 constexpr int int4 = 1;
@@ -695,106 +696,6 @@ constexpr void every_algorithm(F&& f) {
     f(a.algorithm);
   for (const auto& a : AllReduceAddAttnResRmsNormBuildConfig::algorithms)
     f(a.algorithm);
-}
-
-// THE CHECK OF A CALL'S CONFIG (its build, of its op's type B, its grid, and
-// the bytes it quantizes from) on a call of `m` rows of `n`: the world and the
-// dtype built; the config's ranges, each the hardware's (STANDARDS 3.2): the
-// grid and the block x alone (every kernel's one dimension), the block whole
-// waves up to the device's workgroup (a wider block's register trade is the
-// tune's to measure), the grid at most the blocks the signals have slots for
-// (whether this kernel's are resident is grid_not_resident), the waves a EU the
-// CU holds, the tile positive, a pack a load the hardware has,
-// quantize_from_bytes an INT4 build's alone; then what the build cannot run;
-// then what the regions cannot hold. With no state (`collective` false) the
-// checks that need peers are left out.
-template <typename B>
-std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
-                             int64_t partials_bytes, int64_t max_blocks,
-                             const B& build, Dim3 grid,
-                             std::optional<int64_t> quantize_from_bytes,
-                             at::ScalarType dtype, int64_t m, int64_t n) {
-  if (collective && !world_built(world)) return Error::world_not_built;
-  if (!dtype_built(dtype)) return Error::dtype_not_built;
-  if (!x_alone(grid) || grid.x < 1 || grid.x > max_blocks)
-    return Error::launch_out_of_range;
-  int tile_k = 1;  // a kernel with no K: its identity
-  if constexpr (requires { build.tile_k; }) tile_k = build.tile_k;
-  if (build.tile_m < 1 || build.tile_n < 1 || tile_k < 1)
-    return Error::field_not_positive;
-  if (build.quantization == Quantization::exact && quantize_from_bytes)
-    return Error::field_not_this_templates;
-  if (quantize_from_bytes.value_or(0) < 0) return Error::field_not_positive;
-  // A PACK A LOAD THE HARDWARE HAS: 2, 4, 8 or 16 bytes (its widest).
-  if (build.pack_bytes < 2 || build.pack_bytes > kPackBytes ||
-      (build.pack_bytes & (build.pack_bytes - 1)) != 0)
-    return Error::pack_out_of_range;
-  const int64_t quantize_from = quantize_from_bytes.value_or(0);
-  constexpr bool kPlain = std::is_same_v<B, AllReduceBuildConfig>;
-  // THE BUILD'S PACK: at least an element, and whole packs a row (an aligned
-  // load of the pack's width: a row that is not whole packs starts the next off
-  // them; a narrower build's takes it).
-  const int64_t pack = build.pack_bytes;
-  if (pack < elem_bytes(dtype)) return Error::pack_out_of_range;
-  if (n * elem_bytes(dtype) % pack != 0) return Error::row_not_packs;
-  // INT4 ON A NORM ON ROWS (it moves nothing): named before the build lookup,
-  // which lists no such build; INT4 AT A NARROWER PACK than the widest: the
-  // format's word is a pack of 8 values (common.cuh's QUANTIZATION).
-  const bool int4_build = build.quantization == Quantization::int4;
-  if constexpr (requires { build.algorithm; }) {
-    if (int4_build && pack != kPackBytes)
-      return Error::quantization_not_supported;
-  } else if (int4_build) {
-    return Error::quantization_not_supported;
-  }
-  // A FUSED OP'S INT4 BUILD ALWAYS QUANTIZES: its kernels have no exact
-  // instance of their own.
-  if (int4_build && !kPlain && quantize_from != 0)
-    return Error::field_not_this_templates;
-  // A BUILD THE KERNEL DOES NOT LIST, named by what differs: its block, its
-  // waves, its tile.
-  if constexpr (!requires { build.algorithm; }) {
-    return std::nullopt;  // a norm on rows reads no peer and no region
-  } else {
-    // WHAT THE CALL MOVES: INT4 where its INT4 build quantizes it (the call's
-    // bytes from its quantize_from_bytes on), else exact (the INT4 build's
-    // instance passing it exact).
-    const bool int4 = int4_build && m * n * elem_bytes(dtype) >= quantize_from;
-    if (!collective) return std::nullopt;
-    const int64_t packs =
-        (n * elem_bytes(dtype) + pack - 1) / pack;  // the last short
-    // An INT4 payload lies in the region that holds it exact (common.cuh's INT4
-    // payload layout): the input's in the inputs, the sums' in the partials, at
-    // most one row of the partials's elements (its every view's bound); the
-    // flat walk's on its shares' own views (int4_flat_share).
-    const bool flat = kPlain && is_two_shot(build.algorithm);
-    const int64_t share = int4_flat_share(m, n, world);
-    const int64_t row = payload_row(build.algorithm, Quantization::int4, n);
-    if (int4 &&
-        (flat ? int4_payload_bytes(1, world * share)
-              : int4_payload_bytes(
-                    staged_rows(build.algorithm, Quantization::int4, m, world),
-                    row)) > staging_bytes)
-      return Error::staging_too_small;
-    const int64_t partials =
-        partials_need(build.algorithm, m, packs, world, pack);
-    if (int4 && (flat ? int4_payload_bytes(1, share)
-                 : int4_groups_a_thread(build.algorithm)
-                     ? int4_payload_bytes((m + world - 1) / world, row)
-                     : int4_payload_bytes(1, partials / elem_bytes(dtype))) >
-                    partials_bytes)
-      return Error::partials_too_small;
-    // A COLLECTIVE RUNS THE WHOLE CALL IN ONE PASS: the regions are sized from
-    // the largest call the server makes, so a call past them is refused here,
-    // never cut into bands. Its input is in the staging whole: an eager exact
-    // call's host copy (INPUT TABLES; a captured one's is read where it is,
-    // refused here alike, so the eager and captured calls of one shape agree),
-    // or a pushed input.
-    if (partials > partials_bytes) return Error::partials_too_small;
-    if (m * n * elem_bytes(dtype) > staging_bytes)
-      return Error::staging_too_small;
-    return std::nullopt;
-  }
 }
 
 // A LAUNCH'S INPUT TABLE (INPUT TABLES): eager, the input copied into this
@@ -1497,8 +1398,7 @@ ErrorCode hip_custom_communicator_all_reduce(
     const std::string& algorithm_name, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
+    const std::string& quantization_name, int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   // ---- THE CALL FROM TORCH: its state, its tensors stripped to pointers and
   // strides, its config's ints. ----
@@ -1559,11 +1459,6 @@ ErrorCode hip_custom_communicator_all_reduce(
       grid_x > s.symmetric.max_blocks)
     return error_code(Error::launch_out_of_range);
   if (tile_m < 1 || tile_n < 1) return error_code(Error::field_not_positive);
-  // QUANTIZE_FROM_BYTES: an INT4 config's alone, and not negative.
-  if (!int4_config && quantize_from_bytes)
-    return error_code(Error::field_not_this_templates);
-  const int64_t quantize_from = quantize_from_bytes.value_or(0);
-  if (quantize_from < 0) return error_code(Error::field_not_positive);
   // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes); INT4 at the widest
   // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION).
   if (pack_bytes < 2 || pack_bytes > kPackBytes ||
@@ -1599,10 +1494,9 @@ ErrorCode hip_custom_communicator_all_reduce(
     if (input_first < output_last && output_first < input_last)
       return error_code(Error::inputs_overlap_outputs);
   }
-  // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: INT4 where the config's quantization
-  // is int4 and the call's bytes reach its quantize_from_bytes, else exact (the
+  // QUANTIZE_INT4, WHAT THIS LAUNCH MOVES: the config's quantization (the
   // kernel's one template parameter).
-  const bool quantize_int4 = int4_config && m * n * e >= quantize_from;
+  const bool quantize_int4 = int4_config;
   // IN PLACE: the exact pull, every rank's input read where its table says.
   const bool in_place = (algorithm == AllReduceAlgorithm::one_shot_pull ||
                          algorithm == AllReduceAlgorithm::two_shot_pull) &&
@@ -1863,7 +1757,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
     int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes,
     std::optional<int64_t> rms_norm_grid_x,
     std::optional<int64_t> rms_norm_grid_y,
     std::optional<int64_t> rms_norm_grid_z,
@@ -2030,15 +1923,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       grid_x > s.symmetric.max_blocks)
     return error_code(Error::launch_out_of_range);
   if (tile_m < 1 || tile_n < 1) return error_code(Error::field_not_positive);
-  // QUANTIZE_FROM_BYTES: an INT4 config's alone, and not negative; the fused
-  // kernel's 0 (its INT4 build always quantizes: no exact instance of its own),
-  // the split's all-reduce's any (it passes a call below it exact).
-  if (!int4_config && quantize_from_bytes)
-    return error_code(Error::field_not_this_templates);
-  const int64_t quantize_from = quantize_from_bytes.value_or(0);
-  if (quantize_from < 0) return error_code(Error::field_not_positive);
-  if (!split && quantize_from != 0)
-    return error_code(Error::field_not_this_templates);
   // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes); INT4 at the widest
   // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION).
   if (pack_bytes < 2 || pack_bytes > kPackBytes ||
@@ -2109,11 +1993,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
              residual_output_last))
       return error_code(Error::inputs_overlap_outputs);
   }
-  // WHAT THE CALL MOVES: INT4 where the config is and, for the split's
-  // all-reduce, the call's bytes reach its quantize_from_bytes (the fused
-  // kernel's INT4 build always quantizes).
-  const bool quantize_int4 =
-      int4_config && (!split || m * n * e >= quantize_from);
+  // WHAT THE CALL MOVES: the config's quantization.
+  const bool quantize_int4 = int4_config;
   const int shared_memory_bytes = 0;
   // ITS KERNELS, ITS VIEWS OF THE REGIONS AND WHAT THE REGIONS MUST HOLD, by
   // its path: the fused kernel's, or the split's all-reduce's and its norm's.
@@ -2597,7 +2478,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
     int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
     int64_t tile_n, int64_t tile_k, const std::string& quantization_name,
-    int64_t pack_bytes, std::optional<int64_t> quantize_from_bytes) {
+    int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
@@ -2681,22 +2562,61 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       .pack_bytes = static_cast<int>(pack_bytes)};
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e =
-          refused(true, s.world, s.symmetric.staging_bytes,
-                  s.symmetric.partials_bytes, s.symmetric.max_blocks, build,
-                  grid, quantize_from_bytes, dtype, m, n))
-    return error_code(e);
+  const int64_t e = elem_bytes(dtype);
+  const int64_t pack = build.pack_bytes;
+  // THE WORLD AND THE DTYPE BUILT; THE CONFIG'S RANGES, each the hardware's
+  // (STANDARDS 3.2): the grid x alone (the kernel's one dimension), at least a
+  // block, at most the blocks the signals have slots for; the tile positive; a
+  // pack a load the hardware has (2, 4, 8 or 16 bytes), at least an element,
+  // whole packs a row (an aligned load of the pack's width); INT4 at the widest
+  // pack (the format's word is a pack of 8 values: common.cuh's QUANTIZATION).
+  if (!world_built(s.world)) return error_code(Error::world_not_built);
+  if (!dtype_built(dtype)) return error_code(Error::dtype_not_built);
+  if (!x_alone(grid) || grid.x < 1 || grid.x > s.symmetric.max_blocks)
+    return error_code(Error::launch_out_of_range);
+  if (build.tile_m < 1 || build.tile_n < 1 || build.tile_k < 1)
+    return error_code(Error::field_not_positive);
+  if (pack < 2 || pack > kPackBytes || (pack & (pack - 1)) != 0 || pack < e)
+    return error_code(Error::pack_out_of_range);
+  if (n * e % pack != 0) return error_code(Error::row_not_packs);
+  const bool int4 = build.quantization == Quantization::int4;
+  if (int4 && pack != kPackBytes)
+    return error_code(Error::quantization_not_supported);
+  // WHAT THE REGIONS MUST HOLD. An INT4 payload lies in the region that holds
+  // it exact (common.cuh's INT4 payload layout): the input's in the staging,
+  // the sums' in the partials. A collective runs the whole call in one pass:
+  // the regions are sized from the largest call the server makes, so a call
+  // past them is refused here, never cut into bands; its input is in the
+  // staging whole (an eager exact call's host copy, INPUT TABLES; a captured
+  // one's is read where it is, refused alike, so the eager and captured calls
+  // of one shape agree).
+  const int64_t packs = (n * e + pack - 1) / pack;  // the last short
+  const int64_t row = payload_row(build.algorithm, Quantization::int4, n);
+  const int64_t partials = partials_need(build.algorithm, m, packs, s.world, pack);
+  if (int4 && int4_payload_bytes(
+                  staged_rows(build.algorithm, Quantization::int4, m, s.world),
+                  row) > s.symmetric.staging_bytes)
+    return error_code(Error::staging_too_small);
+  if (int4 && (int4_groups_a_thread(build.algorithm)
+                   ? int4_payload_bytes((m + s.world - 1) / s.world, row)
+                   : int4_payload_bytes(1, partials / e)) >
+                  s.symmetric.partials_bytes)
+    return error_code(Error::partials_too_small);
+  if (partials > s.symmetric.partials_bytes)
+    return error_code(Error::partials_too_small);
+  if (m * n * e > s.symmetric.staging_bytes)
+    return error_code(Error::staging_too_small);
   // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
   // rows on whole packs of the build's.
   if (input_stride_n != 1 || blocks_stride_n != 1 ||
       norm_weight_stride_n != 1 || qk_weight_stride_n != 1 ||
       prefix_output_stride_n != 1 || output_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
-  if (input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      blocks_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      blocks_stride_r * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      prefix_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+  if (input_stride_m * e % pack != 0 ||
+      blocks_stride_m * e % pack != 0 ||
+      blocks_stride_r * e % pack != 0 ||
+      prefix_output_stride_m * e % pack != 0 ||
+      output_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   // THE OPTIONAL BUFFERS, checked only when given: a missing one is a null
   // pointer with zero strides, which is no layout at all (a prefix-less call
@@ -2704,22 +2624,22 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   if (prefix_ptr != nullptr && prefix_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (prefix_ptr != nullptr &&
-      prefix_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+      prefix_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   if (output_norm_weight_ptr != nullptr && output_norm_weight_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (block_output_ptr != nullptr && block_output_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (block_output_ptr != nullptr &&
-      block_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+      block_output_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps
   // none).
   const int64_t partials_rows =
       n > 0 ? partials_need(algorithm, m,
-                            n * elem_bytes(dtype) / build.pack_bytes, s.world,
-                            build.pack_bytes) /
-                  (n * elem_bytes(dtype))
+                            n * e / pack, s.world,
+                            pack) /
+                  (n * e)
             : 0;
   // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS
   // (attn_res.cuh's attn_res_wide): [tile_m][num_blocks + 1] floats.
@@ -2741,12 +2661,12 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
         i.waves_per_eu == build.waves_per_eu && i.tile_m == build.tile_m &&
         i.tile_n == build.tile_n && i.tile_k == build.tile_k &&
         i.quantization == build.quantization &&
-        i.pack_bytes == build.pack_bytes && i.world == s.world &&
+        i.pack_bytes == pack && i.world == s.world &&
         i.wave_size == s.device.wave_size && i.dtype == dtype &&
         i.weight_dtype == dtype && i.contiguous == false &&
         i.chunked == chunked && i.tail == tail &&
         i.quantize_int4 == (build.quantization == Quantization::int4 &&
-                            build.pack_bytes == kPackBytes))
+                            pack == kPackBytes))
       kernel = i.kernel;
   if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =
@@ -2776,10 +2696,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   in_place = build.quantization == Quantization::exact;
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
-                 partials_stride_n, elem_bytes(dtype),
+                 partials_stride_n, e,
                  s.symmetric.partials_bytes) ||
       !view_fits(1, 0, staging_size_m, staging_stride_m, staging_size_n,
-                 staging_stride_n, elem_bytes(dtype),
+                 staging_stride_n, e,
                  s.symmetric.staging_bytes))
     return error_code(Error::view_past_region);
   // THE INPUT TABLE (INPUT TABLES): where the kernel reads every rank's input
@@ -2787,10 +2707,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   void* const* table = nullptr;
   int64_t table_stride_m = staging_stride_m;
   if (in_place)
-    if (const std::optional<Error> e = input_table(
+    if (const std::optional<Error> error = input_table(
             s, input_ptr, input_stride_m, input_size_m, input_size_n,
-            elem_bytes(dtype), stream, table, table_stride_m))
-      return error_code(e);
+            e, stream, table, table_stride_m))
+      return error_code(error);
   const int table_size = in_place ? s.world : 0;
   const int64_t table_stride_n = in_place ? 1 : staging_stride_n;
   // THE LAUNCH: the instance's kernel, at the call's dtypes.
@@ -2857,8 +2777,7 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
     double eps, double output_eps, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> quantize_from_bytes) {
+    const std::string& quantization_name, int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   // THE CALL FROM TORCH: its state, its tensors, its config's ints.
   if (state == 0) return error_code(Error::not_open);
@@ -2935,37 +2854,50 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
       .quantization = quantization_name == "int4" ? Quantization::int4
                                                   : Quantization::exact,
       .pack_bytes = static_cast<int>(pack_bytes)};
-  const int64_t m = input_size_m,
-                n = input_size_n;  // the problem's shape: the input's
-  if (const std::optional<Error> e =
-          refused(false, s.world, 0, 0, s.symmetric.max_blocks, build, grid,
-                  quantize_from_bytes, dtype, m, n))
-    return error_code(e);
+  const int64_t n = input_size_n;  // the row's width: the input's
+  const int64_t e = elem_bytes(dtype);
+  const int64_t pack = build.pack_bytes;
+  // THE DTYPE BUILT; THE CONFIG'S RANGES, each the hardware's (STANDARDS 3.2):
+  // the grid x alone (the kernel's one dimension), at least a block, at most
+  // the blocks the signals have slots for; the tile positive; a pack a load the
+  // hardware has (2, 4, 8 or 16 bytes), at least an element, whole packs a row
+  // (an aligned load of the pack's width). No INT4: a norm on rows moves
+  // nothing. It reads no peer and no region, so nothing more is checked here.
+  if (!dtype_built(dtype)) return error_code(Error::dtype_not_built);
+  if (!x_alone(grid) || grid.x < 1 || grid.x > s.symmetric.max_blocks)
+    return error_code(Error::launch_out_of_range);
+  if (build.tile_m < 1 || build.tile_n < 1 || build.tile_k < 1)
+    return error_code(Error::field_not_positive);
+  if (pack < 2 || pack > kPackBytes || (pack & (pack - 1)) != 0 || pack < e)
+    return error_code(Error::pack_out_of_range);
+  if (n * e % pack != 0) return error_code(Error::row_not_packs);
+  if (build.quantization == Quantization::int4)
+    return error_code(Error::quantization_not_supported);
   // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1, its
   // rows on whole packs of the build's.
   if (input_stride_n != 1 || blocks_stride_n != 1 ||
       norm_weight_stride_n != 1 || qk_weight_stride_n != 1 ||
       prefix_output_stride_n != 1 || output_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
-  if (input_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      blocks_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      blocks_stride_r * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      prefix_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0 ||
-      output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+  if (input_stride_m * e % pack != 0 ||
+      blocks_stride_m * e % pack != 0 ||
+      blocks_stride_r * e % pack != 0 ||
+      prefix_output_stride_m * e % pack != 0 ||
+      output_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   // THE OPTIONAL BUFFERS, checked only when given
   // (all_reduce_add_attn_res_rms_norm's).
   if (prefix_ptr != nullptr && prefix_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (prefix_ptr != nullptr &&
-      prefix_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+      prefix_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   if (output_norm_weight_ptr != nullptr && output_norm_weight_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (block_output_ptr != nullptr && block_output_stride_n != 1)
     return error_code(Error::inner_stride_not_one);
   if (block_output_ptr != nullptr &&
-      block_output_stride_m * elem_bytes(dtype) % build.pack_bytes != 0)
+      block_output_stride_m * e % pack != 0)
     return error_code(Error::row_stride_not_packs);
   // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS
   // (attn_res.cuh's attn_res_wide): [tile_m][num_blocks + 1] floats.
@@ -2983,12 +2915,12 @@ ErrorCode hip_custom_communicator_add_attn_res_rms_norm(
         i.block_z == build.block.z && i.waves_per_eu == build.waves_per_eu &&
         i.tile_m == build.tile_m && i.tile_n == build.tile_n &&
         i.tile_k == build.tile_k && i.quantization == build.quantization &&
-        i.pack_bytes == build.pack_bytes && i.world == 0 &&
+        i.pack_bytes == pack && i.world == 0 &&
         i.wave_size == s.device.wave_size && i.dtype == dtype &&
         i.weight_dtype == dtype && i.contiguous == false &&
         i.chunked == chunked && i.tail == false &&
         i.quantize_int4 == (build.quantization == Quantization::int4 &&
-                            build.pack_bytes == kPackBytes))
+                            pack == kPackBytes))
       kernel = i.kernel;
   if (kernel == nullptr) return error_code(Error::not_built);
   if (const std::optional<Error> e =

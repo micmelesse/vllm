@@ -10,8 +10,8 @@ all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 (`csrc/rocm/hip_custom_communicator.cu`).
 
 The caller names an op and Python looks its kernels up in the tuned table
-(`TunedTable.nearest`: the inputs tuned at the communicator's `quantization`, INT4
-where it pays): one kernel or, where the op is faster as two kernels of ours, our
+(`TunedTable.nearest`: the inputs tuned at the communicator's `quantization`; where it
+allows INT4 a pick moves INT4 or exact, whichever the tune found faster at its size): one kernel or, where the op is faster as two kernels of ours, our
 all-reduce and then the op's norm on this rank's rows (`add_rms_norm`,
 `add_attn_res_rms_norm`). The keyword arguments an op takes after its
 own: `config`, its op's config class, the one way to force one, for the tuner and
@@ -189,7 +189,8 @@ _TABLE_KEYS = ("inputs", "configs", "picks")
 
 
 # AN OP AS THE TABLE NAMES IT, and the communicator's quantization as the table's input
-# names it (the mode the communicator was opened in).
+# names it (the mode the communicator was opened in: `exact` moves no INT4; `quantized`
+# allows it, each pick exact or INT4 as its config says).
 _QUALIFIED = "hip_custom_communicator."
 
 
@@ -219,7 +220,6 @@ _CONFIG_KEYS = (
     "tile_k",
     "quantization",
     "pack_bytes",
-    "quantize_from_bytes",
 )
 
 
@@ -311,7 +311,7 @@ class Build:
     """ONE BUILD OF AN OP'S KERNEL, what dispatch instantiates (C++'s BuildConfig): its
     algorithm (a norm on rows' "rows"), its block and the block's waves a EU, its tile
     (tile_k 1 where the kernel has no K), what it moves and its pack. A config is a
-    build and a launch (its grid, quantize_from_bytes)."""
+    build and a launch (its grid)."""
 
     algorithm: str
     block_x: int
@@ -343,9 +343,8 @@ class Build:
 
 # EACH OP'S CONFIG, ONE CLASS AN OP, a field each (in `_CONFIG_KEYS`' order): its
 # algorithm (its own), its grid, its block and the block's waves a EU, its
-# tile, what it moves, its pack, and the call's bytes from which an INT4 config
-# quantizes (`quantize_from_bytes`: a launch's, the tune's pick; below them its INT4
-# build passes the call exact; 0, it always quantizes; an exact config's None). Its
+# tile, what it moves (an INT4 config always quantizes, an exact one never) and its
+# pack. Its
 # kernel, its algorithms and what it does not choose (a norm on rows' one algorithm, a
 # kernel without K's tile_k) are the class's: the table and C++ name every field of
 # every op, so a config reads them alike, but a call cannot force them. Every op's C++
@@ -369,9 +368,6 @@ class AllReduceConfig:
     tile_n: int
     quantization: Quantization
     pack_bytes: int
-    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
-    # forcing (C++'s 0, it always quantizes).
-    quantize_from_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -394,9 +390,6 @@ class AllReduceAddRmsNormConfig:
     tile_n: int
     quantization: Quantization
     pack_bytes: int
-    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
-    # forcing (C++'s 0, it always quantizes).
-    quantize_from_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -421,9 +414,6 @@ class AllReduceAddAttnResRmsNormConfig:
     tile_k: int
     quantization: Quantization
     pack_bytes: int
-    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
-    # forcing (C++'s 0, it always quantizes).
-    quantize_from_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -447,9 +437,6 @@ class AddRmsNormConfig:
     tile_n: int
     quantization: Quantization
     pack_bytes: int
-    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
-    # forcing (C++'s 0, it always quantizes).
-    quantize_from_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -471,9 +458,6 @@ class AddAttnResRmsNormConfig:
     tile_k: int
     quantization: Quantization
     pack_bytes: int
-    # None: an exact config's (it never quantizes), or an INT4 one's left out of a
-    # forcing (C++'s 0, it always quantizes).
-    quantize_from_bytes: int | None = None
 
 
 Config = (
@@ -641,11 +625,7 @@ class TunedTable:
                     continue
                 config = first
             if config is not None:
-                return replace(
-                    config,
-                    quantization=quantization,
-                    quantize_from_bytes=None if quantization == "exact" else 0,
-                )
+                return replace(config, quantization=quantization)
         return None
 
 
@@ -718,7 +698,7 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
     bool where its op is the norm's (else none: the residual is the call's), in a mode,
     at a world, with a width and tokens, tuned once; every pick one input's, its configs
     one kernel of the input's op, or our all-reduce then the op's norm on rows, an exact
-    input's moving nothing quantized, a quantized one's all-reduce INT4; every tuned op
+    input's moving nothing quantized (a quantized one's exact or INT4); every tuned op
     an input in each mode at every world the table tunes, the norm op's with a residual
     and without (the lookup reads one there)."""
     tables = json.loads(path.read_text())
@@ -758,17 +738,6 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
                 f"{where} has keys {list(c)}, not {keys}",
-            )
-            return Error.tuned_table_unsound
-        q = c["quantize_from_bytes"]
-        if (c["quantization"] == "exact") != (q is None) or (
-            q is not None and (not isinstance(q, int) or q < 0)
-        ):
-            logger.error(
-                "HipCustomCommunicator open: %s: %s",
-                Error.tuned_table_unsound.name,
-                f"{where}: quantize_from_bytes is null for an exact config, an INT4 "
-                "one's count of bytes",
             )
             return Error.tuned_table_unsound
         # AS ITS KERNEL'S CONFIG: its algorithm one of the kernel's, and a field the
@@ -870,18 +839,6 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
                 f"{where}: an exact input moves INT4",
-            )
-            return Error.tuned_table_unsound
-        # THE QUANTIZED MODE RUNS THE ALL-REDUCE'S INT4 KERNELS, every pick (each
-        # passing a call exact itself below its quantize_from_bytes): no exact
-        # all-reduce kernel in quantized mode, the plain op's or a split's first.
-        if tuned.mode == "quantized" and any(
-            c.kernel == "all_reduce" and c.quantization != "int4" for c in launches
-        ):
-            logger.error(
-                "HipCustomCommunicator open: %s: %s",
-                Error.tuned_table_unsound.name,
-                f"{where}: a quantized input picks the exact all-reduce kernel",
             )
             return Error.tuned_table_unsound
         # ONE KERNEL, or the op's split: our all-reduce, then its kernel on rows (the
@@ -1169,10 +1126,10 @@ class HipCustomCommunicator:
         `timeout_seconds`: how long a kernel waits on a peer before it reports a fault;
         None is the device group's own (its backend's timeout). `max_rows` and
         `max_cols`: the largest call it serves, which its exchange is sized for; None is
-        the server's (its max_num_batched_tokens and hidden size). `quantization`: what
-        the plain calls move across
-        the links, from each op's crossover up (their table: the quantized one where
-        INT4); None is what the environment asks
+        the server's (its max_num_batched_tokens and hidden size). `quantization`: whether
+        the plain calls may move INT4 across the links (`int4`: each call its pick's,
+        exact or INT4, from the quantized inputs; `exact`: never); None is what the
+        environment asks
         (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION).
         `tuned_path`: the tuned tables' file its plain calls run from (the arch's table,
         `parse_tuned_table`): the shipped one (`hip_custom_communicator.json`), or a
@@ -1346,16 +1303,10 @@ class HipCustomCommunicator:
             )
             assert isinstance(picked, AllReduceConfig), picked
             config = picked
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4, a quantized
-        # one runs the INT4 kernel (which passes a call below its quantize_from_bytes
-        # exact itself).
+        # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
         if self.arguments.quantization == "exact" and config.quantization != "exact":
             raise AssertionError(
                 f"an exact communicator given an INT4 config: {config}"
-            )
-        if self.arguments.quantization == "int4" and config.quantization != "int4":
-            raise AssertionError(
-                f"a quantized communicator given an exact config: {config}"
             )
 
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
@@ -1374,7 +1325,6 @@ class HipCustomCommunicator:
             tile_n=config.tile_n,
             quantization=config.quantization,
             pack_bytes=config.pack_bytes,
-            quantize_from_bytes=config.quantize_from_bytes,
         )
         if error is not None:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -1466,20 +1416,10 @@ class HipCustomCommunicator:
             config = picked
         split = isinstance(config, AllReduceAddRmsNormSplitConfig)
         launches: list[Config] = [config.all_reduce, config.rows] if split else [config]
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
-        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
-        # call below its quantize_from_bytes exact itself.
+        # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
         for c in launches:
             if self.arguments.quantization == "exact" and c.quantization != "exact":
                 raise AssertionError(f"an exact communicator given an INT4 config: {c}")
-            if (
-                self.arguments.quantization == "int4"
-                and c.kernel == "all_reduce"
-                and c.quantization != "int4"
-            ):
-                raise AssertionError(
-                    f"a quantized communicator given an exact config: {c}"
-                )
 
         # ONE C++ CALL: the fused kernel at the config's algorithm, or the split
         # (algorithm `<the all-reduce's body>_split`: the all-reduce at its config,
@@ -1507,7 +1447,6 @@ class HipCustomCommunicator:
             tile_n=first.tile_n,
             quantization=first.quantization,
             pack_bytes=first.pack_bytes,
-            quantize_from_bytes=first.quantize_from_bytes,
             rms_norm_grid_x=config.rows.grid_x if split else None,
             rms_norm_grid_y=config.rows.grid_y if split else None,
             rms_norm_grid_z=config.rows.grid_z if split else None,
@@ -1607,20 +1546,10 @@ class HipCustomCommunicator:
             if isinstance(config, AllReduceAddAttnResRmsNormSplitConfig)
             else [config]
         )
-        # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
-        # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
-        # call below its quantize_from_bytes exact itself.
+        # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
         for c in launches:
             if self.arguments.quantization == "exact" and c.quantization != "exact":
                 raise AssertionError(f"an exact communicator given an INT4 config: {c}")
-            if (
-                self.arguments.quantization == "int4"
-                and c.kernel == "all_reduce"
-                and c.quantization != "int4"
-            ):
-                raise AssertionError(
-                    f"a quantized communicator given an exact config: {c}"
-                )
 
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
@@ -1655,7 +1584,6 @@ class HipCustomCommunicator:
                     tile_k=config.tile_k,
                     quantization=config.quantization,
                     pack_bytes=config.pack_bytes,
-                    quantize_from_bytes=config.quantize_from_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(
@@ -1681,7 +1609,6 @@ class HipCustomCommunicator:
                     tile_n=config.all_reduce.tile_n,
                     quantization=config.all_reduce.quantization,
                     pack_bytes=config.all_reduce.pack_bytes,
-                    quantize_from_bytes=config.all_reduce.quantize_from_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(
@@ -1713,7 +1640,6 @@ class HipCustomCommunicator:
                     tile_k=config.rows.tile_k,
                     quantization=config.rows.quantization,
                     pack_bytes=config.rows.pack_bytes,
-                    quantize_from_bytes=config.rows.quantize_from_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(

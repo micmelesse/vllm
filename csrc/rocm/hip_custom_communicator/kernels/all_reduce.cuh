@@ -509,9 +509,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
     int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks) {
-  // THE DISPATCH, an algorithm a function; QUANTIZE_INT4 (the host's, from the
-  // config's quantization and quantize_from_bytes) whether this launch moves
-  // INT4.
+  // THE DISPATCH, an algorithm a function; QUANTIZE_INT4 (the config's
+  // quantization) whether this launch moves INT4.
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
     all_reduce_one_shot_pull<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                              THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
