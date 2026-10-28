@@ -2768,7 +2768,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   staging_stride_n = 1;
   staging_size_m = staged_rows(algorithm, build.quantization, m, s.world);
   staging_size_n = row_n;
-  in_place = !is_push(algorithm) && build.quantization == Quantization::exact;
+  // IN PLACE, every exact algorithm: the pushed two-shot's reduce-scatter reads
+  // its peers' inputs through the input table too (reduce_scatter.cuh's
+  // columns_push), as the norm's does.
+  in_place = build.quantization == Quantization::exact;
   // EVERY VIEW INSIDE ITS REGION (view_fits).
   if (!view_fits(1, 0, partials_size_m, partials_stride_m, partials_size_n,
                  partials_stride_n, elem_bytes(dtype),
