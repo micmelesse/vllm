@@ -220,8 +220,9 @@ def instances(build: Build) -> list[Instance]:
     """EVERY INSTANCE OF `build` a call can reach: each dtype and world (a norm on rows
     has none), the weight's dtype where a norm takes one, contiguous or not (the plain
     two-shots), chunked or not (every kernel but the plain all-reduce's), with a tail or
-    not (an INT4 two-shot, or the fused norm's INT4 one-shot), the plain all-reduce's INT4 build quantizing or passing the
-    call exact, and a norm kernel's with a residual or without. An INT4 build at a
+    not (an INT4 two-shot, or a fused op's INT4 one-shot), the plain all-reduce's INT4
+    build quantizing or passing the call exact, and a norm kernel's with a residual or
+    without. An INT4 build at a
     narrower pack compiles its exact body (INT4's word is a pack of 8 values; the call
     is refused before it launches)."""
     params = TEMPLATE_ARGS[build.kernel].split()
@@ -230,7 +231,7 @@ def instances(build: Build) -> list[Instance]:
     plain = build.kernel == "all_reduce"
     if int4 and plain:
         tails = ((True, True), (False, True), (False, False))
-    elif int4 and (two_shot or build.kernel == "all_reduce_add_rms_norm"):
+    elif int4 and (two_shot or not plain):
         tails = ((True, True), (False, True))
     else:
         tails = ((False, int4),)

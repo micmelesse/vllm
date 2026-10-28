@@ -119,7 +119,7 @@ AllReduceAddRmsNormAlgorithm = Literal[
 
 
 AllReduceAddAttnResRmsNormAlgorithm = Literal[
-    "one_shot_pull", "two_shot_pull", "two_shot_push"
+    "one_shot_pull", "two_shot_pull_rows", "two_shot_pull_columns", "two_shot_push"
 ]
 
 

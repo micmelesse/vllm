@@ -214,7 +214,10 @@ struct AllReduceAddRmsNormBuildConfig {
 struct AllReduceAddAttnResRmsNormBuildConfig {
   static constexpr Named<AllReduceAddAttnResRmsNormAlgorithm> algorithms[] = {
       {AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull, "two_shot_pull"},
+      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_rows,
+       "two_shot_pull_rows"},
+      {AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns,
+       "two_shot_pull_columns"},
       {AllReduceAddAttnResRmsNormAlgorithm::two_shot_push, "two_shot_push"}};
   AllReduceAddAttnResRmsNormAlgorithm algorithm;
   Dim3 block;
@@ -493,7 +496,8 @@ constexpr bool is_one_shot(A a) {
 
 template <typename A>
 constexpr bool is_two_shot(A a) {
-  if constexpr (std::is_same_v<A, AllReduceAddRmsNormKernelAlgorithm>)
+  if constexpr (std::is_same_v<A, AllReduceAddRmsNormKernelAlgorithm> ||
+                std::is_same_v<A, AllReduceAddAttnResRmsNormAlgorithm>)
     return a != A::one_shot_pull;
   else
     return a == A::two_shot_pull || a == A::two_shot_push;
@@ -589,8 +593,8 @@ constexpr bool int4_groups_a_thread(AllReduceAddRmsNormKernelAlgorithm) {
   return false;
 }
 
-constexpr bool int4_groups_a_thread(AllReduceAddAttnResRmsNormAlgorithm a) {
-  return a == AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull;
+constexpr bool int4_groups_a_thread(AllReduceAddAttnResRmsNormAlgorithm) {
+  return false;
 }
 
 // AN INT4 ROW WITH A TAIL, the INT4 two-shots' TAIL instance: the flat walk
@@ -733,14 +737,12 @@ std::optional<Error> refused(bool collective, int world, int64_t staging_bytes,
   const int64_t pack = build.pack_bytes;
   if (pack < elem_bytes(dtype)) return Error::pack_out_of_range;
   if (n * elem_bytes(dtype) % pack != 0) return Error::row_not_packs;
-  // INT4 ON A NORM ON ROWS (it moves nothing) OR A FUSED ONE-SHOT (it reads its
-  // peers' inputs as they are): named before the build lookup, which lists no
-  // such build; INT4 AT A NARROWER PACK than the widest: the format's word is a
-  // pack of 8 values (common.cuh's QUANTIZATION).
+  // INT4 ON A NORM ON ROWS (it moves nothing): named before the build lookup,
+  // which lists no such build; INT4 AT A NARROWER PACK than the widest: the
+  // format's word is a pack of 8 values (common.cuh's QUANTIZATION).
   const bool int4_build = build.quantization == Quantization::int4;
   if constexpr (requires { build.algorithm; }) {
-    if (int4_build &&
-        ((!kPlain && is_one_shot(build.algorithm)) || pack != kPackBytes))
+    if (int4_build && pack != kPackBytes)
       return Error::quantization_not_supported;
   } else if (int4_build) {
     return Error::quantization_not_supported;
