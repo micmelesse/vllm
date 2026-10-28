@@ -69,27 +69,17 @@ ALGORITHM_ENUMS = {
     "add_rms_norm": "AddRmsNormAlgorithm",
     "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
 }
-# THE NORM KERNELS' TEMPLATE WITHOUT A RESIDUAL: a norm kernel is two templates, by the
-# call's residual (as its dtype or its tail, the call's, never tuned), the add-norm (its
-# own name) or this, the norm; every build of it compiles both.
-NO_RESIDUAL_TEMPLATES = {
-    "all_reduce_add_rms_norm": "all_reduce_rms_norm",
-    "add_rms_norm": "rms_norm",
-}
-# EACH TEMPLATE'S PARAMETERS, in its order (kernels/*.cuh): a build
-# field, an instance's (world, wave_size, contiguous, chunked, tail, quantize_int4),
-# or T and W, the input's and the weight's types.
+# EACH KERNEL'S TEMPLATE PARAMETERS, in its order (kernels/*.cuh): a build
+# field, an instance's (world, wave_size, contiguous, chunked, tail, quantize_int4,
+# residual: a norm's, the call's), or T and W, the input's and the weight's types.
 TEMPLATE_ARGS = {
     "all_reduce": "algorithm quantize_int4 T world tile_m tile_n block_x wave_size "
     "pack_bytes waves_per_eu contiguous tail",
-    "all_reduce_rms_norm": "algorithm quantize_int4 T W world tile_n block_x "
-    "wave_size pack_bytes waves_per_eu chunked tail",
-    "all_reduce_add_rms_norm": "algorithm quantize_int4 T W world tile_n block_x "
-    "wave_size pack_bytes waves_per_eu chunked tail",
+    "all_reduce_add_rms_norm": "algorithm residual quantize_int4 T W world tile_n "
+    "block_x wave_size pack_bytes waves_per_eu chunked tail",
     "all_reduce_add_attn_res_rms_norm": "algorithm quantize_int4 T world tile_m "
     "tile_n tile_k block_x wave_size pack_bytes waves_per_eu chunked tail",
-    "rms_norm": "T W tile_m tile_n block_x wave_size pack_bytes waves_per_eu chunked",
-    "add_rms_norm": "T W tile_m tile_n block_x wave_size pack_bytes "
+    "add_rms_norm": "residual T W tile_m tile_n block_x wave_size pack_bytes "
     "waves_per_eu chunked",
     "add_attn_res_rms_norm": "T tile_m tile_n tile_k block_x wave_size "
     "pack_bytes waves_per_eu chunked",
@@ -145,7 +135,7 @@ class Build:
 class Instance:
     """AN INSTANCE OF A BUILD a call can reach: the world (0 for a norm on rows, which
     has none), the dtypes, the wave, and which of the build's instances it is (a norm
-    kernel's with a residual or without, its two templates)."""
+    kernel's with a residual or without)."""
 
     build: Build
     world: int
@@ -157,13 +147,6 @@ class Instance:
     quantize_int4: bool
     residual: bool
     wave_size: int = WAVE_SIZE
-
-    def template_name(self) -> str:
-        """Its template: a norm kernel's by the residual (the add-norm with one, else
-        NO_RESIDUAL_TEMPLATES'), any other kernel's its own."""
-        if self.residual:
-            return self.build.kernel
-        return NO_RESIDUAL_TEMPLATES.get(self.build.kernel, self.build.kernel)
 
     def template(self) -> str:
         """Its kernel's template-id, `all_reduce<...>`: compiled and declared."""
@@ -184,9 +167,10 @@ class Instance:
             "contiguous": str(self.contiguous).lower(),
             "chunked": str(self.chunked).lower(),
             "tail": str(self.tail).lower(),
+            "residual": str(self.residual).lower(),
         }
-        args = ", ".join(value[a] for a in TEMPLATE_ARGS[self.template_name()].split())
-        return f"{self.template_name()}<{args}>"
+        args = ", ".join(value[a] for a in TEMPLATE_ARGS[b.kernel].split())
+        return f"{b.kernel}<{args}>"
 
 
 @dataclass(frozen=True)
@@ -250,7 +234,7 @@ def instances(build: Build) -> list[Instance]:
         tails = ((True, True), (False, True))
     else:
         tails = ((False, int4),)
-    residuals = (True, False) if build.kernel in NO_RESIDUAL_TEMPLATES else (False,)
+    residuals = (True, False) if "residual" in params else (False,)
     out: list[Instance] = []
     for dtype in DTYPES:
         for world in WORLDS if "world" in params else (0,):

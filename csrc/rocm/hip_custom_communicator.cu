@@ -323,24 +323,18 @@ using AllReduceKernel =
     decltype(&all_reduce<AllReduceAlgorithm{}, false, T, 2, 1, 1, 64, 64, 16, 1,
                          false, false>);
 template <typename T, typename W>
-using AllReduceRmsNormKernel =
-    decltype(&all_reduce_rms_norm<AllReduceAddRmsNormKernelAlgorithm{}, false,
-                                  T, W, 2, 1, 64, 64, 16, 1, false, false>);
-template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},
-                                      false, T, W, 2, 1, 64, 64, 16, 1, false,
-                                      false>);
+                                      false, false, T, W, 2, 1, 64, 64, 16, 1,
+                                      false, false>);
 template <typename T, typename W>
 using AllReduceAddAttnResRmsNormKernel =
     decltype(&all_reduce_add_attn_res_rms_norm<
              AllReduceAddAttnResRmsNormAlgorithm{}, false, T, 2, 1, 1, 1, 64,
              64, 16, 1, false, false>);
 template <typename T, typename W>
-using RmsNormKernel = decltype(&rms_norm<T, W, 1, 1, 64, 64, 16, 1, false>);
-template <typename T, typename W>
 using AddRmsNormKernel =
-    decltype(&add_rms_norm<T, W, 1, 1, 64, 64, 16, 1, false>);
+    decltype(&add_rms_norm<false, T, W, 1, 1, 64, 64, 16, 1, false>);
 template <typename T, typename W>
 using AddAttnResRmsNormKernel =
     decltype(&add_attn_res_rms_norm<T, 1, 1, 1, 64, 64, 16, 1, false>);
@@ -2366,111 +2360,24 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     if (static_cast<int64_t>(rms_norm_attributes.localSizeBytes) >
         s.device.scratch_a_lane)
       return error_code(Error::scratch_too_large);
-  } else if (!add) {
-    // ---- THE FUSED NORM KERNEL (no residual) ----
-    // WHAT THE CALL PICKS: INT4 where the config is (it always quantizes); in
-    // place, the exact pull, every rank's input read where its table says; a
-    // row wider than the tile, the build's CHUNKED instance; an INT4 row with a
-    // tail, its TAIL instance (int4_tail).
-    const bool pull =
-        algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
-    in_place = pull && !quantize_int4;
-    const bool chunked = n > tile_n;
-    const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
-    // THE INSTANCE: the kernel compiled at this config, on this device, for
-    // this call (builds.py's kAllReduceAddRmsNormInstances, its norm's rows); a
-    // config the table did not build, or a weight dtype no build has, is
-    // refused here.
-    for (const auto& i : kAllReduceAddRmsNormInstances)
-      if (!i.residual && i.algorithm == algorithm && i.block_x == block_x &&
-          i.block_y == block_y && i.block_z == block_z &&
-          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
-          i.tile_n == tile_n &&
-          i.quantization ==
-              (int4_config ? Quantization::int4 : Quantization::exact) &&
-          i.pack_bytes == pack_bytes && i.world == s.world &&
-          i.wave_size == s.device.wave_size && i.dtype == dtype &&
-          i.weight_dtype == weight_dtype && i.chunked == chunked &&
-          i.tail == tail && i.quantize_int4 == quantize_int4)
-        kernel = i.kernel;
-    if (kernel == nullptr) return error_code(Error::not_built);
-    // THE KERNEL ON THIS DEVICE, as its compiler left it. HIP refuses the block
-    // and the LDS at the launch; the scratch only when the dispatch runs,
-    // aborting the queue and the process with it.
-    hipFuncAttributes attributes;
-    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
-      return error_code(Error::hip_failed);
-    if (block_x > attributes.maxThreadsPerBlock)
-      return error_code(Error::block_too_large);
-    if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
-        s.device.lds_bytes)
-      return error_code(Error::lds_too_large);
-    if (static_cast<int64_t>(attributes.localSizeBytes) >
-        s.device.scratch_a_lane)
-      return error_code(Error::scratch_too_large);
-    // THE GRID RESIDENT AT ONCE: a peer barrier spins until the same block on
-    // every peer arrives, so a grid past the blocks the device holds at once
-    // can hang (HIP never refuses it).
-    int blocks_a_cu = 0;
-    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_a_cu, kernel, static_cast<int>(block_x),
-            shared_memory_bytes) != hipSuccess)
-      return error_code(Error::hip_failed);
-    if (grid_x > blocks_a_cu * s.device.compute_units)
-      return error_code(Error::grid_not_resident);
-    // ---- ITS VIEWS OF THE REGIONS, in elements, [rows, row] at stride row: a
-    // row is n, or the INT4 pulled two-shot's payload row, whole groups (it
-    // walks whole groups a thread: its kernel's n_pad). The staging holds the
-    // input's rows, or that two-shot's INT4 inbox, WORLD slots of an owner's
-    // ceil(m / WORLD) rows; the partials what a two-shot keeps: the pull its
-    // rank's rows, the push every row's columns. THE WHOLE CALL IN ONE PASS:
-    // the regions are sized from the largest call the server makes, so a call
-    // past them is refused, never cut into bands; every input fits the staging
-    // whole (an eager call's host copy). ----
-    const bool groups_a_thread =
-        quantize_int4 &&
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
-    const int64_t row =
-        groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
-    const int64_t owned_rows = (m + s.world - 1) / s.world;
-    staging_stride_m = row, staging_stride_n = 1,
-    staging_size_m = groups_a_thread ? s.world * owned_rows : m,
-    staging_size_n = row;
-    partials_stride_m = row, partials_stride_n = 1,
-    partials_size_m =
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull
-            ? owned_rows
-        : algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push ? m
-                                                                         : 0,
-    partials_size_n = row;
-    // WHAT THE REGIONS MUST HOLD: its input whole; INT4, the payloads (the
-    // pull's its staged rows' and its owned rows', the push's the call's).
-    staging_need = m * n * e, partials_need = partials_size_m * n * e;
-    if (quantize_int4 && groups_a_thread) {
-      staging_need =
-          std::max(staging_need, int4_payload_bytes(staging_size_m, row));
-      partials_need =
-          std::max(partials_need, int4_payload_bytes(owned_rows, row));
-    } else if (quantize_int4) {
-      staging_need = std::max(staging_need, int4_payload_bytes(m, n));
-      partials_need = std::max(partials_need, int4_payload_bytes(1, m * n));
-    }
   } else {
-    // ---- THE FUSED ADD-NORM KERNEL (a residual) ----
+    // ---- THE FUSED KERNEL ----
     // WHAT THE CALL PICKS: in place, the exact pull; a row wider than the tile,
-    // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance.
+    // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance;
+    // with a residual its RESIDUAL instance.
     in_place = algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push &&
                !quantize_int4;
     const bool chunked = n > tile_n;
     const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
     // THE INSTANCE: the kernel compiled at this config, on this device, for
-    // this call (builds.py's kAllReduceAddRmsNormInstances, its add-norm's
-    // rows).
+    // this call (builds.py's kAllReduceAddRmsNormInstances, a row each); a
+    // config the table did not build, or a weight dtype no build has, is
+    // refused here.
     for (const auto& i : kAllReduceAddRmsNormInstances)
-      if (i.residual && i.algorithm == algorithm && i.block_x == block_x &&
-          i.block_y == block_y && i.block_z == block_z &&
-          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
-          i.tile_n == tile_n &&
+      if (i.algorithm == algorithm && i.residual == add &&
+          i.block_x == block_x && i.block_y == block_y &&
+          i.block_z == block_z && i.waves_per_eu == waves_per_eu &&
+          i.tile_m == tile_m && i.tile_n == tile_n &&
           i.quantization ==
               (int4_config ? Quantization::int4 : Quantization::exact) &&
           i.pack_bytes == pack_bytes && i.world == s.world &&
@@ -2642,19 +2549,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       launch.template operator()<c10::BFloat16, c10::BFloat16>();
     else
       launch.template operator()<c10::Half, c10::Half>();
-    // ---- THE NORM, on the sum in place: every element written by the thread
-    // that read it, after it read it. ----
-    const auto launch_rms_norm = [&]<typename T, typename W>() {
-      const auto typed = reinterpret_cast<RmsNormKernel<T, W>>(rms_norm_kernel);
-      typed<<<dim3_of(rms_norm_grid), dim3_of(rms_norm_block),
-              shared_memory_bytes, stream>>>(
-          static_cast<const T*>(output_ptr), output_stride_m, output_stride_n,
-          static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-          static_cast<const W*>(weight_ptr), weight_stride_n,
-          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), eps);
-    };
+    // ---- THE NORM (with a residual, the add and the norm), on the sum in
+    // place: every element written by the thread that read it, after it read
+    // it; without a residual its arguments null and empty. ----
     const auto launch_add_rms_norm = [&]<typename T, typename W>() {
       const auto typed =
           reinterpret_cast<AddRmsNormKernel<T, W>>(rms_norm_kernel);
@@ -2672,58 +2569,18 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
           residual_output_stride_n, static_cast<int>(residual_output_size_m),
           static_cast<int>(residual_output_size_n), eps);
     };
-    if (add && dtype == at::ScalarType::BFloat16 &&
-        weight_dtype == at::ScalarType::Float)
-      launch_add_rms_norm.template operator()<c10::BFloat16, float>();
-    else if (add && dtype == at::ScalarType::BFloat16)
-      launch_add_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
-    else if (add && weight_dtype == at::ScalarType::Float)
-      launch_add_rms_norm.template operator()<c10::Half, float>();
-    else if (add)
-      launch_add_rms_norm.template operator()<c10::Half, c10::Half>();
-    else if (dtype == at::ScalarType::BFloat16 &&
-             weight_dtype == at::ScalarType::Float)
-      launch_rms_norm.template operator()<c10::BFloat16, float>();
-    else if (dtype == at::ScalarType::BFloat16)
-      launch_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
-    else if (weight_dtype == at::ScalarType::Float)
-      launch_rms_norm.template operator()<c10::Half, float>();
-    else
-      launch_rms_norm.template operator()<c10::Half, c10::Half>();
-  } else if (!add) {
-    // THE NORM KERNEL'S LAUNCH, at the call's dtypes.
-    const auto launch = [&]<typename T, typename W>() {
-      const auto typed = reinterpret_cast<AllReduceRmsNormKernel<T, W>>(kernel);
-      typed<<<dim3_of(grid), dim3_of(block), shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
-          static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-          reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
-          peer_inputs_stride_m, peer_inputs_stride_n,
-          static_cast<const W*>(weight_ptr), weight_stride_n,
-          static_cast<int>(weight_size_n), static_cast<T*>(output_ptr),
-          output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
-          s.world, partials_stride_m, partials_stride_n,
-          static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
-          s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-          staging_stride_n, static_cast<int>(staging_size_m),
-          static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-          s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-          int64_t{1}, int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
-          s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
-          s.timeout_ticks, eps);
-    };
     if (dtype == at::ScalarType::BFloat16 &&
         weight_dtype == at::ScalarType::Float)
-      launch.template operator()<c10::BFloat16, float>();
+      launch_add_rms_norm.template operator()<c10::BFloat16, float>();
     else if (dtype == at::ScalarType::BFloat16)
-      launch.template operator()<c10::BFloat16, c10::BFloat16>();
+      launch_add_rms_norm.template operator()<c10::BFloat16, c10::BFloat16>();
     else if (weight_dtype == at::ScalarType::Float)
-      launch.template operator()<c10::Half, float>();
+      launch_add_rms_norm.template operator()<c10::Half, float>();
     else
-      launch.template operator()<c10::Half, c10::Half>();
+      launch_add_rms_norm.template operator()<c10::Half, c10::Half>();
   } else {
-    // THE ADD-NORM KERNEL'S LAUNCH, at the call's dtypes.
+    // THE FUSED KERNEL'S LAUNCH, at the call's dtypes (without a residual its
+    // arguments null and empty: the kernel reads none).
     const auto launch = [&]<typename T, typename W>() {
       const auto typed =
           reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
