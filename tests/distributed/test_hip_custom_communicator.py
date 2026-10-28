@@ -35,9 +35,24 @@ NUM_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 512, 2048]
 MAX_TOKENS = 2048
 EPS = 1e-5
 ATTN_RES_EPS = 1e-6
-# INT4's error against the exact op, end to end: the format's rounding (a group's
-# largest value / 7 a step) summed over the ranks.
-INT4_RELATIVE_RMS = 0.15
+# INT4's error against the exact op, end to end (relative RMS): the format's
+# rounding (a group's largest value / 7 a step) summed over the ranks. A one-shot
+# quantizes once (each rank's input); a two-shot twice (the inputs for the
+# reduce-scatter, the sums for the all-gather), as QuickReduce's two-shot does:
+# its bar the looser (measured: AttnRes's two-shots 0.19 at 16 tokens, world 8,
+# its one-shot 0.10).
+INT4_ONE_SHOT_RELATIVE_RMS = 0.15
+INT4_TWO_SHOT_RELATIVE_RMS = 0.25
+
+
+def int4_bar(launches) -> float:
+    """The INT4 bar of a call that launched `launches` (its configs): a two-shot's
+    where one moved INT4 in two shots, else a one-shot's."""
+    two_shot = any(
+        c.quantization == "int4" and c.algorithm.startswith("two_shot")
+        for c in launches
+    )
+    return INT4_TWO_SHOT_RELATIVE_RMS if two_shot else INT4_ONE_SHOT_RELATIVE_RMS
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -80,7 +95,9 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
                     if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
-                        assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
+                        assert err / rms <= int4_bar(
+                            comm.tuned("all_reduce", num_tokens, HIDDEN, None)
+                        ), (num_tokens, dtype)
                     else:
                         assert torch.equal(out, want), (num_tokens, dtype)
 
@@ -98,7 +115,9 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
                     if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
-                        assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
+                        assert err / rms <= int4_bar(
+                            comm.tuned("all_reduce", num_tokens, HIDDEN, None)
+                        ), (num_tokens, dtype)
                     else:
                         assert torch.equal(out, want), (num_tokens, dtype)
         finally:
@@ -173,7 +192,13 @@ def all_reduce_add_rms_norm_no_residual_ranks(
                         if comm.arguments.quantization == "int4":
                             err = (out.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
-                            assert err / rms <= INT4_RELATIVE_RMS, (
+                            assert err / rms <= int4_bar(
+                                [config]
+                                if config is not None
+                                else comm.tuned(
+                                    "all_reduce_add_rms_norm", num_tokens, HIDDEN, False
+                                )
+                            ), (
                                 num_tokens,
                                 dtype,
                                 config,
@@ -198,7 +223,11 @@ def all_reduce_add_rms_norm_no_residual_ranks(
                     if comm.arguments.quantization == "int4":
                         err = (out.float() - want.float()).square().mean().sqrt()
                         rms = want.float().square().mean().sqrt()
-                        assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
+                        assert err / rms <= int4_bar(
+                            comm.tuned(
+                                "all_reduce_add_rms_norm", num_tokens, HIDDEN, False
+                            )
+                        ), (num_tokens, dtype)
                     else:
                         torch.testing.assert_close(out, want, atol=2e-2, rtol=2e-2)
         finally:
@@ -291,7 +320,16 @@ def all_reduce_add_rms_norm_ranks(
                                     (got.float() - want.float()).square().mean().sqrt()
                                 )
                                 rms = want.float().square().mean().sqrt()
-                                assert err / rms <= INT4_RELATIVE_RMS, (
+                                assert err / rms <= int4_bar(
+                                    [config]
+                                    if config is not None
+                                    else comm.tuned(
+                                        "all_reduce_add_rms_norm",
+                                        num_tokens,
+                                        HIDDEN,
+                                        True,
+                                    )
+                                ), (
                                     num_tokens,
                                     dtype,
                                     config,
@@ -321,7 +359,11 @@ def all_reduce_add_rms_norm_ranks(
                         if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
-                            assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
+                            assert err / rms <= int4_bar(
+                                comm.tuned(
+                                    "all_reduce_add_rms_norm", num_tokens, HIDDEN, True
+                                )
+                            ), (num_tokens, dtype)
                         else:
                             torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
         finally:
@@ -455,7 +497,16 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                                     (got.float() - want.float()).square().mean().sqrt()
                                 )
                                 rms = want.float().square().mean().sqrt()
-                                assert err / rms <= INT4_RELATIVE_RMS, (
+                                assert err / rms <= int4_bar(
+                                    [config]
+                                    if config is not None
+                                    else comm.tuned(
+                                        "all_reduce_add_attn_res_rms_norm",
+                                        num_tokens,
+                                        HIDDEN,
+                                        None,
+                                    )
+                                ), (
                                     num_tokens,
                                     dtype,
                                     config,
@@ -521,7 +572,14 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                         if comm.arguments.quantization == "int4":
                             err = (got.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
-                            assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
+                            assert err / rms <= int4_bar(
+                                comm.tuned(
+                                    "all_reduce_add_attn_res_rms_norm",
+                                    num_tokens,
+                                    HIDDEN,
+                                    None,
+                                )
+                            ), (num_tokens, dtype)
                         else:
                             torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
         finally:
