@@ -41,9 +41,11 @@ DINLINE void rms_normalize(const float (&input)[ROWS][K][P],
                            bool round_scaled, Layout layout) {
   if (part != NormPart::apply) {
     // This thread's share of each row's sum of squares, packs past size_n
-    // counting zero: its mask, 1 below size_n and 0 past it, is multiplied in
-    // so nothing branches (load clamps a pack past the clip to the last in
-    // bounds, and a load under a runtime `if` cannot be hoisted past it).
+    // counting zero, by a select (nothing branches: load clamps a pack past the
+    // clip to the last in bounds, and a load under a runtime `if` cannot be
+    // hoisted past it). A select, not a multiply by 0: a lane past size_n may
+    // hold anything (its clamped pack another thread's, not yet written), and 0
+    // * NaN is NaN, the row's whole scale with it.
     float ss[1][ROWS];
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) {
@@ -62,7 +64,7 @@ DINLINE void rms_normalize(const float (&input)[ROWS][K][P],
                       ((k / kInt4GroupPacks) * THREADS_PER_BLOCK + t) *
                           kInt4GroupPacks +
                       k % kInt4GroupPacks;
-        ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
+        ss[0][m] += n < size_n / P ? ss_k : 0.0f;
       }
     }
     if (part == NormPart::wide && offs_n + K * P * THREADS_PER_BLOCK < size_n) {
