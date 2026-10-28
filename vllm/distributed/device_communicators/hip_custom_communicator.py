@@ -379,13 +379,12 @@ class AllReduceConfig:
 
 @dataclass(frozen=True)
 class AllReduceAddRmsNormConfig:
-    """THE ALL-REDUCE THEN (ADD-)RMSNORM'S CONFIG, one kernel: the add-norm with a
-    residual, the norm without (`residual`, which of its two templates)."""
+    """THE ALL-REDUCE THEN (ADD-)RMSNORM'S CONFIG, one kernel: the add-norm where the
+    call has a residual, the norm where it has none (the call's, not the config's)."""
 
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
-    residual: bool
     algorithm: AllReduceAddRmsNormAlgorithm
     grid_x: int
     grid_y: int
@@ -433,14 +432,13 @@ class AllReduceAddAttnResRmsNormConfig:
 @dataclass(frozen=True)
 class AddRmsNormConfig:
     """THE (ADD-)RMSNORM ON THIS RANK'S ROWS' CONFIG: the second launch of
-    all_reduce_add_rms_norm's split (its rms_norm_ fields), the add-norm with a
-    residual, the norm without (`residual`)."""
+    all_reduce_add_rms_norm's split (its rms_norm_ fields): the add-norm where the call
+    has a residual, the norm where it has none."""
 
     kernel: ClassVar[str] = "add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = ("rows",)
     algorithm: ClassVar[str] = "rows"  # its one
     tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
-    residual: bool
     grid_x: int
     grid_y: int
     grid_z: int
@@ -598,12 +596,10 @@ class TunedTable:
         cols: int,
         quantization: Quantization,
         world: int,
-        residual: bool | None = None,
     ) -> Config | None:
         """KERNEL `kernel`'S OWN CONFIG AT `algorithm` FOR `rows` x `cols` MOVING
         `quantization` (a forced launch at the tuned config: gp's kernel lines, the
-        tests), a norm kernel's with `residual` or without (None for another
-        kernel's): the config of it moving that which its nearest input at `world`
+        tests): the config of it moving that which its nearest input at `world`
         launches, of any op, else the first such config of the table's; moving INT4
         where it has no INT4 config, its exact config moved INT4 (a build it lists).
         None where it has neither."""
@@ -614,7 +610,6 @@ class TunedTable:
         def takes(c: Config, moving: Quantization) -> bool:
             return (
                 c.kernel == kernel
-                and getattr(c, "residual", None) == residual
                 and c.algorithm == algorithm
                 and c.quantization == moving
                 and replace(Build.of(c), quantization=quantization) in builds
@@ -720,13 +715,12 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
     `TunedTables`), parsed and checked; else the Error, returned (why, logged):
     no_tuned_table where the file holds none for it, tuned_table_unsound (naming the
     entry) where it is not sound: its keys `_TABLE_KEYS`; every config its op's
-    (qualified), every field `_CONFIG_KEYS` names in that order (a norm kernel's
-    `residual` after its kernel), read as its op's config (its algorithm one of its
-    kernel's; builds.py compiles every config, and C++ refuses a config it did not,
-    not_built); every input one of `Op`'s, its residual a bool where its op is the
-    norm's (else none), in a mode, at a world, with a width and tokens, tuned once;
-    every pick one input's, its configs one kernel of the input's op, or our all-reduce
-    then the op's norm on rows, each norm kernel's residual the input's, an exact
+    (qualified), every field `_CONFIG_KEYS` names in that order, read as its op's
+    config (its algorithm one of its kernel's; builds.py compiles every config, and C++
+    refuses a config it did not, not_built); every input one of `Op`'s, its residual a
+    bool where its op is the norm's (else none: the residual is the call's), in a mode,
+    at a world, with a width and tokens, tuned once; every pick one input's, its configs
+    one kernel of the input's op, or our all-reduce then the op's norm on rows, an exact
     input's moving nothing quantized, a quantized one's all-reduce INT4; every tuned op
     an input in each mode at every world the table tunes, the norm op's with a residual
     and without (the lookup reads one there)."""
@@ -762,15 +756,11 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
         cls = _CONFIGS[c["kernel"]]
         own = {f.name for f in fields(cls)}
         keys = ["op", *_CONFIG_KEYS]
-        if "residual" in own:
-            keys.insert(keys.index("kernel") + 1, "residual")
-        if list(c) != keys or (
-            "residual" in own and not isinstance(c["residual"], bool)
-        ):
+        if list(c) != keys:
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
-                f"{where} has keys {list(c)}, not {keys} (a residual a bool)",
+                f"{where} has keys {list(c)}, not {keys}",
             )
             return Error.tuned_table_unsound
         q = c["quantize_from_bytes"]
@@ -876,15 +866,6 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
                 Error.tuned_table_unsound.name,
                 f"{where}: its configs are {ops}'s: one of {name}'s, or our all-reduce "
                 f"then {_ROWS.get(name)}",
-            )
-            return Error.tuned_table_unsound
-        if any(
-            getattr(c, "residual", tuned.residual) != tuned.residual for c in launches
-        ):
-            logger.error(
-                "HipCustomCommunicator open: %s: %s",
-                Error.tuned_table_unsound.name,
-                f"{where}: a norm config's residual is not its input's",
             )
             return Error.tuned_table_unsound
         if tuned.mode == "exact" and {c.quantization for c in launches} != {"exact"}:
@@ -1487,11 +1468,6 @@ class HipCustomCommunicator:
             ), picked
             config = picked
         split = isinstance(config, AllReduceAddRmsNormSplitConfig)
-        if (config.rows if split else config).residual != add:
-            raise AssertionError(
-                f"a config {'with' if add else 'without'} a residual is needed: "
-                f"{config}"
-            )
         launches: list[Config] = [config.all_reduce, config.rows] if split else [config]
         # WHAT IT MOVES IS THE COMMUNICATOR'S: an exact one moves no INT4; a quantized
         # one's all-reduce kernel (the split's first) is the INT4 one, which passes a
@@ -1827,14 +1803,12 @@ class HipCustomCommunicator:
         rows: int,
         cols: int,
         quantization: Quantization = "exact",
-        residual: bool | None = None,
     ) -> Config | None:
         """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` for `rows` x `cols` moving
-        `quantization`, a norm kernel's with `residual` or without
-        (`TunedTable.kernel_config`), or None."""
+        `quantization` (`TunedTable.kernel_config`), or None."""
         assert self.state is not None, "an open communicator has its state"
         return self.state.tuned_table.kernel_config(
-            kernel, algorithm, rows, cols, quantization, self.arguments.world, residual
+            kernel, algorithm, rows, cols, quantization, self.arguments.world
         )
 
     # ---- ITS END: close, a collective, and what it frees; the abandon at exit; the
