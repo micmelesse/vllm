@@ -69,7 +69,8 @@ ALGORITHM_ENUMS = {
     "add_rms_norm": "AddRmsNormAlgorithm",
     "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
 }
-# EACH FUSED OP'S KERNEL ON THIS RANK'S ROWS, its split's second launch.
+# EACH FUSED OP'S KERNEL ON THIS RANK'S ROWS, its split's second (its fields named
+# for it).
 SPLIT_ROWS = {
     "all_reduce_add_rms_norm": "add_rms_norm",
     "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
@@ -204,20 +205,24 @@ def parse_args(argv: list[str]) -> Command:
 
 def config_builds(config: dict) -> list[Build]:
     """THE BUILDS A CONFIG LAUNCHES: its kernel's; a split's (its algorithm
-    `<body>_split`) our all-reduce's at that body and its op's kernel on rows' at its
-    `rows_` fields (exact: it moves nothing)."""
+    `<body>_split`) our all-reduce's at that body and its second kernel's (the op on
+    this rank's rows) at the fields named for it (exact: it moves nothing; tile_k 1
+    where it has no K)."""
     if not str(config["algorithm"]).endswith("_split"):
         return [Build(config["kernel"], *(config[f] for f in FIELDS))]
     body = {**config, "algorithm": config["algorithm"].removesuffix("_split")}
-    rows = {
-        f: config[f"rows_{f}"] for f in FIELDS if f not in ("algorithm", "quantization")
+    second = SPLIT_ROWS[config["kernel"]]
+    fields = {
+        f: config.get(f"{second}_{f}", 1)
+        for f in FIELDS
+        if f not in ("algorithm", "quantization")
     }
     return [
         Build("all_reduce", *(body[f] for f in FIELDS)),
         Build(
-            SPLIT_ROWS[config["kernel"]],
+            second,
             *(
-                {**rows, "algorithm": "rows", "quantization": "exact"}[f]
+                {**fields, "algorithm": "rows", "quantization": "exact"}[f]
                 for f in FIELDS
             ),
         ),
