@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    AllReduceAddAttnResRmsNormConfig,
     AllReduceAddRmsNormConfig,
     HipCustomCommunicator,
 )
@@ -414,30 +415,56 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                     )
                     assert comm.should_allreduce_add_attn_res_rms_norm(x)
 
-                    # Eager.
-                    out_prefix, out = comm.all_reduce_add_attn_res_rms_norm(
-                        x,
-                        prefix,
-                        blocks,
-                        norm_weight,
-                        qk_weight,
-                        output_norm_weight,
-                        num_blocks,
-                        write_index,
-                        ATTN_RES_EPS,
-                        EPS,
-                    )
-                    for got, want in [
-                        (out, want_out),
-                        (out_prefix, want_prefix),
-                        (blocks, want_blocks),
-                    ]:
-                        if comm.arguments.quantization == "int4":
-                            err = (got.float() - want.float()).square().mean().sqrt()
-                            rms = want.float().square().mean().sqrt()
-                            assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
-                        else:
-                            torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+                    # Eager: the table's pick, then each algorithm of the fused
+                    # kernel forced at the table's build of it in this mode (one
+                    # it has no build of is skipped), each on its own copy of the
+                    # blocks (AttnRes writes one).
+                    forced = [
+                        comm.kernel_config(
+                            "all_reduce_add_attn_res_rms_norm",
+                            algorithm,
+                            num_tokens,
+                            HIDDEN,
+                            comm.arguments.quantization,
+                        )
+                        for algorithm in AllReduceAddAttnResRmsNormConfig.algorithms
+                    ]
+                    original_blocks = blocks.clone()
+                    for config in [None, *(c for c in forced if c is not None)]:
+                        blocks.copy_(original_blocks)
+                        out_prefix, out = comm.all_reduce_add_attn_res_rms_norm(
+                            x,
+                            prefix,
+                            blocks,
+                            norm_weight,
+                            qk_weight,
+                            output_norm_weight,
+                            num_blocks,
+                            write_index,
+                            ATTN_RES_EPS,
+                            EPS,
+                            config=config,
+                        )
+                        for got, want in [
+                            (out, want_out),
+                            (out_prefix, want_prefix),
+                            (blocks, want_blocks),
+                        ]:
+                            if comm.arguments.quantization == "int4":
+                                err = (
+                                    (got.float() - want.float()).square().mean().sqrt()
+                                )
+                                rms = want.float().square().mean().sqrt()
+                                assert err / rms <= INT4_RELATIVE_RMS, (
+                                    num_tokens,
+                                    dtype,
+                                    config,
+                                )
+                            else:
+                                torch.testing.assert_close(
+                                    got, want, atol=2e-2, rtol=2e-2, msg=str(config)
+                                )
+                    blocks.copy_(original_blocks)
 
                     # A CUDA graph, replayed on fresh inputs.
                     graph = torch.cuda.CUDAGraph()
