@@ -195,7 +195,10 @@ struct AllReduceBuildConfig {
 struct AllReduceAddRmsNormBuildConfig {
   static constexpr Named<AllReduceAddRmsNormKernelAlgorithm> algorithms[] = {
       {AllReduceAddRmsNormKernelAlgorithm::one_shot_pull, "one_shot_pull"},
-      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull, "two_shot_pull"},
+      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows,
+       "two_shot_pull_rows"},
+      {AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns,
+       "two_shot_pull_columns"},
       {AllReduceAddRmsNormKernelAlgorithm::two_shot_push, "two_shot_push"}};
   AllReduceAddRmsNormKernelAlgorithm algorithm;
   Dim3 block;
@@ -279,7 +282,8 @@ struct AddAttnResRmsNormBuildConfig {
 // (AllReduceAddRmsNormKernelAlgorithm).
 enum class AllReduceAddRmsNormAlgorithm : int {
   one_shot_pull,
-  two_shot_pull,
+  two_shot_pull_rows,
+  two_shot_pull_columns,
   two_shot_push,
   one_shot_pull_split,
   one_shot_push_split,
@@ -489,7 +493,10 @@ constexpr bool is_one_shot(A a) {
 
 template <typename A>
 constexpr bool is_two_shot(A a) {
-  return a == A::two_shot_pull || a == A::two_shot_push;
+  if constexpr (std::is_same_v<A, AllReduceAddRmsNormKernelAlgorithm>)
+    return a != A::one_shot_pull;
+  else
+    return a == A::two_shot_pull || a == A::two_shot_push;
 }
 
 template <typename A>
@@ -570,7 +577,7 @@ inline std::optional<Error> check_kernel(const CommsState& s,
 // sizes alike).
 constexpr bool slices_columns(AllReduceAlgorithm) { return false; }
 constexpr bool slices_columns(AllReduceAddRmsNormKernelAlgorithm a) {
-  return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
+  return is_two_shot(a);  // every two-shot's partials the [m, n] sum
 }
 
 constexpr bool slices_columns(AllReduceAddAttnResRmsNormAlgorithm a) {
@@ -578,8 +585,8 @@ constexpr bool slices_columns(AllReduceAddAttnResRmsNormAlgorithm a) {
 }
 
 constexpr bool int4_groups_a_thread(AllReduceAlgorithm) { return false; }
-constexpr bool int4_groups_a_thread(AllReduceAddRmsNormKernelAlgorithm a) {
-  return a == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
+constexpr bool int4_groups_a_thread(AllReduceAddRmsNormKernelAlgorithm) {
+  return false;
 }
 
 constexpr bool int4_groups_a_thread(AllReduceAddAttnResRmsNormAlgorithm a) {
@@ -663,30 +670,17 @@ constexpr std::optional<decltype(B::algorithm)> algorithm_named(
 // =============================================================================
 
 // A KERNEL'S PARTIALS, row-major, the whole call's: the plain two-shot its
-// slice of every row; a column two-shot the whole reduced tensor (each rank's
-// columns at their place); a row two-shot its rank's rows, twice where it
-// leaves two results (out and the residual). A one-shot reads the inputs and
-// keeps nothing; `packs` a row's in packs of `pack` bytes (the build's). THE
-// ADD-RMSNORM ROW TWO-SHOT's rows each carry their scale in a slot of
-// kScaleSlotBytes before the row (common.cuh;
-// kernels/all_reduce_add_rms_norm.cuh, its exact body: a row with its scale,
-// one buffer), its row whole kScaleSlotBytes so the next row's scale is aligned
-// (scale_slot_row).
+// slice of every row; a fused two-shot the whole reduced tensor (each rank's
+// rows or columns at their place). A one-shot reads the inputs and keeps
+// nothing; `packs` a row's in packs of `pack` bytes (the build's).
 template <typename A>
 constexpr int64_t partials_need(A algorithm, int64_t m, int64_t packs,
                                 int world, int64_t pack) {
   if (!is_two_shot(algorithm)) return 0;
-  if constexpr (std::is_same_v<A, AllReduceAlgorithm>) {
+  if constexpr (std::is_same_v<A, AllReduceAlgorithm>)
     return m * ((packs + world - 1) / world) * pack;
-  } else {
-    if (slices_columns(algorithm)) return m * packs * pack;
-    const int64_t row_bytes =
-        std::is_same_v<A, AllReduceAddRmsNormKernelAlgorithm> &&
-                !is_push(algorithm)
-            ? scale_slot_row(packs * pack) + kScaleSlotBytes
-            : packs * pack;
-    return (m + world - 1) / world * row_bytes;
-  }
+  else
+    return m * packs * pack;
 }
 
 // EVERY ALGORITHM OF EVERY KERNEL, `f` handed each (a norm on rows has none).
@@ -1920,8 +1914,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   AllReduceAddRmsNormAlgorithm op_algorithm;
   if (algorithm_name == "one_shot_pull")
     op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull;
-  else if (algorithm_name == "two_shot_pull")
-    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull;
+  else if (algorithm_name == "two_shot_pull_rows")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull_rows;
+  else if (algorithm_name == "two_shot_pull_columns")
+    op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull_columns;
   else if (algorithm_name == "two_shot_push")
     op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_push;
   else if (algorithm_name == "one_shot_pull_split")
@@ -1944,8 +1940,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     case AllReduceAddRmsNormAlgorithm::one_shot_pull:
       algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot_pull;
       break;
-    case AllReduceAddRmsNormAlgorithm::two_shot_pull:
-      algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
+    case AllReduceAddRmsNormAlgorithm::two_shot_pull_rows:
+      algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows;
+      break;
+    case AllReduceAddRmsNormAlgorithm::two_shot_pull_columns:
+      algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns;
       break;
     case AllReduceAddRmsNormAlgorithm::two_shot_push:
       algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
@@ -2122,7 +2121,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   // its path: the fused kernel's, or the split's all-reduce's and its norm's.
   void* kernel = nullptr;
   void* rms_norm_kernel = nullptr;
-  int64_t scales_stride_m = 0, scales_size_m = 0;
   Dim3 rms_norm_grid{}, rms_norm_block{};
   bool in_place = false;
   int64_t staging_need = 0, partials_need = 0;
@@ -2407,55 +2405,21 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       return error_code(Error::hip_failed);
     if (grid_x > blocks_a_cu * s.device.compute_units)
       return error_code(Error::grid_not_resident);
-    // ---- ITS VIEWS OF THE REGIONS, in elements: a row is n, or the INT4
-    // pulled two-shot's payload row, whole groups (it walks whole groups a
-    // thread). The staging holds the input's rows, or that two-shot's INT4
-    // inbox, WORLD slots of an owner's ceil(m / WORLD) rows. The partials what
-    // a two-shot keeps: the push every row's columns; the pull its rank's rows,
-    // EXACT each row after its scale's slot (kScaleSlotBytes, the row whole
-    // slots: scale_slot_row, so every row's scale is aligned at any pack), INT4
-    // the row alone, its scales in the scales region (max_rows rows). ----
-    const bool pull_two_shot =
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_pull;
-    const bool push_two_shot =
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::two_shot_push;
-    const bool groups_a_thread = quantize_int4 && pull_two_shot;
-    const bool scale_slot = pull_two_shot && !quantize_int4;
-    const int64_t row =
-        groups_a_thread ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
-    const int64_t owned_rows = (m + s.world - 1) / s.world;
-    const int64_t packs = n * e / pack_bytes;
-    // What a two-shot keeps, as the exchange was sized for it: the push every
-    // row; the pull its owned rows, each its scale's slot and the row.
-    const int64_t kept =
-        push_two_shot   ? m * packs * pack_bytes
-        : pull_two_shot ? owned_rows * (scale_slot_row(packs * pack_bytes) +
-                                        kScaleSlotBytes)
-                        : 0;
-    partials_stride_m =
-        scale_slot ? scale_slot_row(row * e) / e + kScaleSlotBytes / e : row;
-    partials_stride_n = 1;
-    partials_size_m = kept / (partials_stride_m * e);
-    partials_size_n = partials_stride_m;
-    if (pull_two_shot && !scale_slot && owned_rows > s.max_rows)
-      return error_code(Error::partials_too_small);
-    scales_stride_m = 1;
-    scales_size_m = pull_two_shot && !scale_slot ? owned_rows : 0;
-    staging_stride_m = row, staging_stride_n = 1,
-    staging_size_m = groups_a_thread ? s.world * owned_rows : m,
-    staging_size_n = row;
-    // WHAT THE REGIONS MUST HOLD: its input whole and what it keeps; INT4, the
-    // payloads (the pull's its staged rows' and its owned rows', the push's the
-    // call's).
-    staging_need = m * n * e, partials_need = kept;
-    if (quantize_int4 && groups_a_thread) {
-      staging_need =
-          std::max(staging_need, int4_payload_bytes(staging_size_m, row));
-      partials_need =
-          std::max(partials_need, int4_payload_bytes(owned_rows, row));
-    } else if (quantize_int4) {
+    // ---- ITS VIEWS OF THE REGIONS, in elements, [m, n] at stride n: the
+    // staging holds the input (an eager call's copy; INT4 its payload), a
+    // two-shot's partials the whole sum (each rank's rows or columns at their
+    // place; INT4 its payload). ----
+    const bool two_shot = is_two_shot(algorithm);
+    staging_stride_m = n, staging_stride_n = 1, staging_size_m = m,
+    staging_size_n = n;
+    partials_stride_m = n, partials_stride_n = 1,
+    partials_size_m = two_shot ? m : 0, partials_size_n = n;
+    // WHAT THE REGIONS MUST HOLD: the input whole and a two-shot's sum; INT4,
+    // their payloads.
+    staging_need = m * n * e, partials_need = two_shot ? m * n * e : 0;
+    if (quantize_int4) {
       staging_need = std::max(staging_need, int4_payload_bytes(m, n));
-      partials_need = std::max(partials_need, int4_payload_bytes(1, kept / e));
+      partials_need = std::max(partials_need, int4_payload_bytes(m, n));
     }
   }
   // THE REGIONS HOLD THE CALL: what the kernel stages and keeps, and each
@@ -2478,9 +2442,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   if (std::max(staging_need, staging_end) > s.symmetric.staging_bytes)
     return error_code(Error::staging_too_small);
   if (std::max(partials_need, partials_end) > s.symmetric.partials_bytes)
-    return error_code(Error::partials_too_small);
-  if (scales_size_m * scales_stride_m * int64_t{sizeof(float)} >
-      s.symmetric.scales_bytes)
     return error_code(Error::partials_too_small);
   // EVERY RANK'S INPUT, where the kernel reads it: in place through an input
   // table (the exact pulls: `world` addresses), else in every rank's staging;
@@ -2601,15 +2562,13 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
           static_cast<int>(residual_output_size_n),
           s.symmetric.partials_ptr_array, s.world, partials_stride_m,
           partials_stride_n, static_cast<int>(partials_size_m),
-          static_cast<int>(partials_size_n), s.symmetric.scales_ptr_array,
-          s.world, scales_stride_m, static_cast<int>(scales_size_m),
-          s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-          staging_stride_n, static_cast<int>(staging_size_m),
-          static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-          s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-          int64_t{1}, int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
-          s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
-          s.timeout_ticks, eps);
+          static_cast<int>(partials_size_n), s.symmetric.staging_ptr_array,
+          s.world, staging_stride_m, staging_stride_n,
+          static_cast<int>(staging_size_m), static_cast<int>(staging_size_n),
+          s.symmetric.signals_ptr_array, s.world,
+          s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+          int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+          int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
     };
     if (dtype == at::ScalarType::BFloat16 &&
         weight_dtype == at::ScalarType::Float)

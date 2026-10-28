@@ -26,6 +26,7 @@ namespace hip_custom_communicator {
 // staging, which every rank filled before a barrier).
 enum class AllGatherAlgorithm {
   flat,
+  rows,
   columns,
   tile_pull,
   tile_push,
@@ -40,10 +41,16 @@ enum class AllGatherAlgorithm {
 // contiguous range of groups reduce_scatter's same block summed, a rank a row
 // of threads, decoded and stored.
 //
+// rows (the fused ops' pull): `output` a thread's tile, ROWS x K packs from row
+// offs_m and column offs_n of the output_size_m x output_size_n tensor
+// (output's strides unused): each row from the rank owning it, `slice` rows a
+// rank (the last rank's to the end), its partials at the row's place
+// (reduce_scatter's rows walk). int4: the owner's words and scales, decoded.
+//
 // columns (the fused ops' pull): `output` a thread's tile, ROWS x K packs from
 // row offs_m and column offs_n of the output_size_m x output_size_n tensor
 // (output's strides unused): each pack from the rank owning its columns,
-// slice_n columns a rank (the last rank's to the end), the owner's partials
+// `slice` columns a rank (the last rank's to the end), the owner's partials
 // picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
 template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
@@ -55,7 +62,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
                         int partials_size_n, OUTPUT&& output,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int offs_m,
-                        int offs_n, int slice_n, int rank) {
+                        int offs_n, int slice, int rank) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   if constexpr (ALGORITHM == AllGatherAlgorithm::flat) {
@@ -152,6 +159,49 @@ DINLINE void all_gather(char* const* partials_ptr_array,
             0, chunk * kChunkN, 1);
       }
     }
+  } else if constexpr (ALGORITHM == AllGatherAlgorithm::rows) {
+    using Tile = std::remove_reference_t<OUTPUT>;
+    constexpr int kRows = std::extent_v<Tile, 0>;
+    constexpr int kPacks = std::extent_v<Tile, 1>;
+    static_assert(std::extent_v<Tile, 2> == kPackElems,
+                  "a tile's pack is the dtype's");
+    (void)output_stride_m;
+    (void)output_stride_n;
+    // EACH ROW FROM THE RANK OWNING IT, a recv a pack (a row's packs have one
+    // owner). int4: every pack's raw words and scales first, all in flight,
+    // then decoded.
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      const int owner = min((offs_m + i) / slice, WORLD - 1);
+      if constexpr (!kInt4) {
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k) {
+          DTYPE pack[1][1][kPackElems];
+          recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+               Layout::tile, TAIL>(
+              partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
+              partials_stride_m, partials_stride_n, 1, partials_size_m,
+              partials_size_n, output_size_m, output_size_n, pack, offs_m + i,
+              offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
+#pragma unroll
+          for (int j = 0; j < kPackElems; ++j) output[i][k][j] = pack[0][0][j];
+        }
+      } else {
+        uint32_t raw[kPacks][1][1][2];
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k)
+          recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+               Layout::tile, TAIL>(
+              partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
+              partials_stride_m, partials_stride_n, 1, partials_size_m,
+              partials_size_n, output_size_m, output_size_n, raw[k], offs_m + i,
+              offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k)
+          dequantize(raw[k][0][0][0],
+                     __builtin_bit_cast(float, raw[k][0][0][1]), output[i][k]);
+      }
+    }
   } else {
     using Tile = std::remove_reference_t<OUTPUT>;
     constexpr int kRows = std::extent_v<Tile, 0>;
@@ -160,7 +210,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
                   "a tile's pack is the dtype's");
     (void)output_stride_m;
     (void)output_stride_n;
-    // EACH PACK FROM THE RANK OWNING ITS COLUMNS, slice_n columns a rank (the
+    // EACH PACK FROM THE RANK OWNING ITS COLUMNS, `slice` columns a rank (the
     // last rank's to the end): a per-lane rank (a wave's packs may have two
     // owners), so a recv a pack, the pack's column as recv clamps it (past
     // output_size_n the last below it). int4: every pack's raw words and scales
@@ -171,7 +221,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
                     k * THREADS_PER_BLOCK;
       const int col =
           n < output_size_n / kPackElems ? n : output_size_n / kPackElems - 1;
-      return min(col / (slice_n / kPackElems), WORLD - 1);
+      return min(col / (slice / kPackElems), WORLD - 1);
     };
     if constexpr (!kInt4) {
 #pragma unroll

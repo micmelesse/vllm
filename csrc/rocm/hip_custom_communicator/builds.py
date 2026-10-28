@@ -226,7 +226,7 @@ def instances(build: Build) -> list[Instance]:
     is refused before it launches)."""
     params = TEMPLATE_ARGS[build.kernel].split()
     int4 = build.quantization == "int4" and build.pack_bytes == PACK_BYTES
-    two_shot = build.algorithm in ("two_shot_pull", "two_shot_push")
+    two_shot = build.algorithm.startswith("two_shot")
     plain = build.kernel == "all_reduce"
     if int4 and plain:
         tails = ((True, True), (False, True), (False, False))

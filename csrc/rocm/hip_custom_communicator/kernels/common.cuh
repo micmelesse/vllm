@@ -108,16 +108,6 @@ constexpr uint32_t kInt4ZeroWord =
 // A GROUP'S PACKS: a pack is a word of its group's values.
 constexpr int kInt4GroupPacks = kInt4Group / (2 * kInt4WordBytes);
 
-// THE ADD-RMSNORM PULL TWO-SHOT'S SCALE SLOT: each partials row's fp32 scale in
-// a slot before the row, kScaleSlotBytes whatever the build's pack, and the row
-// whole slots (scale_slot_row), so every row's scale is aligned at any pack
-// (kernels/all_reduce_add_rms_norm.cuh; the host's partials_need and partials
-// stride).
-constexpr int kScaleSlotBytes = 16;
-__host__ __device__ constexpr int64_t scale_slot_row(int64_t row_bytes) {
-  return (row_bytes + kScaleSlotBytes - 1) / kScaleSlotBytes * kScaleSlotBytes;
-}
-
 // A ROW OF n ELEMENTS' INT4 GROUPS, the last short where n is not whole groups.
 __host__ __device__ constexpr int64_t int4_groups(int64_t n) {
   return (n + kInt4Group - 1) / kInt4Group;

@@ -114,7 +114,7 @@ AllReduceAlgorithm = Literal[
 
 
 AllReduceAddRmsNormAlgorithm = Literal[
-    "one_shot_pull", "two_shot_pull", "two_shot_push"
+    "one_shot_pull", "two_shot_pull_rows", "two_shot_pull_columns", "two_shot_push"
 ]
 
 
@@ -123,16 +123,13 @@ AllReduceAddAttnResRmsNormAlgorithm = Literal[
 ]
 
 
-# THE ALGORITHMS THAT PUSH (their peers store into this rank's buffers): no input of
-# theirs is read in place.
-_PUSHED = ("one_shot_push", "two_shot_push", "one_shot_push_staged")
-
-
 # Any op's, by name: what a lookup across ops (`TunedTable.kernel_config`) asks.
 Algorithm = Literal[
     "one_shot_pull",
     "one_shot_push",
     "two_shot_pull",
+    "two_shot_pull_rows",
+    "two_shot_pull_columns",
     "two_shot_push",
     "one_shot_push_staged",
     "rows",
