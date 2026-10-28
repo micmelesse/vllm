@@ -332,8 +332,8 @@ using AllReduceKernel =
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},
-                                      false, false, T, W, 2, 1, 64, 64, 16, 1,
-                                      false, false>);
+                                      false, false, T, W, 2, 1, 1, 64, 64, 16,
+                                      1, false, false>);
 template <typename T, typename W>
 using AllReduceAddAttnResRmsNormKernel =
     decltype(&all_reduce_add_attn_res_rms_norm<

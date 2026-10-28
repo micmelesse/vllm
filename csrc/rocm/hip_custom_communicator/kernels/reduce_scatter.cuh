@@ -543,9 +543,9 @@ DINLINE void reduce_scatter_columns_pull(
 // THE ROWS WALK, PULLED (the fused ops' pull): this rank's rows, ceil(m /
 // WORLD) a rank (the last rank's to the end), every column; a chunk of a row at
 // a time, rank w's copy a row of threads, summed through LDS into this rank's
-// partials, the tensor's [m, n] (its rows alone written). Row q is block q %
-// gridDim.x's, as every walk after it reads it (all_gather's rows), so the
-// block that reads a row is the twin of the block that summed it.
+// partials, the tensor's [m, n] (its rows alone written). Tile t (TILE_M rows)
+// is block t % gridDim.x's, as every walk after it reads it (all_gather's
+// rows), so the block that reads a row is the twin of the block that summed it.
 template <bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
           bool TAIL, typename DTYPE>
@@ -609,39 +609,42 @@ DINLINE void reduce_scatter_rows_pull(
   static_assert(kLanes * WORLD == THREADS_PER_BLOCK,
                 "a block is a row of threads a rank");
   using Summed = std::conditional_t<QUANTIZE_INT4, float, DTYPE>;
-  // THIS BLOCK'S ROWS OF THIS RANK'S: q % gridDim.x == blockIdx.x.
-  const int grid = static_cast<int>(gridDim.x);
-  const int first =
-      row0 + ((static_cast<int>(blockIdx.x) - row0) % grid + grid) % grid;
-  for (int row = first; row < row_end; row += grid)
-    for (int c = 0; c < end; c += kLanes * kPackElems) {
-      // 2. Every rank's copy of the chunk, a row of threads each, in one
-      //    round trip.
-      const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
-      DTYPE got[1][1][kPackElems];
-      if constexpr (!QUANTIZE_INT4)
-        recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            input_ptr_array, input_ptr_array_size, r, 0, 0,
-            input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m,
-            input_size_n, input_size_m, end, got, row, c, 0);
-      else
-        recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-             Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r,
-                                 0, 0, staging_stride_m, staging_stride_n, 1,
-                                 staging_size_m, staging_size_n, input_size_m,
-                                 end, got, row, c, 0);
-      // 3. Summed over the rows (the ranks), in row order, through LDS,
-      //    rounded once.
-      Summed rounded[1][1][kPackElems];
-      reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
-                                                                 rounded[0]);
-      // 4. Stored in this rank's slice.
-      store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-            Layout::tile, TAIL>(
-          rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-          partials_stride_m, partials_stride_n, 1, partials_size_m,
-          partials_size_n, row + 1, end, row, c, 1);
-    }
+  // THIS BLOCK'S ROWS OF THIS RANK'S: those of its tiles, TILE_M rows each,
+  // tile t block t % gridDim.x's (as every walk after it).
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x)
+    for (int row = max(t * TILE_M, row0);
+         row < min(t * TILE_M + TILE_M, row_end); ++row)
+      for (int c = 0; c < end; c += kLanes * kPackElems) {
+        // 2. Every rank's copy of the chunk, a row of threads each, in one
+        // round
+        //    trip.
+        const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+        DTYPE got[1][1][kPackElems];
+        if constexpr (!QUANTIZE_INT4)
+          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+              input_ptr_array, input_ptr_array_size, r, 0, 0,
+              input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
+              input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
+        else
+          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+               Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r,
+                                   0, 0, staging_stride_m, staging_stride_n, 1,
+                                   staging_size_m, staging_size_n, input_size_m,
+                                   end, got, row, c, 0);
+        // 3. Summed over the rows (the ranks), in row order, through LDS,
+        // rounded
+        //    once.
+        Summed rounded[1][1][kPackElems];
+        reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
+                                                                   rounded[0]);
+        // 4. Stored in this rank's slice.
+        store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+              Layout::tile, TAIL>(
+            rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+            partials_stride_m, partials_stride_n, 1, partials_size_m,
+            partials_size_n, row + 1, end, row, c, 1);
+      }
   barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                  signals_stride_parity, signals_stride_block,
                  signals_stride_writer, signals_size_parity, signals_size_block,
@@ -682,10 +685,9 @@ DINLINE void reduce_scatter_columns_push(
       ((packs + kSliceUnit - 1) / kSliceUnit + WORLD - 1) / WORLD * kSliceUnit;
   const int col0 = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));
-  const int block_size_m =
-      input_size_m > static_cast<int>(blockIdx.x)
-          ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
-          : 0;
+  // THIS BLOCK'S TILES, TILE_M rows each, tile t block t % gridDim.x's (as the
+  // staging's walk below, and every walk after it).
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   // 1. int4: this block's rows of this rank's input, quantized into its
   //    staging, every load in flight before the first store.
   if constexpr (QUANTIZE_INT4) {
@@ -731,106 +733,109 @@ DINLINE void reduce_scatter_columns_push(
   const int offs_n = col0 * kPackElems;
   const int size_n = own_packs * kPackElems;
   if (size_n > 0)  // a late rank owns no columns
-    for (int q = 0; q < block_size_m; q += kThreadsM)
-      for (int c = offs_n; c < offs_n + size_n; c += kThreadsN * kPackElems) {
-        const int row = static_cast<int>(blockIdx.x + q * gridDim.x);
-        Summed rounded[1][1][kPackElems];
-        if constexpr (!QUANTIZE_INT4) {
-          DTYPE peers[WORLD][1][1][kPackElems];
-          for (int r = 0; r < WORLD; ++r)
-            recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, false,
-                 Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0,
-                               input_ptr_array_stride_m,
-                               input_ptr_array_stride_n, 1, input_size_m,
-                               input_size_n, input_size_m, offs_n + size_n,
-                               peers[r], row, c, static_cast<int>(gridDim.x));
+    for (int t = blockIdx.x; t < tiles; t += gridDim.x)
+      for (int q = 0; q < TILE_M; q += kThreadsM)
+        for (int c = offs_n; c < offs_n + size_n; c += kThreadsN * kPackElems) {
+          // Rows of threads, a row each, from the tile's row q; a row past the
+          // tile's end (another block's) reads the last below it and writes
+          // nothing.
+          const int row = t * TILE_M + q;
+          const int tile_end = min(input_size_m, t * TILE_M + TILE_M);
+          Summed rounded[1][1][kPackElems];
+          if constexpr (!QUANTIZE_INT4) {
+            DTYPE peers[WORLD][1][1][kPackElems];
+            for (int r = 0; r < WORLD; ++r)
+              recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, false,
+                   Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0,
+                                 input_ptr_array_stride_m,
+                                 input_ptr_array_stride_n, 1, input_size_m,
+                                 input_size_n, tile_end, offs_n + size_n,
+                                 peers[r], row, c, 1);
       // Summed in rank order in fp32, so every rank's sum agrees bitwise,
       // rounded once.
 #pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            float acc = static_cast<float>(peers[0][0][0][j]);
+            for (int j = 0; j < kPackElems; ++j) {
+              float acc = static_cast<float>(peers[0][0][0][j]);
 #pragma unroll
-            for (int r = 1; r < WORLD; ++r)
-              acc += static_cast<float>(peers[r][0][0][j]);
-            rounded[0][0][j] = static_cast<Summed>(acc);
-          }
-        } else {
-          // INT4 sums from the words: every rank's word and scale of this
-          // thread's pack, raw.
-          uint32_t raw[WORLD][1][1][2];
-          for (int r = 0; r < WORLD; ++r)
-            recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-                 Layout::tile, TAIL>(
-                staging_ptr_array, staging_ptr_array_size, r, 0, 0,
-                staging_stride_m, staging_stride_n, 1, staging_size_m,
-                staging_size_n, input_size_m, offs_n + size_n, raw[r], row, c,
-                static_cast<int>(gridDim.x));
-          // Every rank's pack summed from the words, in fp32 in rank order (the
-          // flat walk's sum above).
-          float sum[kPackElems];
+              for (int r = 1; r < WORLD; ++r)
+                acc += static_cast<float>(peers[r][0][0][j]);
+              rounded[0][0][j] = static_cast<Summed>(acc);
+            }
+          } else {
+            // INT4 sums from the words: every rank's word and scale of this
+            // thread's pack, raw.
+            uint32_t raw[WORLD][1][1][2];
+            for (int r = 0; r < WORLD; ++r)
+              recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
+                   QUANTIZE_INT4, Layout::tile, TAIL>(
+                  staging_ptr_array, staging_ptr_array_size, r, 0, 0,
+                  staging_stride_m, staging_stride_n, 1, staging_size_m,
+                  staging_size_n, tile_end, offs_n + size_n, raw[r], row, c, 1);
+            // Every rank's pack summed from the words, in fp32 in rank order
+            // (the flat walk's sum above).
+            float sum[kPackElems];
 #pragma unroll
-          for (int j = 0; j < kPackElems; ++j) sum[j] = 0.0f;
-          int w = 0;
-          if constexpr (kBf16<DTYPE>) {
-            const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
+            for (int j = 0; j < kPackElems; ++j) sum[j] = 0.0f;
+            int w = 0;
+            if constexpr (kBf16<DTYPE>) {
+              const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
-            for (; w + 1 < WORLD; w += 2) {
-              float a[kPackElems], b[kPackElems];
+              for (; w + 1 < WORLD; w += 2) {
+                float a[kPackElems], b[kPackElems];
+                dequantize(raw[w][0][0][0],
+                           __builtin_bit_cast(float, raw[w][0][0][1]), a);
+                dequantize(raw[w + 1][0][0][0],
+                           __builtin_bit_cast(float, raw[w + 1][0][0][1]), b);
+#pragma unroll
+                for (int j = 0; j < kPackElems; ++j)
+                  sum[j] = __builtin_amdgcn_fdot2_f32_bf16(
+                      __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones,
+                      sum[j], false);
+#pragma unroll
+                for (int j = 0; j < kPackElems; ++j)
+                  asm volatile("" ::"v"(sum[j]));
+              }
+            }
+#pragma unroll
+            for (; w < WORLD; ++w) {
+              float a[kPackElems];
               dequantize(raw[w][0][0][0],
                          __builtin_bit_cast(float, raw[w][0][0][1]), a);
-              dequantize(raw[w + 1][0][0][0],
-                         __builtin_bit_cast(float, raw[w + 1][0][0][1]), b);
 #pragma unroll
               for (int j = 0; j < kPackElems; ++j)
-                sum[j] = __builtin_amdgcn_fdot2_f32_bf16(
-                    __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones,
-                    sum[j], false);
+                sum[j] += static_cast<float>(static_cast<DTYPE>(a[j]));
 #pragma unroll
               for (int j = 0; j < kPackElems; ++j)
                 asm volatile("" ::"v"(sum[j]));
             }
+#pragma unroll
+            for (int j = 0; j < kPackElems; ++j) rounded[0][0][j] = sum[j];
           }
-#pragma unroll
-          for (; w < WORLD; ++w) {
-            float a[kPackElems];
-            dequantize(raw[w][0][0][0],
-                       __builtin_bit_cast(float, raw[w][0][0][1]), a);
-#pragma unroll
-            for (int j = 0; j < kPackElems; ++j)
-              sum[j] += static_cast<float>(static_cast<DTYPE>(a[j]));
-#pragma unroll
-            for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[j]));
+          // SENT TO EVERY RANK'S PARTIALS, INT4 quantized ONCE and the same
+          // payload sent to all.
+          [[maybe_unused]] uint32_t payload[1][1][2];
+          if constexpr (QUANTIZE_INT4) {
+            uint32_t word[1];
+            float scale;
+            quantize(rounded[0], word, scale);
+            payload[0][0][0] = word[0];
+            payload[0][0][1] = __builtin_bit_cast(uint32_t, scale);
           }
-#pragma unroll
-          for (int j = 0; j < kPackElems; ++j) rounded[0][0][j] = sum[j];
+          for (int r = 0; r < WORLD; ++r) {
+            if constexpr (QUANTIZE_INT4)
+              send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
+                   QUANTIZE_INT4, Layout::tile, TAIL>(
+                  payload, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
+                  partials_stride_m, partials_stride_n, 1, partials_size_m,
+                  partials_size_n, tile_end, offs_n + size_n, row, c, 1);
+            else
+              send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
+                   QUANTIZE_INT4, Layout::tile, TAIL>(
+                  rounded, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
+                  partials_stride_m, partials_stride_n, 1, partials_size_m,
+                  partials_size_n, tile_end, offs_n + size_n, row, c, 1);
+          }
         }
-        // SENT TO EVERY RANK'S PARTIALS, INT4 quantized ONCE and the same
-        // payload sent to all.
-        [[maybe_unused]] uint32_t payload[1][1][2];
-        if constexpr (QUANTIZE_INT4) {
-          uint32_t word[1];
-          float scale;
-          quantize(rounded[0], word, scale);
-          payload[0][0][0] = word[0];
-          payload[0][0][1] = __builtin_bit_cast(uint32_t, scale);
-        }
-        for (int r = 0; r < WORLD; ++r) {
-          if constexpr (QUANTIZE_INT4)
-            send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-                 Layout::tile, TAIL>(
-                payload, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
-                partials_stride_m, partials_stride_n, 1, partials_size_m,
-                partials_size_n, input_size_m, offs_n + size_n, row, c,
-                static_cast<int>(gridDim.x));
-          else
-            send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-                 Layout::tile, TAIL>(
-                rounded, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
-                partials_stride_m, partials_stride_n, 1, partials_size_m,
-                partials_size_n, input_size_m, offs_n + size_n, row, c,
-                static_cast<int>(gridDim.x));
-        }
-      }
   barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                  signals_stride_parity, signals_stride_block,
                  signals_stride_writer, signals_size_parity, signals_size_block,
