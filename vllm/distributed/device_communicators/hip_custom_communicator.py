@@ -962,11 +962,6 @@ def open_state(
                 signal.signal(
                     sig, functools.partial(on_exit_signal, signal.getsignal(sig))
                 )
-    logger.info(
-        "HipCustomCommunicator ready: exchange sized for %d rows of %d",
-        max_rows,
-        max_cols,
-    )
     return CommsState(handle=handle, arch=arch, tuned_table=tuned_table)
 
 
@@ -1136,6 +1131,15 @@ class HipCustomCommunicator:
         self.state = opened
         self.lifecycle.status = "open"
         _open_communicators.add(self)
+        # THE READY LINE, read by the benches' communicator proof: what the exchange is
+        # sized for, and the quantization the plain calls may move.
+        logger.info(
+            "HipCustomCommunicator ready: exchange sized for %d rows of %d, "
+            "quantization=%s",
+            self.arguments.max_rows,
+            self.arguments.max_cols,
+            self.arguments.quantization,
+        )
 
     # ---- WHAT THE CALLER USES, in its order. Concrete: this class owns the order. ----
     #
