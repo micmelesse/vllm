@@ -35,6 +35,37 @@ enum class AllReduceAddAttnResRmsNormAlgorithm {
 // the mix normed or not). IN PLACE: `input` may be `output` (the fused kernel's
 // sums): attn_res reads the sums before it writes the output.
 // =============================================================================
+// THE ROWS IN REGISTERS (a row in one pass): `sum` the thread's packs of ROWS
+// rows from row offs_m, the reduction's, never written to memory.
+template <int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, typename DTYPE,
+          int ROWS, int K, int P>
+DINLINE void add_attn_res_rms_norm_rows(
+    int offs_m, const DTYPE (&sum)[ROWS][K][P], int input_size_m,
+    int input_size_n, const DTYPE* prefix_ptr, int64_t prefix_stride_m,
+    int64_t prefix_stride_n, const DTYPE* blocks_ptr, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n,
+    const DTYPE* norm_weight_ptr, int64_t norm_weight_stride_n,
+    const DTYPE* qk_weight_ptr, int64_t qk_weight_stride_n,
+    const DTYPE* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
+    DTYPE* prefix_output_ptr, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
+    int64_t output_stride_n, DTYPE* block_output_ptr,
+    int64_t block_output_stride_m, int64_t block_output_stride_n,
+    int num_blocks, float eps, float output_eps) {
+  const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
+  attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, Layout::tile, false>(
+      sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
+      blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+      norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+      output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
+      prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+      output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
+      block_output_stride_n, input_size_m, input_size_n, offs_m, 0, num_blocks,
+      eps, output_eps, inv_hidden);
+}
+
+// THE ROWS IN MEMORY: their sums at `input` (a wide row, CHUNKED, a chunk at a
+// time, in attn_res's passes).
 template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED>
 DINLINE void add_attn_res_rms_norm_rows(
@@ -212,20 +243,36 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
             acc += static_cast<float>(copies[r][0][k][j]);
           sum[0][k][j] = static_cast<DTYPE>(acc);
         }
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS to AttnRes in registers; a wide row's chunks stored,
+      // then read back in attn_res's passes.
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
+            blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
+            norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+            qk_weight_stride_n, output_norm_weight_ptr,
+            output_norm_weight_stride_n, prefix_output_ptr,
+            prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+            output_stride_m, output_stride_n, block_output_ptr,
+            block_output_stride_m, block_output_stride_n, num_blocks, eps,
+            output_eps);
     }
-    add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
-                               WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
-        prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-        blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
-        qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
-        output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
-        prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
-        block_output_ptr, block_output_stride_m, block_output_stride_n,
-        num_blocks, eps, output_eps);
+    if constexpr (CHUNKED)
+      add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
+          prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+          norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+          output_norm_weight_ptr, output_norm_weight_stride_n,
+          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n,
+          output_ptr, output_stride_m, output_stride_n, block_output_ptr,
+          block_output_stride_m, block_output_stride_n, num_blocks, eps,
+          output_eps);
   }
   // 4. Every peer done reading this rank's input (or staging): the caller may
   //    write it, the next launch its staging.
@@ -296,20 +343,36 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, slice, rank);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS to AttnRes in registers; a wide row's chunks stored,
+      // then read back in attn_res's passes.
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
+            blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
+            norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+            qk_weight_stride_n, output_norm_weight_ptr,
+            output_norm_weight_stride_n, prefix_output_ptr,
+            prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+            output_stride_m, output_stride_n, block_output_ptr,
+            block_output_stride_m, block_output_stride_n, num_blocks, eps,
+            output_eps);
     }
-    add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
-                               WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
-        prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-        blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
-        qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
-        output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
-        prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
-        block_output_ptr, block_output_stride_m, block_output_stride_n,
-        num_blocks, eps, output_eps);
+    if constexpr (CHUNKED)
+      add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
+          prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+          norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+          output_norm_weight_ptr, output_norm_weight_stride_n,
+          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n,
+          output_ptr, output_stride_m, output_stride_n, block_output_ptr,
+          block_output_stride_m, block_output_stride_n, num_blocks, eps,
+          output_eps);
   }
 }
 
@@ -375,20 +438,36 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, slice, rank);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS to AttnRes in registers; a wide row's chunks stored,
+      // then read back in attn_res's passes.
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
+            blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
+            norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+            qk_weight_stride_n, output_norm_weight_ptr,
+            output_norm_weight_stride_n, prefix_output_ptr,
+            prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+            output_stride_m, output_stride_n, block_output_ptr,
+            block_output_stride_m, block_output_stride_n, num_blocks, eps,
+            output_eps);
     }
-    add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
-                               WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
-        prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-        blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
-        qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
-        output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
-        prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
-        block_output_ptr, block_output_stride_m, block_output_stride_n,
-        num_blocks, eps, output_eps);
+    if constexpr (CHUNKED)
+      add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
+          prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+          norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+          output_norm_weight_ptr, output_norm_weight_stride_n,
+          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n,
+          output_ptr, output_stride_m, output_stride_n, block_output_ptr,
+          block_output_stride_m, block_output_stride_n, num_blocks, eps,
+          output_eps);
   }
 }
 
@@ -453,20 +532,36 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
            TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                  partials_stride_m, partials_stride_n, 1, partials_size_m,
                  partials_size_n, m, n, sum, row, c, 1);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS to AttnRes in registers; a wide row's chunks stored,
+      // then read back in attn_res's passes.
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
+            blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
+            norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+            qk_weight_stride_n, output_norm_weight_ptr,
+            output_norm_weight_stride_n, prefix_output_ptr,
+            prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+            output_stride_m, output_stride_n, block_output_ptr,
+            block_output_stride_m, block_output_stride_n, num_blocks, eps,
+            output_eps);
     }
-    add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
-                               WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
-        prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-        blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
-        qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
-        output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
-        prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
-        block_output_ptr, block_output_stride_m, block_output_stride_n,
-        num_blocks, eps, output_eps);
+    if constexpr (CHUNKED)
+      add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, THREADS_PER_BLOCK,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
+          prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+          norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+          output_norm_weight_ptr, output_norm_weight_stride_n,
+          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n,
+          output_ptr, output_stride_m, output_stride_n, block_output_ptr,
+          block_output_stride_m, block_output_stride_n, num_blocks, eps,
+          output_eps);
   }
 }
 
