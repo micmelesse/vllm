@@ -2362,11 +2362,12 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       return error_code(Error::scratch_too_large);
   } else {
     // ---- THE FUSED KERNEL ----
-    // WHAT THE CALL PICKS: in place, the exact pull; a row wider than the tile,
-    // the build's CHUNKED instance; an INT4 row with a tail, its TAIL instance;
+    // WHAT THE CALL PICKS: in place, every exact algorithm (the pushed
+    // two-shot's reduce-scatter reads its peers' inputs through the input table
+    // too: reduce_scatter.cuh's columns_push); a row wider than the tile, the
+    // build's CHUNKED instance; an INT4 row with a tail, its TAIL instance;
     // with a residual its RESIDUAL instance.
-    in_place = algorithm != AllReduceAddRmsNormKernelAlgorithm::two_shot_push &&
-               !quantize_int4;
+    in_place = !quantize_int4;
     const bool chunked = n > tile_n;
     const bool tail = quantize_int4 && int4_tail(algorithm, m, n, s.world);
     // THE INSTANCE: the kernel compiled at this config, on this device, for
