@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT Copyright (C) 2026, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
-// ALL-REDUCE THEN (ADD THEN) RMSNORM: first the norm on rows, add_rms_norm_tile
+// ALL-REDUCE THEN (ADD THEN) RMSNORM: first the norm on rows, add_rms_norm_rows
 // (the split's second kernel, add_rms_norm, is a loop over it); then the fused
 // kernel, all_reduce_add_rms_norm, an algorithm a function. Each algorithm is a
 // reduction built from the all-reduce's primitives (all_gather.cuh,
@@ -30,7 +30,7 @@ enum class AllReduceAddRmsNormKernelAlgorithm {
 };
 
 // =============================================================================
-// add_rms_norm_tile: THE NORM ON ROWS, TILE_M rows from row offs_m: s =
+// add_rms_norm_rows: THE NORM ON ROWS, TILE_M rows from row offs_m: s =
 // float(input) (with RESIDUAL + float(residual), residual_output = DTYPE(s)),
 // output = DTYPE(W(W(s * scale) * float(w))) (rms_normalize.cuh). A row wider
 // than TILE_N (CHUNKED) in two passes: the scale over every chunk, then each
@@ -41,7 +41,7 @@ enum class AllReduceAddRmsNormKernelAlgorithm {
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
           int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool CHUNKED>
-DINLINE void add_rms_norm_tile(
+DINLINE void add_rms_norm_rows(
     int offs_m, const DTYPE* input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
@@ -193,7 +193,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                  int residual_output_size_n, float eps) {
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
-    add_rms_norm_tile<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
                       THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
         t * TILE_M, input_ptr, input_stride_m, input_stride_n, input_size_m,
         input_size_n, residual_ptr, residual_stride_m, residual_stride_n,
@@ -203,7 +203,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 // =============================================================================
-// THE FUSED KERNEL'S ALGORITHMS: each a reduction, then add_rms_norm_tile on
+// THE FUSED KERNEL'S ALGORITHMS: each a reduction, then add_rms_norm_rows on
 // this block's rows. Row q is block q % gridDim.x's in every walk, so the block
 // that norms a row is the block that wrote its sum; within the block a thread
 // norms the elements it wrote (the same Layout::tile walk).
@@ -270,7 +270,7 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
           sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
           n, m, n, row, c, 1);
     }
-    add_rms_norm_tile<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
                       THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
         residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
@@ -345,7 +345,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
           sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
           n, m, n, row, c, 1);
     }
-    add_rms_norm_tile<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
                       THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
         residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
@@ -415,7 +415,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
           sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
           n, m, n, row, c, 1);
     }
-    add_rms_norm_tile<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
                       THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
         residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
@@ -484,7 +484,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
           sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
           n, m, n, row, c, 1);
     }
-    add_rms_norm_tile<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
                       THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
         residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
