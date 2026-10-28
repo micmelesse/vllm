@@ -2038,15 +2038,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   if (!split && quantize_from != 0)
     return error_code(Error::field_not_this_templates);
   // A PACK A LOAD THE HARDWARE HAS (2, 4, 8 or 16 bytes); INT4 at the widest
-  // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION), and
-  // not on the one-shot, which reads its peers' inputs as they are.
+  // (the format's word is a pack of 8 values: common.cuh's QUANTIZATION).
   if (pack_bytes < 2 || pack_bytes > kPackBytes ||
       (pack_bytes & (pack_bytes - 1)) != 0)
     return error_code(Error::pack_out_of_range);
-  if (int4_config &&
-      (pack_bytes != kPackBytes ||
-       (!split &&
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)))
+  if (int4_config && pack_bytes != kPackBytes)
     return error_code(Error::quantization_not_supported);
   // THE CALL'S DTYPE BUILT (the world is: open refuses the rest), and its
   // elements whole packs: at least an element a pack, whole packs a row (an

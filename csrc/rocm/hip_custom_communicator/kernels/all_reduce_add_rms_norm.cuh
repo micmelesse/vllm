@@ -209,15 +209,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // norms the elements it wrote (the same Layout::tile walk).
 // =============================================================================
 
-// THE PULLED ONE-SHOT: every rank's chunk of the row through the input table
-// (all_gather's tile_pull, the all-reduce's pulled one-shot), summed in rank
-// order in fp32, rounded once, into `output`; then the row normed. Exact alone:
-// an INT4 build of it compiles this exact body, which never runs (the host
-// refuses an INT4 call of it by name, quantization_not_supported).
-template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int WORLD,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED>
+// THE PULLED ONE-SHOT: every rank's chunk of the row (all_gather's tile_pull,
+// the all-reduce's pulled one-shot), summed in rank order in fp32, rounded
+// once, into `output`; then the row normed. Exact, each rank's input read in
+// place through the input table; INT4, each rank's input quantized into its own
+// staging first and read from there, decoded.
+template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
+          typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_one_shot_pull(
+    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
     int input_ptr_array_size, int64_t input_ptr_array_stride_m,
     int64_t input_ptr_array_stride_n, const DTYPE* residual_ptr,
@@ -225,7 +226,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     const WEIGHT_DTYPE* weight_ptr, int64_t weight_stride_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
     DTYPE* residual_output_ptr, int64_t residual_output_stride_m,
-    int64_t residual_output_stride_n, uint32_t* const* signals_ptr_array,
+    int64_t residual_output_stride_n, char* const* staging_ptr_array,
+    int staging_ptr_array_size, uint32_t* const* signals_ptr_array,
     int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
@@ -236,25 +238,46 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
                          (kPackElems * THREADS_PER_BLOCK);
   constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
   const int m = input_size_m, n = input_size_n;
-  // 1. Every rank's input, through the input table, read before the barrier so
-  //    its round trip overlaps it; ready before the peer's launch.
-  const DTYPE* entries[WORLD];
+  // 1. INT4: this block's rows of this rank's input, quantized into its staging
+  //    (its payload a row of n), where its twin block on each peer reads them.
+  if constexpr (QUANTIZE_INT4)
+    for (int row = blockIdx.x; row < m; row += gridDim.x)
+      for (int c = 0; c < n; c += kSpan) {
+        DTYPE mine[1][kPacks][kPackElems];
+        load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m,
+            n, mine, row, c, 1);
+        store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile, TAIL>(
+            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
+            1, m, n, m, n, row, c, 1);
+      }
+  // 2. Every rank's entry, read before the barrier so its round trip overlaps
+  //    it: its staging's payload (INT4), or its input through the input table.
+  //    Every rank's data ready: INT4's written in this launch (ordered), the
+  //    exact inputs before it (the launch boundaries order them).
+  std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
 #pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    entries[r] = load(input_ptr_array, input_ptr_array_size, r);
+  for (int r = 0; r < WORLD; ++r) {
+    if constexpr (QUANTIZE_INT4)
+      entries[r] = load(staging_ptr_array, staging_ptr_array_size, r);
+    else
+      entries[r] = load(input_ptr_array, input_ptr_array_size, r);
+  }
+  constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::started;
   barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                  signals_stride_parity, signals_stride_block,
                  signals_stride_writer, signals_size_parity, signals_size_block,
                  signals_size_writer, status_ptr, status_stride_field,
-                 status_size_field, rank, timeout_ticks, Until::started, 0);
-  // 2. This block's rows: summed into `output`, chunk by chunk, then normed.
+                 status_size_field, rank, timeout_ticks, kFirst, 0);
+  // 3. This block's rows: summed into `output`, chunk by chunk, then normed.
   for (int row = blockIdx.x; row < m; row += gridDim.x) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE copies[WORLD][1][kPacks][kPackElems];
-      all_gather<AllGatherAlgorithm::tile_pull, false, DTYPE, WORLD, 1,
-                 THREADS_PER_BLOCK, WAVE_SIZE, false>(
-          entries, input_ptr_array_stride_m, input_ptr_array_stride_n, m, n, n,
-          row, c, copies);
+      all_gather<AllGatherAlgorithm::tile_pull, QUANTIZE_INT4, DTYPE, WORLD, 1,
+                 THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
+          entries, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
+          QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, n, row,
+          c, copies);
       DTYPE sum[1][kPacks][kPackElems];
 #pragma unroll
       for (int k = 0; k < kPacks; ++k)
@@ -277,7 +300,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
         output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
         residual_output_stride_m, residual_output_stride_n, eps);
   }
-  // 3. Every peer done reading this rank's input: the caller may write it.
+  // 4. Every peer done reading this rank's input (or staging): the caller may
+  //    write it, the next launch its staging.
   barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                  signals_stride_parity, signals_stride_block,
                  signals_stride_writer, signals_size_parity, signals_size_block,
@@ -535,18 +559,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // THE DISPATCH, an algorithm a function; RESIDUAL (the call's) whether it
   // adds a residual, QUANTIZE_INT4 (the host's) whether it moves INT4.
   if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)
-    all_reduce_add_rms_norm_one_shot_pull<RESIDUAL, DTYPE, WEIGHT_DTYPE, WORLD,
-                                          TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                                          PACK_BYTES, CHUNKED>(
-        input_size_m, input_size_n, input_ptr_array, input_ptr_array_size,
-        input_ptr_array_stride_m, input_ptr_array_stride_n, residual_ptr,
-        residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-        residual_output_stride_m, residual_output_stride_n, signals_ptr_array,
-        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks, eps);
+    all_reduce_add_rms_norm_one_shot_pull<
+        RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_N,
+        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
+        input_ptr_array_stride_n, residual_ptr, residual_stride_m,
+        residual_stride_n, weight_ptr, weight_stride_n, output_ptr,
+        output_stride_m, output_stride_n, residual_output_ptr,
+        residual_output_stride_m, residual_output_stride_n, staging_ptr_array,
+        staging_ptr_array_size, signals_ptr_array, signals_ptr_array_size,
+        signals_stride_parity, signals_stride_block, signals_stride_writer,
+        signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
+        eps);
   else if constexpr (ALGORITHM ==
                      AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows)
     all_reduce_add_rms_norm_two_shot_pull_rows<
