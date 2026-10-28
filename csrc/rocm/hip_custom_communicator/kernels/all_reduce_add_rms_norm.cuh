@@ -38,6 +38,56 @@ enum class AllReduceAddRmsNormKernelAlgorithm {
 // the split's), every element written by the thread that read it, after it read
 // it; so the rows' pointers are not __restrict__.
 // =============================================================================
+// THE ROWS IN REGISTERS (a row in one pass): `sum` the thread's packs of ROWS
+// rows from row offs_m (the reduction's, never written to memory), `w` the
+// weight's (loaded once by the caller, every row's).
+template <bool RESIDUAL, int THREADS_PER_BLOCK, int WAVE_SIZE, typename DTYPE,
+          typename WEIGHT_DTYPE, int ROWS, int K, int P>
+DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
+                               const WEIGHT_DTYPE (&w)[1][K][P],
+                               int input_size_m, int input_size_n,
+                               const DTYPE* residual_ptr,
+                               int64_t residual_stride_m,
+                               int64_t residual_stride_n, DTYPE* output_ptr,
+                               int64_t output_stride_m, int64_t output_stride_n,
+                               DTYPE* residual_output_ptr,
+                               int64_t residual_output_stride_m,
+                               int64_t residual_output_stride_n, float eps) {
+  const int m = input_size_m, n = input_size_n;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  DTYPE res[ROWS][K][P];
+  if constexpr (RESIDUAL)
+    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, m,
+        n, m, n, res, offs_m, 0, 1);
+  float s[ROWS][K][P];
+  DTYPE added[ROWS][K][P];
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        s[i][k][j] = static_cast<float>(sum[i][k][j]);
+        if constexpr (RESIDUAL) s[i][k][j] += static_cast<float>(res[i][k][j]);
+        added[i][k][j] = static_cast<DTYPE>(s[i][k][j]);
+      }
+  if constexpr (RESIDUAL)
+    store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
+        residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
+  float scale[ROWS];
+  DTYPE normed[ROWS][K][P];
+  rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps,
+                                              inv_hidden, n, 0, NormPart::row,
+                                              true, Layout::tile);
+  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
+      n, m, n, offs_m, 0, 1);
+}
+
+// THE ROWS IN MEMORY: their sums at `input`, a wide row (CHUNKED) in two
+// passes, a row in one pass loaded and handed to the register form.
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
           int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool CHUNKED>
@@ -129,43 +179,19 @@ DINLINE void add_rms_norm_rows(
           m, n, m, n, offs_m, c, 1);
     }
   } else {
-    // THE ROWS IN ONE PASS.
-    DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
+    // THE ROWS IN ONE PASS: their sums and the weight loaded, then the register
+    // form.
+    DTYPE x[TILE_M][kPacks][kPackElems];
     load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
         x, offs_m, 0, 1);
-    if constexpr (RESIDUAL)
-      load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, m,
-          n, m, n, res, offs_m, 0, 1);
-    float s[TILE_M][kPacks][kPackElems];
-    DTYPE added[TILE_M][kPacks][kPackElems];
-#pragma unroll
-    for (int i = 0; i < TILE_M; ++i)
-#pragma unroll
-      for (int k = 0; k < kPacks; ++k)
-#pragma unroll
-        for (int j = 0; j < kPackElems; ++j) {
-          s[i][k][j] = static_cast<float>(x[i][k][j]);
-          if constexpr (RESIDUAL)
-            s[i][k][j] += static_cast<float>(res[i][k][j]);
-          added[i][k][j] = static_cast<DTYPE>(s[i][k][j]);
-        }
-    if constexpr (RESIDUAL)
-      store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
-          residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
-    float scale[TILE_M];
-    DTYPE normed[TILE_M][kPacks][kPackElems];
-    rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps,
-                                                inv_hidden, n, 0, NormPart::row,
-                                                true, Layout::tile);
-    store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-        n, m, n, offs_m, 0, 1);
+    add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+        offs_m, x, w, m, n, residual_ptr, residual_stride_m, residual_stride_n,
+        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
+        residual_output_stride_m, residual_output_stride_n, eps);
   }
 }
 
@@ -270,6 +296,11 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
                  signals_size_writer, status_ptr, status_stride_field,
                  status_size_field, rank, timeout_ticks, kFirst, 0);
   // 3. This block's rows: summed into `output`, chunk by chunk, then normed.
+  // THE WEIGHT ONCE, every row's (a row in one pass).
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  if constexpr (!CHUNKED)
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
   for (int row = blockIdx.x; row < m; row += gridDim.x) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE copies[WORLD][1][kPacks][kPackElems];
@@ -289,16 +320,26 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
             acc += static_cast<float>(copies[r][0][k][j]);
           sum[0][k][j] = static_cast<DTYPE>(acc);
         }
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS normed in registers; a wide row's chunks stored, then
+      // normed from memory (two passes over the row).
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, w, m, n, residual_ptr, residual_stride_m,
+            residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+            residual_output_ptr, residual_output_stride_m,
+            residual_output_stride_n, eps);
     }
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
-                      THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
-        residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-        residual_output_stride_m, residual_output_stride_n, eps);
+    if constexpr (CHUNKED)
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
+          residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
+          output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
+          residual_output_stride_m, residual_output_stride_n, eps);
   }
   // 4. Every peer done reading this rank's input (or staging): the caller may
   //    write it, the next launch its staging.
@@ -357,6 +398,11 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
       rank, timeout_ticks);
   // 2. This block's rows: each from its owner into `output`, then normed.
   const int slice = (m + WORLD - 1) / WORLD;
+  // THE WEIGHT ONCE, every row's (a row in one pass).
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  if constexpr (!CHUNKED)
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
   for (int row = blockIdx.x; row < m; row += gridDim.x) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[1][kPacks][kPackElems];
@@ -365,16 +411,26 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, slice, rank);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS normed in registers; a wide row's chunks stored, then
+      // normed from memory (two passes over the row).
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, w, m, n, residual_ptr, residual_stride_m,
+            residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+            residual_output_ptr, residual_output_stride_m,
+            residual_output_stride_n, eps);
     }
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
-                      THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
-        residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-        residual_output_stride_m, residual_output_stride_n, eps);
+    if constexpr (CHUNKED)
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
+          residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
+          output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
+          residual_output_stride_m, residual_output_stride_n, eps);
   }
 }
 
@@ -427,6 +483,11 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
   // 2. This block's rows: each pack from its columns' owner into `output`, then
   //    normed. A rank's slice, in elements, as reduce_scatter cut it.
   const int slice = (n / kPackElems + WORLD - 1) / WORLD * kPackElems;
+  // THE WEIGHT ONCE, every row's (a row in one pass).
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  if constexpr (!CHUNKED)
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
   for (int row = blockIdx.x; row < m; row += gridDim.x) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[1][kPacks][kPackElems];
@@ -435,16 +496,26 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, slice, rank);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS normed in registers; a wide row's chunks stored, then
+      // normed from memory (two passes over the row).
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, w, m, n, residual_ptr, residual_stride_m,
+            residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+            residual_output_ptr, residual_output_stride_m,
+            residual_output_stride_n, eps);
     }
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
-                      THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
-        residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-        residual_output_stride_m, residual_output_stride_n, eps);
+    if constexpr (CHUNKED)
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
+          residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
+          output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
+          residual_output_stride_m, residual_output_stride_n, eps);
   }
 }
 
@@ -497,6 +568,11 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
       rank, timeout_ticks);
   // 2. This block's rows: each from this rank's partials into `output`, then
   //    normed.
+  // THE WEIGHT ONCE, every row's (a row in one pass).
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  if constexpr (!CHUNKED)
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
   for (int row = blockIdx.x; row < m; row += gridDim.x) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[1][kPacks][kPackElems];
@@ -504,16 +580,26 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
            TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                  partials_stride_m, partials_stride_n, 1, partials_size_m,
                  partials_size_n, m, n, sum, row, c, 1);
-      store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-          n, m, n, row, c, 1);
+      // A ROW IN ONE PASS normed in registers; a wide row's chunks stored, then
+      // normed from memory (two passes over the row).
+      if constexpr (CHUNKED)
+        store<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+            m, n, m, n, row, c, 1);
+      else
+        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+            row, sum, w, m, n, residual_ptr, residual_stride_m,
+            residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+            residual_output_ptr, residual_output_stride_m,
+            residual_output_stride_n, eps);
     }
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
-                      THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
-        residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-        output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-        residual_output_stride_m, residual_output_stride_n, eps);
+    if constexpr (CHUNKED)
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+          row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
+          residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
+          output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
+          residual_output_stride_m, residual_output_stride_n, eps);
   }
 }
 
