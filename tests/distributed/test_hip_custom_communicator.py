@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    AllReduceAddRmsNormConfig,
     HipCustomCommunicator,
 )
 from vllm.distributed.parallel_state import get_tp_group
@@ -151,14 +152,35 @@ def all_reduce_add_rms_norm_no_residual_ranks(
                     want = rms_norm(summed, weight, EPS)
                     assert comm.should_allreduce_add_rms_norm(x, weight)
 
-                    # Eager.
-                    out = comm.all_reduce_add_rms_norm(x, weight, EPS)
-                    if comm.arguments.quantization == "int4":
-                        err = (out.float() - want.float()).square().mean().sqrt()
-                        rms = want.float().square().mean().sqrt()
-                        assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
-                    else:
-                        torch.testing.assert_close(out, want, atol=2e-2, rtol=2e-2)
+                    # Eager: the table's pick, then each algorithm of the fused
+                    # kernel forced at the table's build of it in this mode (one
+                    # it has no build of is skipped).
+                    forced = [
+                        comm.kernel_config(
+                            "all_reduce_add_rms_norm",
+                            algorithm,
+                            num_tokens,
+                            HIDDEN,
+                            comm.arguments.quantization,
+                        )
+                        for algorithm in AllReduceAddRmsNormConfig.algorithms
+                    ]
+                    for config in [None, *(c for c in forced if c is not None)]:
+                        out = comm.all_reduce_add_rms_norm(
+                            x, weight, EPS, config=config
+                        )
+                        if comm.arguments.quantization == "int4":
+                            err = (out.float() - want.float()).square().mean().sqrt()
+                            rms = want.float().square().mean().sqrt()
+                            assert err / rms <= INT4_RELATIVE_RMS, (
+                                num_tokens,
+                                dtype,
+                                config,
+                            )
+                        else:
+                            torch.testing.assert_close(
+                                out, want, atol=2e-2, rtol=2e-2, msg=str(config)
+                            )
 
                     # A CUDA graph, replayed on fresh inputs.
                     graph = torch.cuda.CUDAGraph()
@@ -242,17 +264,41 @@ def all_reduce_add_rms_norm_ranks(
                     )
                     assert comm.should_allreduce_add_rms_norm(x, weight, residual)
 
-                    # Eager.
-                    out, residual_out = comm.all_reduce_add_rms_norm(
-                        x, weight, EPS, residual=residual
-                    )
-                    for got, want in [(out, want_out), (residual_out, want_residual)]:
-                        if comm.arguments.quantization == "int4":
-                            err = (got.float() - want.float()).square().mean().sqrt()
-                            rms = want.float().square().mean().sqrt()
-                            assert err / rms <= INT4_RELATIVE_RMS, (num_tokens, dtype)
-                        else:
-                            torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+                    # Eager: the table's pick, then each algorithm of the fused
+                    # kernel forced at the table's build of it in this mode (one
+                    # it has no build of is skipped).
+                    forced = [
+                        comm.kernel_config(
+                            "all_reduce_add_rms_norm",
+                            algorithm,
+                            num_tokens,
+                            HIDDEN,
+                            comm.arguments.quantization,
+                        )
+                        for algorithm in AllReduceAddRmsNormConfig.algorithms
+                    ]
+                    for config in [None, *(c for c in forced if c is not None)]:
+                        out, residual_out = comm.all_reduce_add_rms_norm(
+                            x, weight, EPS, residual=residual, config=config
+                        )
+                        for got, want in [
+                            (out, want_out),
+                            (residual_out, want_residual),
+                        ]:
+                            if comm.arguments.quantization == "int4":
+                                err = (
+                                    (got.float() - want.float()).square().mean().sqrt()
+                                )
+                                rms = want.float().square().mean().sqrt()
+                                assert err / rms <= INT4_RELATIVE_RMS, (
+                                    num_tokens,
+                                    dtype,
+                                    config,
+                                )
+                            else:
+                                torch.testing.assert_close(
+                                    got, want, atol=2e-2, rtol=2e-2, msg=str(config)
+                                )
 
                     # A CUDA graph, replayed on fresh inputs.
                     graph = torch.cuda.CUDAGraph()
