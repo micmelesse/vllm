@@ -69,6 +69,11 @@ ALGORITHM_ENUMS = {
     "add_rms_norm": "AddRmsNormAlgorithm",
     "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
 }
+# EACH FUSED OP'S KERNEL ON THIS RANK'S ROWS, its split's second launch.
+SPLIT_ROWS = {
+    "all_reduce_add_rms_norm": "add_rms_norm",
+    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
+}
 # EACH KERNEL'S TEMPLATE PARAMETERS, in its order (kernels/*.cuh): a build
 # field, an instance's (world, wave_size, contiguous, chunked, tail, quantize_int4,
 # residual: a norm's, the call's), or T and W, the input's and the weight's types.
@@ -197,6 +202,28 @@ def parse_args(argv: list[str]) -> Command:
     )
 
 
+def config_builds(config: dict) -> list[Build]:
+    """THE BUILDS A CONFIG LAUNCHES: its kernel's; a split's (its algorithm
+    `<body>_split`) our all-reduce's at that body and its op's kernel on rows' at its
+    `rows_` fields (exact: it moves nothing)."""
+    if not str(config["algorithm"]).endswith("_split"):
+        return [Build(config["kernel"], *(config[f] for f in FIELDS))]
+    body = {**config, "algorithm": config["algorithm"].removesuffix("_split")}
+    rows = {
+        f: config[f"rows_{f}"] for f in FIELDS if f not in ("algorithm", "quantization")
+    }
+    return [
+        Build("all_reduce", *(body[f] for f in FIELDS)),
+        Build(
+            SPLIT_ROWS[config["kernel"]],
+            *(
+                {**rows, "algorithm": "rows", "quantization": "exact"}[f]
+                for f in FIELDS
+            ),
+        ),
+    ]
+
+
 def parse_table(path: Path) -> dict[str, list[Build]]:
     """EACH ARCH'S BUILDS in the tuned tables' file at `path`, in the order its configs
     name them. A config of a kernel this file does not know, or with a tile_k where its
@@ -208,11 +235,14 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
             kernel = config["kernel"]
             if kernel not in ALGORITHM_ENUMS:
                 raise SystemExit(f"{path}: {arch}: no kernel {kernel}")
-            build = Build(kernel, *(config[f] for f in FIELDS))
-            if "tile_k" not in TEMPLATE_ARGS[kernel].split() and build.tile_k != 1:
-                raise SystemExit(f"{path}: {arch}: {build}: its kernel has no K")
-            if build not in builds:
-                builds.append(build)
+            for build in config_builds(config):
+                if (
+                    "tile_k" not in TEMPLATE_ARGS[build.kernel].split()
+                    and build.tile_k != 1
+                ):
+                    raise SystemExit(f"{path}: {arch}: {build}: its kernel has no K")
+                if build not in builds:
+                    builds.append(build)
     return out
 
 
@@ -220,17 +250,14 @@ def instances(build: Build) -> list[Instance]:
     """EVERY INSTANCE OF `build` a call can reach: each dtype and world (a norm on rows
     has none), the weight's dtype where a norm takes one, contiguous or not (the plain
     two-shots), chunked or not (every kernel but the plain all-reduce's), with a tail or
-    not (an INT4 build's), and a norm kernel's with a residual or without. An INT4 build at a
-    narrower pack compiles its exact body (INT4's word is a pack of 8 values; the call
-    is refused before it launches)."""
+    not (an INT4 build's), and a norm kernel's with a residual or without. An INT4 build
+    at a narrower pack compiles its exact body (INT4's word is a pack of 8 values; the
+    call is refused before it launches)."""
     params = TEMPLATE_ARGS[build.kernel].split()
     int4 = build.quantization == "int4" and build.pack_bytes == PACK_BYTES
     two_shot = build.algorithm.startswith("two_shot")
     plain = build.kernel == "all_reduce"
-    if int4:
-        tails = ((True, True), (False, True))
-    else:
-        tails = ((False, int4),)
+    tails = ((True, True), (False, True)) if int4 else ((False, int4),)
     residuals = (True, False) if "residual" in params else (False,)
     out: list[Instance] = []
     for dtype in DTYPES:

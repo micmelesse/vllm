@@ -45,13 +45,10 @@ INT4_ONE_SHOT_RELATIVE_RMS = 0.15
 INT4_TWO_SHOT_RELATIVE_RMS = 0.25
 
 
-def int4_bar(launches) -> float:
-    """The INT4 bar of a call that launched `launches` (its configs): a two-shot's
-    where one moved INT4 in two shots, else a one-shot's."""
-    two_shot = any(
-        c.quantization == "int4" and c.algorithm.startswith("two_shot")
-        for c in launches
-    )
+def int4_bar(config) -> float:
+    """The INT4 bar of a call that ran `config`: a two-shot's where it moved INT4 in
+    two shots (a split's all-reduce among them), else a one-shot's."""
+    two_shot = config.quantization == "int4" and config.algorithm.startswith("two_shot")
     return INT4_TWO_SHOT_RELATIVE_RMS if two_shot else INT4_ONE_SHOT_RELATIVE_RMS
 
 
@@ -193,7 +190,7 @@ def all_reduce_add_rms_norm_no_residual_ranks(
                             err = (out.float() - want.float()).square().mean().sqrt()
                             rms = want.float().square().mean().sqrt()
                             assert err / rms <= int4_bar(
-                                [config]
+                                config
                                 if config is not None
                                 else comm.tuned(
                                     "all_reduce_add_rms_norm", num_tokens, HIDDEN, False
@@ -321,7 +318,7 @@ def all_reduce_add_rms_norm_ranks(
                                 )
                                 rms = want.float().square().mean().sqrt()
                                 assert err / rms <= int4_bar(
-                                    [config]
+                                    config
                                     if config is not None
                                     else comm.tuned(
                                         "all_reduce_add_rms_norm",
@@ -498,7 +495,7 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                                 )
                                 rms = want.float().square().mean().sqrt()
                                 assert err / rms <= int4_bar(
-                                    [config]
+                                    config
                                     if config is not None
                                     else comm.tuned(
                                         "all_reduce_add_attn_res_rms_norm",
@@ -687,8 +684,13 @@ def tuned_table_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, p
                     ("all_reduce_add_attn_res_rms_norm", None),
                 ]:
                     for num_tokens in [1, MAX_TOKENS]:
-                        launches = comm.tuned(op, num_tokens, HIDDEN, residual)
-                        assert launches, (op, residual, quantization, num_tokens)
+                        config = comm.tuned(op, num_tokens, HIDDEN, residual)
+                        assert config is not None, (
+                            op,
+                            residual,
+                            quantization,
+                            num_tokens,
+                        )
             finally:
                 comm.close()
 

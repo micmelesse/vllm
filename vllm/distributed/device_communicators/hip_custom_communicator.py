@@ -9,14 +9,16 @@ CustomAllreduce) extended to every collective Kimi-K3 needs -- the all-reduce an
 all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 (`csrc/rocm/hip_custom_communicator.cu`).
 
-The caller names an op and Python looks its kernels up in the tuned table
+The caller names an op and Python looks its config up in the tuned table
 (`TunedTable.nearest`: the inputs tuned at the communicator's `quantization`; where it
-allows INT4 a pick moves INT4 or exact, whichever the tune found faster at its size): one kernel or, where the op is faster as two kernels of ours, our
-all-reduce and then the op's norm on this rank's rows (`add_rms_norm`,
-`add_attn_res_rms_norm`). The keyword arguments an op takes after its
-own: `config`, its op's config class, the one way to force one, for the tuner and
-the tests. C++ takes every field of every call, checks the config, and returns the Error
-it refused it for, or none: it raises nothing, holds no table and picks nothing.
+allows INT4 a pick moves INT4 or exact, whichever the tune found faster at its size),
+one config a pick: its algorithm the op's fused kernel's body, or, where the op is
+faster as two kernels of ours, a split (`<body>_split`: our all-reduce at that body,
+then the op on this rank's rows at the config's `rows_` fields). The keyword arguments
+an op takes after its own: `config`, its op's config class, the one way to force one,
+for the tuner and the tests. C++ takes every field of every call, checks the config,
+and returns the Error it refused it for, or none: it raises nothing, holds no table and
+picks nothing.
 
 THE MEMORY is C++'s, in its CommsState (a handle this class holds), each buffer its own
 allocation: the exchange's regions (signals, staging, partials, scales, the pushed
@@ -66,10 +68,6 @@ __all__ = [
     "AllReduceConfig",
     "AllReduceAddRmsNormConfig",
     "AllReduceAddAttnResRmsNormConfig",
-    "AddRmsNormConfig",
-    "AddAttnResRmsNormConfig",
-    "AllReduceAddRmsNormSplitConfig",
-    "AllReduceAddAttnResRmsNormSplitConfig",
 ]
 
 
@@ -83,14 +81,6 @@ Op = Literal[
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
 ]
-
-
-# EACH FUSED OP'S KERNEL ON THIS RANK'S ROWS, its split's second launch after our
-# all-reduce: no op of its own (its configs are its op's in the table).
-_ROWS: Mapping[Op, str] = {
-    "all_reduce_add_rms_norm": "add_rms_norm",
-    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
-}
 
 
 # WHAT CROSSES THE LINKS, C++'s `Quantization` by name (number for number): exact
@@ -113,13 +103,32 @@ AllReduceAlgorithm = Literal[
 ]
 
 
+# A FUSED OP'S ALGORITHMS: its fused kernel's bodies, and `<body>_split`, the split: our
+# all-reduce at that body into this rank's sum, then the op on this rank's rows (its
+# `rows_` fields), back to back.
 AllReduceAddRmsNormAlgorithm = Literal[
-    "one_shot_pull", "two_shot_pull_rows", "two_shot_pull_columns", "two_shot_push"
+    "one_shot_pull",
+    "two_shot_pull_rows",
+    "two_shot_pull_columns",
+    "two_shot_push",
+    "one_shot_pull_split",
+    "one_shot_push_split",
+    "one_shot_push_staged_split",
+    "two_shot_pull_split",
+    "two_shot_push_split",
 ]
 
 
 AllReduceAddAttnResRmsNormAlgorithm = Literal[
-    "one_shot_pull", "two_shot_pull_rows", "two_shot_pull_columns", "two_shot_push"
+    "one_shot_pull",
+    "two_shot_pull_rows",
+    "two_shot_pull_columns",
+    "two_shot_push",
+    "one_shot_pull_split",
+    "one_shot_push_split",
+    "one_shot_push_staged_split",
+    "two_shot_pull_split",
+    "two_shot_push_split",
 ]
 
 
@@ -132,7 +141,11 @@ Algorithm = Literal[
     "two_shot_pull_columns",
     "two_shot_push",
     "one_shot_push_staged",
-    "rows",
+    "one_shot_pull_split",
+    "one_shot_push_split",
+    "one_shot_push_staged_split",
+    "two_shot_pull_split",
+    "two_shot_push_split",
 ]
 
 
@@ -201,10 +214,27 @@ _MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
 _DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
 
 
+# A SPLIT'S SECOND LAUNCH'S FIELDS (a fused op's `rows_`), in their order.
+_ROWS_KEYS = (
+    "rows_grid_x",
+    "rows_grid_y",
+    "rows_grid_z",
+    "rows_block_x",
+    "rows_block_y",
+    "rows_block_z",
+    "rows_waves_per_eu",
+    "rows_tile_m",
+    "rows_tile_n",
+    "rows_tile_k",
+    "rows_pack_bytes",
+)
+
+
 # A CONFIG POINT'S FIELDS, in their order (the table's): the kernel, its algorithm,
 # its grid, its block and the block's waves a EU (__launch_bounds__), its
-# tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
-# op carries each; all but the kernel and the grid are its build.
+# tile (tile_k 1 where the kernel has no K), then what it moves; then a split's second
+# launch, the op on this rank's rows (`rows_`: its grid, block, waves, tile and pack;
+# null unless the algorithm is a split). Every config of every op carries each.
 _CONFIG_KEYS = (
     "kernel",
     "algorithm",
@@ -220,6 +250,7 @@ _CONFIG_KEYS = (
     "tile_k",
     "quantization",
     "pack_bytes",
+    *_ROWS_KEYS,
 )
 
 
@@ -309,7 +340,7 @@ class Error(IntEnum):
 @dataclass(frozen=True)
 class Build:
     """ONE BUILD OF AN OP'S KERNEL, what dispatch instantiates (C++'s BuildConfig): its
-    algorithm (a norm on rows' "rows"), its block and the block's waves a EU, its tile
+    algorithm (a split's `<body>_split`), its block and the block's waves a EU, its tile
     (tile_k 1 where the kernel has no K), what it moves and its pack. A config is a
     build and a launch (its grid)."""
 
@@ -345,8 +376,8 @@ class Build:
 # algorithm (its own), its grid, its block and the block's waves a EU, its
 # tile, what it moves (an INT4 config always quantizes, an exact one never) and its
 # pack. Its
-# kernel, its algorithms and what it does not choose (a norm on rows' one algorithm, a
-# kernel without K's tile_k) are the class's: the table and C++ name every field of
+# kernel, its algorithms and what it does not choose (a kernel without K's tile_k) are
+# the class's: the table and C++ name every field of
 # every op, so a config reads them alike, but a call cannot force them. Every op's C++
 # call is handed its own fields by name, a line each.
 @dataclass(frozen=True)
@@ -372,8 +403,10 @@ class AllReduceConfig:
 
 @dataclass(frozen=True)
 class AllReduceAddRmsNormConfig:
-    """THE ALL-REDUCE THEN (ADD-)RMSNORM'S CONFIG, one kernel: the add-norm where the
-    call has a residual, the norm where it has none (the call's, not the config's)."""
+    """THE ALL-REDUCE THEN (ADD-)RMSNORM'S CONFIG: the add-norm where the call has a
+    residual, the norm where it has none (the call's, not the config's); one fused
+    kernel, or the split (our all-reduce at these fields, then the norm on rows at the
+    `rows_` fields)."""
 
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
@@ -390,12 +423,30 @@ class AllReduceAddRmsNormConfig:
     tile_n: int
     quantization: Quantization
     pack_bytes: int
+    # A SPLIT'S SECOND LAUNCH (the algorithm `<body>_split`), the op on this rank's
+    # rows: its kernel's grid, block, waves a EU, tile and pack; None unless split.
+    rows_grid_x: int | None = None
+    rows_grid_y: int | None = None
+    rows_grid_z: int | None = None
+    rows_block_x: int | None = None
+    rows_block_y: int | None = None
+    rows_block_z: int | None = None
+    rows_waves_per_eu: int | None = None
+    rows_tile_m: int | None = None
+    rows_tile_n: int | None = None
+    rows_tile_k: int | None = None  # the norm on rows has no K: 1
+    rows_pack_bytes: int | None = None
+
+    @property
+    def split(self) -> bool:
+        return self.algorithm.endswith("_split")
 
 
 @dataclass(frozen=True)
 class AllReduceAddAttnResRmsNormConfig:
-    """THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM'S CONFIG, one kernel: TILE_K
-    sources a step."""
+    """THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM'S CONFIG: TILE_K sources a step; one
+    fused kernel, or the split (our all-reduce at these fields, then AttnRes on rows at
+    the `rows_` fields)."""
 
     kernel: ClassVar[str] = "all_reduce_add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(
@@ -414,59 +465,26 @@ class AllReduceAddAttnResRmsNormConfig:
     tile_k: int
     quantization: Quantization
     pack_bytes: int
+    # A SPLIT'S SECOND LAUNCH (the algorithm `<body>_split`), the op on this rank's
+    # rows: its kernel's grid, block, waves a EU, tile and pack; None unless split.
+    rows_grid_x: int | None = None
+    rows_grid_y: int | None = None
+    rows_grid_z: int | None = None
+    rows_block_x: int | None = None
+    rows_block_y: int | None = None
+    rows_block_z: int | None = None
+    rows_waves_per_eu: int | None = None
+    rows_tile_m: int | None = None
+    rows_tile_n: int | None = None
+    rows_tile_k: int | None = None
+    rows_pack_bytes: int | None = None
+
+    @property
+    def split(self) -> bool:
+        return self.algorithm.endswith("_split")
 
 
-@dataclass(frozen=True)
-class AddRmsNormConfig:
-    """THE (ADD-)RMSNORM ON THIS RANK'S ROWS' CONFIG: the second launch of
-    all_reduce_add_rms_norm's split (its rms_norm_ fields): the add-norm where the call
-    has a residual, the norm where it has none."""
-
-    kernel: ClassVar[str] = "add_rms_norm"
-    algorithms: ClassVar[tuple[str, ...]] = ("rows",)
-    algorithm: ClassVar[str] = "rows"  # its one
-    tile_k: ClassVar[int] = 1  # no K: the table's and C++'s identity
-    grid_x: int
-    grid_y: int
-    grid_z: int
-    block_x: int
-    block_y: int
-    block_z: int
-    waves_per_eu: int
-    tile_m: int
-    tile_n: int
-    quantization: Quantization
-    pack_bytes: int
-
-
-@dataclass(frozen=True)
-class AddAttnResRmsNormConfig:
-    """ATTNRES AND ITS RMSNORM ON THIS RANK'S ROWS' CONFIG: TILE_K sources a step."""
-
-    kernel: ClassVar[str] = "add_attn_res_rms_norm"
-    algorithms: ClassVar[tuple[str, ...]] = ("rows",)
-    algorithm: ClassVar[str] = "rows"  # its one
-    grid_x: int
-    grid_y: int
-    grid_z: int
-    block_x: int
-    block_y: int
-    block_z: int
-    waves_per_eu: int
-    tile_m: int
-    tile_n: int
-    tile_k: int
-    quantization: Quantization
-    pack_bytes: int
-
-
-Config = (
-    AllReduceConfig
-    | AllReduceAddRmsNormConfig
-    | AllReduceAddAttnResRmsNormConfig
-    | AddRmsNormConfig
-    | AddAttnResRmsNormConfig
-)
+Config = AllReduceConfig | AllReduceAddRmsNormConfig | AllReduceAddAttnResRmsNormConfig
 
 
 # EACH KERNEL'S CONFIG CLASS, by the kernel's name (the table's `kernel`).
@@ -476,30 +494,14 @@ _CONFIGS: Mapping[str, type[Config]] = {
         AllReduceConfig,
         AllReduceAddRmsNormConfig,
         AllReduceAddAttnResRmsNormConfig,
-        AddRmsNormConfig,
-        AddAttnResRmsNormConfig,
     )
 }
 
 
-# A FUSED OP AS TWO KERNELS OF OURS, its algorithm "split": our all-reduce into this
-# rank's sum, then the op on this rank's rows (`rows`, its kernel on rows). The tune
-# picks it where it is faster than the op's one kernel.
-@dataclass(frozen=True)
-class AllReduceAddRmsNormSplitConfig:
-    algorithm: ClassVar[str] = "split"
-    all_reduce: AllReduceConfig
-    rows: AddRmsNormConfig
-
-
-@dataclass(frozen=True)
-class AllReduceAddAttnResRmsNormSplitConfig:
-    algorithm: ClassVar[str] = "split"
-    all_reduce: AllReduceConfig
-    rows: AddAttnResRmsNormConfig
-
-
-SplitConfig = AllReduceAddRmsNormSplitConfig | AllReduceAddAttnResRmsNormSplitConfig
+def _packs(config: Config) -> tuple[int, ...]:
+    """The packs `config` loads at: its own, and its split's norm on rows' (a split)."""
+    rows = getattr(config, "rows_pack_bytes", None)
+    return (config.pack_bytes,) if rows is None else (config.pack_bytes, rows)
 
 
 @dataclass(frozen=True)
@@ -521,11 +523,11 @@ class TunedInput:
 @dataclass(frozen=True)
 class TunedTable:
     """THE ARCH'S TUNED TABLE, parsed and checked (`parse_tuned_table`): each tuned
-    input and the config a plain call runs there (the op's one kernel, or its split:
-    our all-reduce then the op on rows), and every config the file lists (its picks'
-    and a tune's candidates)."""
+    input and the config a plain call runs there (its algorithm the op's fused kernel's
+    body, or a split), and every config the file lists (its picks' and a tune's
+    candidates)."""
 
-    picks: dict[TunedInput, Config | SplitConfig]
+    picks: dict[TunedInput, Config]
     configs: tuple[Config, ...]
 
     def nearest(
@@ -536,7 +538,7 @@ class TunedTable:
         world: int,
         rows: int,
         cols: int,
-    ) -> tuple[TunedInput, Config | SplitConfig]:
+    ) -> tuple[TunedInput, Config]:
         """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` RUNS, and the input it was
         tuned at: the nearest input of `op` (with `residual`, the norm op's; else None)
         tuned in the communicator's mode at `world`.
@@ -555,12 +557,7 @@ class TunedTable:
         fitting = [
             (i, c)
             for i, c in tuned
-            if all(
-                cols * _DTYPE_BYTES[i.dtype] % x.pack_bytes == 0
-                for x in (
-                    (c.all_reduce, c.rows) if isinstance(c, SplitConfig) else (c,)
-                )
-            )
+            if all(cols * _DTYPE_BYTES[i.dtype] % pack == 0 for pack in _packs(c))
         ]
         tuned = fitting or tuned
         width = min((i.hidden for i, _ in tuned), key=lambda h: abs(h - cols))
@@ -601,15 +598,8 @@ class TunedTable:
         ):
             found = []
             for i, pick in self.picks.items():
-                if i.world == world:
-                    launches = (
-                        (pick.all_reduce, pick.rows)
-                        if isinstance(pick, SplitConfig)
-                        else (pick,)
-                    )
-                    c = next((c for c in launches if takes(c, moving)), None)
-                    if c is not None:
-                        found.append((i, c))
+                if i.world == world and takes(pick, moving):
+                    found.append((i, pick))
             if found:
                 width = min((i.hidden for i, _ in found), key=lambda h: abs(h - cols))
                 _, config = min(
@@ -696,9 +686,10 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
     config (its algorithm one of its kernel's; builds.py compiles every config, and C++
     refuses a config it did not, not_built); every input one of `Op`'s, its residual a
     bool where its op is the norm's (else none: the residual is the call's), in a mode,
-    at a world, with a width and tokens, tuned once; every pick one input's, its configs
-    one kernel of the input's op, or our all-reduce then the op's norm on rows, an exact
-    input's moving nothing quantized (a quantized one's exact or INT4); every tuned op
+    at a world, with a width and tokens, tuned once; every pick one input's and one
+    config of the input's op (its algorithm the fused kernel's body or a split, the
+    split's `rows_` fields its alone), an exact input's moving nothing quantized (a
+    quantized one's exact or INT4); every tuned op
     an input in each mode at every world the table tunes, the norm op's with a residual
     and without (the lookup reads one there)."""
     tables = json.loads(path.read_text())
@@ -720,10 +711,9 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
     configs: list[Config] = []
     for i, c in enumerate(raw["configs"]):
         where = f"the tuned table: configs[{i}]"
-        # ITS OP: the kernel's own, or a rows kernel's fused op (its split's).
+        # ITS OP: its kernel's own.
         kernel = c.get("kernel")
-        op = next((o for o, k in _ROWS.items() if k == kernel), kernel)
-        if kernel not in _CONFIGS or c.get("op") != _QUALIFIED + op:
+        if kernel not in _CONFIGS or c.get("op") != _QUALIFIED + kernel:
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
@@ -757,23 +747,42 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
                     f"{where}: {c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}",
                 )
                 return Error.tuned_table_unsound
-        config = cls(**{k: c[k] for k in keys if k in own})
-        configs.append(config)
-    picks: dict[TunedInput, Config | SplitConfig] = {}
-    for i, k in enumerate(raw["picks"]):
-        where = f"the tuned table: picks[{i}]"
-        at = k.get("configs")
-        if not (
-            isinstance(k.get("input"), int)
-            and 0 <= k["input"] < len(raw["inputs"])
-            and isinstance(at, list)
-            and at
-            and all(isinstance(j, int) and 0 <= j < len(configs) for j in at)
+        # A SPLIT'S SECOND LAUNCH: every `rows_` field a split's, only a split's (the
+        # norm on rows' tile_k 1: it has no K).
+        rows = [c[k] for k in _ROWS_KEYS]
+        split = str(c["algorithm"]).endswith("_split")
+        if (
+            (split and None in rows)
+            or (not split and rows != [None] * len(rows))
+            or (
+                split
+                and c["kernel"] == "all_reduce_add_rms_norm"
+                and c["rows_tile_k"] != 1
+            )
         ):
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
-                f"{where}: {k} names no one input's configs",
+                f"{where}: the rows_ fields are a split's, every one, a split's alone",
+            )
+            return Error.tuned_table_unsound
+        config = cls(**{k: c[k] for k in keys if k in own})
+        configs.append(config)
+    picks: dict[TunedInput, Config] = {}
+    for i, k in enumerate(raw["picks"]):
+        where = f"the tuned table: picks[{i}]"
+        at = k.get("config")
+        if not (
+            list(k) == ["input", "config"]
+            and isinstance(k["input"], int)
+            and 0 <= k["input"] < len(raw["inputs"])
+            and isinstance(at, int)
+            and 0 <= at < len(configs)
+        ):
+            logger.error(
+                "HipCustomCommunicator open: %s: %s",
+                Error.tuned_table_unsound.name,
+                f"{where}: {k} names no one input and its config",
             )
             return Error.tuned_table_unsound
         e = raw["inputs"][k["input"]]
@@ -824,35 +833,22 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
                 f"{where}: {tuned} is tuned twice",
             )
             return Error.tuned_table_unsound
-        launches = tuple(configs[j] for j in at)
-        ops = [c.kernel for c in launches]
-        if ops not in ([name], ["all_reduce", _ROWS.get(name)]):
+        config = configs[at]
+        if config.kernel != name:
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
-                f"{where}: its configs are {ops}'s: one of {name}'s, or our all-reduce "
-                f"then {_ROWS.get(name)}",
+                f"{where}: its config is {config.kernel}'s, not {name}'s",
             )
             return Error.tuned_table_unsound
-        if tuned.mode == "exact" and {c.quantization for c in launches} != {"exact"}:
+        if tuned.mode == "exact" and config.quantization != "exact":
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
                 f"{where}: an exact input moves INT4",
             )
             return Error.tuned_table_unsound
-        # ONE KERNEL, or the op's split: our all-reduce, then its kernel on rows (the
-        # ops checked above).
-        if len(launches) == 1:
-            picks[tuned] = launches[0]
-            continue
-        first, second = launches
-        assert isinstance(first, AllReduceConfig), where
-        if isinstance(second, AddRmsNormConfig):
-            picks[tuned] = AllReduceAddRmsNormSplitConfig(first, second)
-        else:
-            assert isinstance(second, AddAttnResRmsNormConfig), where
-            picks[tuned] = AllReduceAddAttnResRmsNormSplitConfig(first, second)
+        picks[tuned] = config
     for name in get_args(Op):
         for residual in (False, True) if name == "all_reduce_add_rms_norm" else (None,):
             for world in sorted({i.world for i in picks}):
@@ -1126,11 +1122,10 @@ class HipCustomCommunicator:
         `timeout_seconds`: how long a kernel waits on a peer before it reports a fault;
         None is the device group's own (its backend's timeout). `max_rows` and
         `max_cols`: the largest call it serves, which its exchange is sized for; None is
-        the server's (its max_num_batched_tokens and hidden size). `quantization`: whether
-        the plain calls may move INT4 across the links (`int4`: each call its pick's,
-        exact or INT4, from the quantized inputs; `exact`: never); None is what the
-        environment asks
-        (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION).
+        the server's (its max_num_batched_tokens and hidden size). `quantization`:
+        whether the plain calls may move INT4 across the links (`int4`: each call its
+        pick's, exact or INT4, from the quantized inputs; `exact`: never); None is what
+        the environment asks (VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION).
         `tuned_path`: the tuned tables' file its plain calls run from (the arch's table,
         `parse_tuned_table`): the shipped one (`hip_custom_communicator.json`), or a
         tuner's candidate."""
@@ -1369,9 +1364,7 @@ class HipCustomCommunicator:
         eps: float,
         *,
         residual: torch.Tensor | None = None,
-        config: AllReduceAddRmsNormConfig
-        | AllReduceAddRmsNormSplitConfig
-        | None = None,
+        config: AllReduceAddRmsNormConfig | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """THE RMSNORM OF VLLM ON THE ALL-REDUCE, at the config given (the tuner's, the
         tests'), else at the table's pick for its rows and width: without a residual
@@ -1410,21 +1403,17 @@ class HipCustomCommunicator:
                 rows,
                 cols,
             )
-            assert isinstance(
-                picked, AllReduceAddRmsNormConfig | AllReduceAddRmsNormSplitConfig
-            ), picked
+            assert isinstance(picked, AllReduceAddRmsNormConfig), picked
             config = picked
-        split = isinstance(config, AllReduceAddRmsNormSplitConfig)
-        launches: list[Config] = [config.all_reduce, config.rows] if split else [config]
         # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
-        for c in launches:
-            if self.arguments.quantization == "exact" and c.quantization != "exact":
-                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+        if self.arguments.quantization == "exact" and config.quantization != "exact":
+            raise AssertionError(
+                f"an exact communicator given an INT4 config: {config}"
+            )
 
         # ONE C++ CALL: the fused kernel at the config's algorithm, or the split
-        # (algorithm `<the all-reduce's body>_split`: the all-reduce at its config,
-        # then the norm at the rms_norm_ fields).
-        first = config.all_reduce if split else config
+        # (`<the all-reduce's body>_split`: the all-reduce at the config's fields, then
+        # the norm on rows at its rows_ fields, C++'s rms_norm_).
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             state=self.state.handle,
             input=input,
@@ -1433,30 +1422,28 @@ class HipCustomCommunicator:
             output=output,
             residual_output=residual_output,
             eps=eps,
-            algorithm=f"{config.all_reduce.algorithm}_split"
-            if split
-            else config.algorithm,
-            grid_x=first.grid_x,
-            grid_y=first.grid_y,
-            grid_z=first.grid_z,
-            block_x=first.block_x,
-            block_y=first.block_y,
-            block_z=first.block_z,
-            waves_per_eu=first.waves_per_eu,
-            tile_m=first.tile_m,
-            tile_n=first.tile_n,
-            quantization=first.quantization,
-            pack_bytes=first.pack_bytes,
-            rms_norm_grid_x=config.rows.grid_x if split else None,
-            rms_norm_grid_y=config.rows.grid_y if split else None,
-            rms_norm_grid_z=config.rows.grid_z if split else None,
-            rms_norm_block_x=config.rows.block_x if split else None,
-            rms_norm_block_y=config.rows.block_y if split else None,
-            rms_norm_block_z=config.rows.block_z if split else None,
-            rms_norm_waves_per_eu=config.rows.waves_per_eu if split else None,
-            rms_norm_tile_m=config.rows.tile_m if split else None,
-            rms_norm_tile_n=config.rows.tile_n if split else None,
-            rms_norm_pack_bytes=config.rows.pack_bytes if split else None,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            quantization=config.quantization,
+            pack_bytes=config.pack_bytes,
+            rms_norm_grid_x=config.rows_grid_x,
+            rms_norm_grid_y=config.rows_grid_y,
+            rms_norm_grid_z=config.rows_grid_z,
+            rms_norm_block_x=config.rows_block_x,
+            rms_norm_block_y=config.rows_block_y,
+            rms_norm_block_z=config.rows_block_z,
+            rms_norm_waves_per_eu=config.rows_waves_per_eu,
+            rms_norm_tile_m=config.rows_tile_m,
+            rms_norm_tile_n=config.rows_tile_n,
+            rms_norm_pack_bytes=config.rows_pack_bytes,
         )
         if error is not None:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -1496,9 +1483,7 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        config: AllReduceAddAttnResRmsNormConfig
-        | AllReduceAddAttnResRmsNormSplitConfig
-        | None = None,
+        config: AllReduceAddAttnResRmsNormConfig | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(input), blocks, ...)`, at the config given (the
         tuner's, the tests'), else at the table's pick for its rows and width: one
@@ -1535,27 +1520,19 @@ class HipCustomCommunicator:
                 rows,
                 cols,
             )
-            assert isinstance(
-                picked,
-                AllReduceAddAttnResRmsNormConfig
-                | AllReduceAddAttnResRmsNormSplitConfig,
-            ), picked
+            assert isinstance(picked, AllReduceAddAttnResRmsNormConfig), picked
             config = picked
-        launches: list[Config] = (
-            [config.all_reduce, config.rows]
-            if isinstance(config, AllReduceAddAttnResRmsNormSplitConfig)
-            else [config]
-        )
         # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
-        for c in launches:
-            if self.arguments.quantization == "exact" and c.quantization != "exact":
-                raise AssertionError(f"an exact communicator given an INT4 config: {c}")
+        if self.arguments.quantization == "exact" and config.quantization != "exact":
+            raise AssertionError(
+                f"an exact communicator given an INT4 config: {config}"
+            )
 
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        match config:
-            case AllReduceAddAttnResRmsNormConfig():
+        match config.split:
+            case False:
                 # ONE KERNEL, the fused op.
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
                     state=self.state.handle,
@@ -1589,30 +1566,31 @@ class HipCustomCommunicator:
                     raise RuntimeError(
                         f"{Error(error).name}: {config} on {input.shape}"
                     )
-            case AllReduceAddAttnResRmsNormSplitConfig():
-                # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then
-                # AttnRes on its rows.
+            case True:
+                # THE SPLIT, two kernels of ours: our all-reduce at the config's body
+                # into this rank's sum, then AttnRes on its rows at its rows_ fields
+                # (exact: on rows it moves nothing).
                 summed = torch.empty_like(input)
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     state=self.state.handle,
                     input=input,
                     output=summed,
-                    algorithm=config.all_reduce.algorithm,
-                    grid_x=config.all_reduce.grid_x,
-                    grid_y=config.all_reduce.grid_y,
-                    grid_z=config.all_reduce.grid_z,
-                    block_x=config.all_reduce.block_x,
-                    block_y=config.all_reduce.block_y,
-                    block_z=config.all_reduce.block_z,
-                    waves_per_eu=config.all_reduce.waves_per_eu,
-                    tile_m=config.all_reduce.tile_m,
-                    tile_n=config.all_reduce.tile_n,
-                    quantization=config.all_reduce.quantization,
-                    pack_bytes=config.all_reduce.pack_bytes,
+                    algorithm=config.algorithm.removesuffix("_split"),
+                    grid_x=config.grid_x,
+                    grid_y=config.grid_y,
+                    grid_z=config.grid_z,
+                    block_x=config.block_x,
+                    block_y=config.block_y,
+                    block_z=config.block_z,
+                    waves_per_eu=config.waves_per_eu,
+                    tile_m=config.tile_m,
+                    tile_n=config.tile_n,
+                    quantization=config.quantization,
+                    pack_bytes=config.pack_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(
-                        f"{Error(error).name}: {config.all_reduce} on {input.shape}"
+                        f"{Error(error).name}: {config} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
                     state=self.state.handle,
@@ -1628,22 +1606,22 @@ class HipCustomCommunicator:
                     num_blocks=num_blocks,
                     eps=eps,
                     output_eps=output_eps,
-                    grid_x=config.rows.grid_x,
-                    grid_y=config.rows.grid_y,
-                    grid_z=config.rows.grid_z,
-                    block_x=config.rows.block_x,
-                    block_y=config.rows.block_y,
-                    block_z=config.rows.block_z,
-                    waves_per_eu=config.rows.waves_per_eu,
-                    tile_m=config.rows.tile_m,
-                    tile_n=config.rows.tile_n,
-                    tile_k=config.rows.tile_k,
-                    quantization=config.rows.quantization,
-                    pack_bytes=config.rows.pack_bytes,
+                    grid_x=config.rows_grid_x,
+                    grid_y=config.rows_grid_y,
+                    grid_z=config.rows_grid_z,
+                    block_x=config.rows_block_x,
+                    block_y=config.rows_block_y,
+                    block_z=config.rows_block_z,
+                    waves_per_eu=config.rows_waves_per_eu,
+                    tile_m=config.rows_tile_m,
+                    tile_n=config.rows_tile_n,
+                    tile_k=config.rows_tile_k,
+                    quantization="exact",
+                    pack_bytes=config.rows_pack_bytes,
                 )
                 if error is not None:
                     raise RuntimeError(
-                        f"{Error(error).name}: {config.rows} on {input.shape}"
+                        f"{Error(error).name}: {config}'s rows on {input.shape}"
                     )
         return prefix_output, output
 
@@ -1706,17 +1684,15 @@ class HipCustomCommunicator:
     @final
     def tuned(
         self, op: Op, rows: int, cols: int, residual: bool | None = None
-    ) -> list[Config]:
-        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order (the
-        norm op's with `residual` or without): its table's nearest input's configs
+    ) -> Config:
+        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` RUNS here (the norm op's with
+        `residual` or without): its table's nearest input's config
         (`TunedTable.nearest`)."""
         assert self.state is not None, "an open communicator has its state"
         _, config = self.state.tuned_table.nearest(
             op, residual, self.arguments.quantization, self.arguments.world, rows, cols
         )
-        if isinstance(config, SplitConfig):
-            return [config.all_reduce, config.rows]
-        return [config]
+        return config
 
     @final
     def kernel_config(
