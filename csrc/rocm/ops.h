@@ -59,19 +59,12 @@ void paged_attention(
 // each op once, on the state, its tensors and values, then its config's fields
 // as plain values. EVERY ERROR IS A VALUE: each returns the Error's number it
 // was refused for, or none (hip_custom_communicator.cu); none raises.
-std::tuple<std::optional<int64_t>, int64_t, std::vector<int64_t>, std::string>
-hip_custom_communicator_open(int64_t rank, int64_t world, int64_t device,
+std::tuple<std::optional<int64_t>, int64_t, std::string>
+hip_custom_communicator_open(const std::string& group, int64_t device,
                              int64_t max_rows, int64_t max_cols,
                              double timeout_seconds);
-std::optional<int64_t> hip_custom_communicator_connect(
-    int64_t state, const std::vector<int64_t>& handles);
-std::tuple<std::optional<int64_t>, std::vector<int64_t>, std::vector<int64_t>>
-hip_custom_communicator_graph_ipc_meta(int64_t state);
-std::optional<int64_t> hip_custom_communicator_register_graph_buffers(
-    int64_t state, const std::vector<int64_t>& handles,
-    const std::vector<int64_t>& offsets);
-std::optional<int64_t> hip_custom_communicator_close_peers(int64_t state);
-std::optional<int64_t> hip_custom_communicator_free(int64_t state);
+std::optional<int64_t> hip_custom_communicator_register_graph(int64_t state);
+std::optional<int64_t> hip_custom_communicator_close(int64_t state, bool alone);
 std::optional<int64_t> hip_custom_communicator_all_reduce(
     int64_t state, torch::Tensor& input, torch::Tensor& output,
     const std::string& algorithm, int64_t grid_x, int64_t grid_y,

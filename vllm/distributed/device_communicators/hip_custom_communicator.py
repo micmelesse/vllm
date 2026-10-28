@@ -39,18 +39,16 @@ import functools
 import json
 import os
 import signal
-import socket
 import threading
 import warnings
 import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
-from datetime import timedelta
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import Any, ClassVar, Literal, cast, final, get_args
+from typing import ClassVar, Literal, cast, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -328,6 +326,10 @@ class Error(IntEnum):
     ranks_disagree = 35
     not_open = 36
     field_missing = 37
+    no_such_group = 38  # open's group is registered under no such name
+    exchange_failed = 39  # a peer missed an exchange over the CPU group
+    peer_not_accessible = 40  # this device cannot reach a peer's
+    peers_not_opened = 41  # a peer's regions not opened over IPC
 
     # PYTHON'S OWN, after C++'s. Why it is disabled:
     no_problem_size = 100  # no server config to size the exchange from
@@ -343,8 +345,6 @@ class Error(IntEnum):
     close_while_capturing = 108  # close() inside capture()
     # Opening failed:
     wrong_device = 109  # the current device is not the communicator's
-    peer_not_accessible = 111  # this device cannot reach a peer's
-    peers_not_opened = 112  # C++'s connect failed: a peer's regions not opened
     tuned_table_unsound = 113  # the tuned table is not one the module can read
     capture_raised = 119  # a capture raised part way
 
@@ -888,15 +888,13 @@ def open_state(
     """THE COMMUNICATOR'S STATE, OPENED (on `device`, this rank of `device_group`, its
     exchange over `cpu_group`, sized for `max_rows` rows of at most `max_cols`, a wait
     giving up after `timeout_seconds`, its table `tuned_path`'s), or the Error it cannot
-    open for, returned (why, logged; none raised: the caller decides): C++'s state
-    made
-    (the device supported, its buffers allocated), the tuned table read for its
-    arch, and every peer's regions opened, after the exchange over the CPU group (a
-    collective, so every rank must reach it).
+    open for, returned (why, logged; none raised: the caller decides): C++'s open (the
+    device supported, its buffers allocated, every peer's regions opened after its
+    exchange over the CPU group: a collective, so every rank must reach it), then the
+    tuned table read for its arch.
 
     Eager, and before any capture: doing this inside a cudagraph capture is not
-    recoverable. An open that fails frees what it made, alone (and where torch raises
-    in the exchange, frees it and lets that propagate)."""
+    recoverable. An open that fails releases what it made."""
     # THE GROUPS: one world, this rank the same in both.
     if (
         cpu_group.size() != device_group.size()
@@ -916,10 +914,8 @@ def open_state(
             f"communicator's {device.index}",
         )
         return Error.wrong_device
-    ops = torch.ops._rocm_C
-    error, handle, ipc_handle, arch = ops.hip_custom_communicator_open(
-        rank=device_group.rank(),
-        world=device_group.size(),
+    error, handle, arch = torch.ops._rocm_C.hip_custom_communicator_open(
+        group=cpu_group.group_name,
         device=device.index,
         max_rows=max_rows,
         max_cols=max_cols,
@@ -930,74 +926,9 @@ def open_state(
         return Error(error)
     tuned_table = parse_tuned_table(tuned_path, arch)
     if not isinstance(tuned_table, TunedTable):
-        free_state(handle)
+        # Every rank reads the same table for the same arch: they close together.
+        close_state(handle, alone=False)
         return tuned_table
-    failure: Error | None = None
-    try:
-        # THE EXCHANGE, one collective over the CPU group: every rank's regions' IPC
-        # handles, its host, its GPU and its pid.
-        props = torch.cuda.get_device_properties(device)
-        me = {
-            "handle": ipc_handle,
-            "host": socket.gethostname(),
-            "gpu": str(getattr(props, "uuid", "")),
-            "pid": os.getpid(),
-        }
-        everyone: list[Any] = [None] * device_group.size()
-        torch.distributed.all_gather_object(everyone, me, group=cpu_group)
-        # EVERY PEER'S GPU, where this process sees it (by its UUID), reachable from
-        # ours: a rank that cannot reach a peer's GPU is refused here, by name, not
-        # at its first call.
-        here = {
-            str(getattr(torch.cuda.get_device_properties(d), "uuid", "")): d
-            for d in range(torch.cuda.device_count())
-        }
-        for r, peer in enumerate(everyone):
-            d = here.get(peer["gpu"])
-            if r == device_group.rank() or d is None or d == device.index:
-                continue
-            if failure is None and not torch.cuda.can_device_access_peer(
-                device.index, d
-            ):
-                logger.error(
-                    "HipCustomCommunicator open: device %d cannot access rank %d's "
-                    "device %d",
-                    device.index,
-                    r,
-                    d,
-                )
-                failure = Error.peer_not_accessible
-        for r, peer in enumerate(everyone):
-            if r == device_group.rank():
-                continue
-            if peer["host"] != me["host"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d is on another host", r
-                )
-            elif peer["gpu"] and peer["gpu"] == me["gpu"]:
-                logger.warning(
-                    "HipCustomCommunicator open: rank %d (pid %d) is on this "
-                    "rank's GPU",
-                    r,
-                    peer["pid"],
-                )
-        if failure is None:
-            error = ops.hip_custom_communicator_connect(
-                state=handle, handles=[b for peer in everyone for b in peer["handle"]]
-            )
-            if error is not None:
-                logger.error(
-                    "HipCustomCommunicator open: C++'s connect: %s", Error(error).name
-                )
-                failure = Error.peers_not_opened
-    except BaseException:
-        close_peers(handle)
-        free_state(handle)
-        raise
-    if failure is not None:
-        close_peers(handle)
-        free_state(handle)
-        return failure
     # THE EXIT HOOKS, once a process, at the first open: atexit, and SIGTERM and
     # SIGINT handlers chained in front of whatever is there (from the main thread
     # only: Python sets handlers nowhere else). A handler abandons, then runs what
@@ -1039,35 +970,14 @@ def open_state(
     return CommsState(handle=handle, arch=arch, tuned_table=tuned_table)
 
 
-def close_peers(handle: int) -> None:
-    """EVERY BORROWED MAPPING of the state at `handle` closed (C++'s close_peers: the
-    peers' regions, their captured inputs); carries on past an error, logged. Three
-    callers: an open that raised, close, abandon."""
-    error = torch.ops._rocm_C.hip_custom_communicator_close_peers(state=handle)
+def close_state(handle: int, alone: bool) -> None:
+    """THE STATE AT `handle` RELEASED (C++'s close): its peers' mappings closed, its own
+    buffers freed. A collective over the CPU group unless `alone` (an exit, a signal):
+    a peer that misses a handshake is logged, and it finishes alone. Every launch on
+    the device finished first (the caller's)."""
+    error = torch.ops._rocm_C.hip_custom_communicator_close(state=handle, alone=alone)
     if error is not None:
-        logger.error("HipCustomCommunicator: closing the peers: %s", Error(error).name)
-
-
-def free_state(handle: int) -> None:
-    """THE STATE AT `handle` freed, its own buffers with it (C++'s free), once no peer
-    has them open; an error is logged. Three callers: an open that raised, close,
-    abandon."""
-    error = torch.ops._rocm_C.hip_custom_communicator_free(state=handle)
-    if error is not None:
-        logger.error("HipCustomCommunicator: freeing: %s", Error(error).name)
-
-
-def barrier_within(group: ProcessGroup, seconds: float) -> bool:
-    """EVERY RANK OF `group` ARRIVED within `seconds`, or False (a peer that did not,
-    or a group that failed): never unbounded, a peer may be dead. close's two
-    handshakes."""
-    try:
-        torch.distributed.barrier(group=group, async_op=True).wait(
-            timedelta(seconds=seconds)
-        )
-    except RuntimeError:
-        return False
-    return True
+        logger.error("HipCustomCommunicator close: %s", Error(error).name)
 
 
 # ---- THE API: the communicator, and the exit hook. ----
@@ -1207,11 +1117,14 @@ class HipCustomCommunicator:
         )
         if not isinstance(opened, CommsState):
             error = opened
-            # A BROKEN SETUP RAISES (the wrong device, a peer it cannot reach, peers
-            # half-opened, a tuned table it cannot read); A DEVICE OR A SERVER IT DOES
-            # NOT RUN ON disables it, and vLLM takes its own path.
+            # A BROKEN SETUP RAISES (the wrong device, a group or a peer it cannot
+            # reach, peers half-opened, a tuned table it cannot read); A DEVICE OR A
+            # SERVER IT DOES NOT RUN ON disables it, and vLLM takes its own path.
             if error in (
                 Error.wrong_device,
+                Error.no_such_group,
+                Error.exchange_failed,
+                Error.ranks_disagree,
                 Error.peer_not_accessible,
                 Error.peers_not_opened,
                 Error.tuned_table_unsound,
@@ -1599,33 +1512,14 @@ class HipCustomCommunicator:
         try:
             yield
             # THE CAPTURED IN-PLACE LAUNCHES' INPUTS, registered before any replay
-            # (vLLM's register_graph_buffers): every rank's IPC handles exchanged over
-            # the CPU group (a collective, so every rank exits its capture together),
-            # then C++ opens each peer allocation once and writes every slot its
-            # launches reserved.
+            # (C++'s register_graph, vLLM's register_graph_buffers): a collective over
+            # the CPU group, so every rank exits its capture together.
             assert self.state is not None
-            ops = torch.ops._rocm_C
-            error, handles, offsets = ops.hip_custom_communicator_graph_ipc_meta(
+            error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
                 state=self.state.handle
             )
             if error is not None:
-                raise RuntimeError(
-                    f"{Error(error).name}: the captured inputs' IPC handles"
-                )
-            everyone: list[Any] = [None] * self.arguments.world
-            torch.distributed.all_gather_object(
-                everyone, (handles, offsets), group=self.arguments.cpu_group
-            )
-            error = ops.hip_custom_communicator_register_graph_buffers(
-                state=self.state.handle,
-                handles=[h for rank_handles, _ in everyone for h in rank_handles],
-                offsets=[o for _, rank_offsets in everyone for o in rank_offsets],
-            )
-            if error is not None:
-                raise RuntimeError(
-                    f"{Error(error).name}: captured inputs a rank: "
-                    f"{[len(o) for _, o in everyone]}"
-                )
+                raise RuntimeError(f"{Error(error).name}: the captured inputs")
         except BaseException as e:
             # BROKEN, once: every later call raises (`disabled`), the cause logged.
             life = self.lifecycle
@@ -1683,13 +1577,13 @@ class HipCustomCommunicator:
         call is exactly when `del` does not release. This does.
 
         A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
-        every rank's device finishes, a handshake over the CPU group, every rank
-        closes its peers' IPC mappings, a second handshake, then each frees its own
-        (below). Each handshake
-        is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
-        costs at most that, never a hang: the failed handshake is logged and the
-        teardown carries on alone. Ordering that matters is the caller's -- close
-        before the process group is destroyed, and after any captured graph is gone.
+        every rank's device finishes, then C++'s close (a handshake over the CPU
+        group, every rank closes its peers' IPC mappings, a second handshake, then
+        each frees its own). Each handshake is bounded by `timeout_seconds`, so a rank
+        closing alone, or a dead peer, costs at most that, never a hang: the failed
+        handshake is logged and the teardown carries on alone. Ordering that matters is
+        the caller's -- close before the process group is destroyed, and after any
+        captured graph is gone.
         """
         if self.lifecycle.status == "closed":
             return
@@ -1700,13 +1594,8 @@ class HipCustomCommunicator:
             )
         with self.lifecycle.lock:
             self.lifecycle.status = "closed"
-        # (a) every launch on this device finished, so nothing of ours reads or
-        # writes a peer's memory; (b) handshake: every rank has stopped; (c) every
-        # borrowed mapping closed; (d) handshake: every rank has closed its mappings
-        # of ours (skipped when (b) failed: a peer that missed it would pair this one
-        # with its own first); (e) our own buffers freed. A handshake that fails is
-        # logged and the teardown carries on alone. After an abandon, only what it
-        # left.
+        # Every launch on this device finished, so nothing of ours reads or writes a
+        # peer's memory; then C++'s close. After an abandon, only what it left.
         with self.lifecycle.teardown:
             if self.state is None:
                 return
@@ -1718,30 +1607,18 @@ class HipCustomCommunicator:
                 logger.error(
                     "HipCustomCommunicator close: the device did not finish: %s", e
                 )
-            stopped = barrier_within(
-                self.arguments.cpu_group, self.arguments.timeout_seconds
-            )
-            close_peers(self.state.handle)
-            done = stopped and barrier_within(
-                self.arguments.cpu_group, self.arguments.timeout_seconds
-            )
-            free_state(self.state.handle)
+            close_state(self.state.handle, alone=False)
             self.state = None
-        if not (stopped and done):
-            logger.error(
-                "HipCustomCommunicator close: a peer did not arrive at the %s "
-                "handshake within %.0f s; it finished alone",
-                "first" if not stopped else "second",
-                self.arguments.timeout_seconds,
-            )
 
     @final
     def abandon(self, wait_s: float = ABANDON_WAIT_S) -> None:
         """ABANDONED, from the exit hook (`abandon_open`): torn down ALONE, never
         waiting on a peer (STANDARDS 3.5). The device given `wait_s` to finish (a wait
-        on a dead peer traps at its timeout); every BORROWED peer mapping closed; and,
-        only once the device finished, our own buffers freed (freeing memory a running
-        kernel reads would fault it). A no-op while another teardown runs."""
+        on a dead peer traps at its timeout); once it finished, C++'s close alone (every
+        BORROWED peer mapping closed, our own buffers freed). A device that did not
+        finish keeps both (freeing memory a running kernel reads would fault it, and so
+        would unmapping a peer's): the process exit releases them. A no-op while another
+        teardown runs."""
         with self.lifecycle.lock:
             if not self.lifecycle.holds():
                 return
@@ -1765,10 +1642,8 @@ class HipCustomCommunicator:
             waiter = threading.Thread(target=synchronize, daemon=True)
             waiter.start()
             waiter.join(wait_s)
-            finished = not waiter.is_alive() and not failed
-            close_peers(self.state.handle)
-            if finished:
-                free_state(self.state.handle)
+            if not waiter.is_alive() and not failed:
+                close_state(self.state.handle, alone=True)
                 self.state = None
         finally:
             self.lifecycle.teardown.release()

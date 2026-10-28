@@ -102,25 +102,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // function fails the library load. The ops that take tensors have a device
   // impl; the state's take none, so they are bound whole.
   rocm_ops.def(
-      "hip_custom_communicator_open(int rank, int world, int device, int "
-      "max_rows, int max_cols, float timeout_seconds) -> (int?, int, int[], "
-      "str)",
+      "hip_custom_communicator_open(str group, int device, int max_rows, int "
+      "max_cols, float timeout_seconds) -> (int?, int, str)",
       &hip_custom_communicator_open);
-  rocm_ops.def(
-      "hip_custom_communicator_connect(int state, int[] handles) -> int?",
-      &hip_custom_communicator_connect);
-  rocm_ops.def(
-      "hip_custom_communicator_graph_ipc_meta(int state) -> (int?, int[], "
-      "int[])",
-      &hip_custom_communicator_graph_ipc_meta);
-  rocm_ops.def(
-      "hip_custom_communicator_register_graph_buffers(int state, int[] "
-      "handles, int[] offsets) -> int?",
-      &hip_custom_communicator_register_graph_buffers);
-  rocm_ops.def("hip_custom_communicator_close_peers(int state) -> int?",
-               &hip_custom_communicator_close_peers);
-  rocm_ops.def("hip_custom_communicator_free(int state) -> int?",
-               &hip_custom_communicator_free);
+  rocm_ops.def("hip_custom_communicator_register_graph(int state) -> int?",
+               &hip_custom_communicator_register_graph);
+  rocm_ops.def("hip_custom_communicator_close(int state, bool alone) -> int?",
+               &hip_custom_communicator_close);
   rocm_ops.def(
       "hip_custom_communicator_all_reduce(int state, Tensor input, Tensor! "
       "output, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, "

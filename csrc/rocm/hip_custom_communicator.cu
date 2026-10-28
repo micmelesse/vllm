@@ -56,6 +56,8 @@
 #include "hip_custom_communicator/kernels/common.cuh"
 #include "hip_custom_communicator/kernels/reduce_scatter.cuh"
 #include "hip_custom_communicator/utils.h"
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 // THE DECLARATIONS torch_bindings.cpp registers, so a definition here that
 // differs is a compile error, not a mismatch at run time.
@@ -134,6 +136,10 @@ enum class Error : int {
   ranks_disagree = 35,
   not_open = 36,
   field_missing = 37,
+  no_such_group = 38,
+  exchange_failed = 39,
+  peer_not_accessible = 40,
+  peers_not_opened = 41,
 };
 
 // =============================================================================
@@ -307,14 +313,18 @@ struct DeviceProperties {
           scratch_a_lane = 0;
 };
 
-// THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (this
-// rank, the world, the device, the largest call, a wait's bound), what open
-// asked of the device, the symmetric memory, this rank's own buffers (the
-// pushed one-shot's epochs, the status), and the input tables. Made by `open`,
-// completed by `connect`, released by `close_peers` then `free`; Python holds
-// it as a handle. A launch reads it, and a captured in-place launch reserves
-// its table slot in it: its one mutation during a call.
+// THE STATE BETWEEN PYTHON AND C++, one a communicator: what it was given (its
+// group, this rank, the world, the device, the largest call, a wait's bound),
+// what open asked of the device, the symmetric memory, this rank's own buffers
+// (the pushed one-shot's epochs, the status), and the input tables. Made by
+// `open`, released by `close`; Python holds it as a handle. A launch reads it,
+// and a captured in-place launch reserves its table slot in it: its one
+// mutation during a call.
 struct CommsState {
+  // THE CPU GROUP the exchanges go round (open's, register_graph's, close's
+  // handshakes), each giving up on a peer after `timeout_seconds`.
+  c10::intrusive_ptr<c10d::ProcessGroup> group;
+  double timeout_seconds = 0;
   int rank = 0;
   int world = 0;
   int64_t max_rows = 0;
@@ -332,12 +342,9 @@ struct CommsState {
 
 }  // namespace hip_custom_communicator
 
-// WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
-using Names = std::vector<std::string>;
-using OpenWire = std::tuple<std::optional<int64_t>, int64_t,
-                            std::vector<int64_t>, std::string>;
-using GraphMetaWire = std::tuple<std::optional<int64_t>, std::vector<int64_t>,
-                                 std::vector<int64_t>>;
+// WHAT CROSSES THE TORCH BOUNDARY, as the tuple an op schema can return: open's
+// (the Error or none, the handle, the device's arch).
+using OpenWire = std::tuple<std::optional<int64_t>, int64_t, std::string>;
 // AN ERROR CODE ACROSS THE BOUNDARY: none when the call ran, else the Error's
 // number (a torch op returns no enum).
 using ErrorCode = std::optional<int64_t>;
@@ -358,57 +365,67 @@ using ErrorCode = std::optional<int64_t>;
 // what a caller leaves out and hands its table's pick the same way; the API
 // checks it.
 
-// ITS ONE SHARED HELPER: utils.h's error_code.
+// ITS SHARED HELPERS: utils.h's.
+using hip_custom_communicator::internal::all_gathered;
 using hip_custom_communicator::internal::error_code;
 
 // =============================================================================
 // THE STATE, AS A HANDLE: the CommsState, made by `open` and handed to Python
 // as its address (an int, as vLLM's custom all-reduce hands its own), passed
-// back to every call, and freed by `free`. Each returns its Error's number, or
-// none.
+// back to every call, and released by `close`. Each returns its Error's number,
+// or none. Open, register_graph and close are COLLECTIVES: every rank calls
+// them, and they exchange over the state's CPU group themselves.
 // =============================================================================
 
-// OPEN: the state of a communicator at `rank` of `world` on `device`, serving
-// `max_rows` rows of at most `max_cols` columns, a wait giving up after
-// `timeout_seconds`: (the Error it is refused for, or none; the handle, 0 where
-// refused; this rank's regions' IPC handles, their bytes; the device's arch). A
-// device the build does not run on is refused, nothing allocated: the caller
-// does not run here.
-OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
-                                      int64_t device, int64_t max_rows,
-                                      int64_t max_cols,
+// OPEN: the state of a communicator over the CPU group registered as `group`
+// (this rank its rank, the world its size) on `device`, serving `max_rows` rows
+// of at most `max_cols` columns, a wait giving up after `timeout_seconds`,
+// every peer's regions opened: (the Error it is refused for, or none; the
+// handle, 0 where refused; the device's arch). A device the build does not run
+// on is refused, nothing allocated: the caller does not run here. A rank
+// refused before the exchange leaves its peers to give up on it after
+// `timeout_seconds` (exchange_failed); after it, every rank agrees.
+OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
+                                      int64_t max_rows, int64_t max_cols,
                                       double timeout_seconds) {
   using namespace hip_custom_communicator;
-  // ---- PRECONDITIONS: the call's values, the world built, the device the
-  // build's target with our kernels' code object on it (a kernel's attributes
-  // answer exactly when it does). ----
+  // ---- PRECONDITIONS: the group, the call's values, the world built, the
+  // device the build's target with our kernels' code object on it (a kernel's
+  // attributes answer exactly when it does). ----
+  c10::intrusive_ptr<c10d::ProcessGroup> process_group;
+  try {
+    process_group = c10d::resolve_process_group(group);
+  } catch (const std::exception&) {
+    return {error_code(Error::no_such_group), 0, ""};
+  }
+  const int64_t rank = process_group->getRank();
+  const int64_t world = process_group->getSize();
   for (const int64_t v : {rank, world, device})
     if (v < std::numeric_limits<int>::min() ||
         v > std::numeric_limits<int>::max())
-      return {error_code(Error::field_out_of_range), 0, {}, ""};
+      return {error_code(Error::field_out_of_range), 0, ""};
   if (rank < 0 || rank >= world ||
       std::find(kWorlds.begin(), kWorlds.end(), world) == kWorlds.end())
-    return {error_code(Error::world_not_built), 0, {}, ""};
+    return {error_code(Error::world_not_built), 0, ""};
   if (max_rows < 1 || max_cols < 1)
-    return {error_code(Error::field_not_positive), 0, {}, ""};
+    return {error_code(Error::field_not_positive), 0, ""};
   hipDeviceProp_t prop;
   if (hipGetDeviceProperties(&prop, static_cast<int>(device)) != hipSuccess) {
     (void)hipGetLastError();
-    return {error_code(Error::device_not_built), 0, {}, ""};
+    return {error_code(Error::device_not_built), 0, ""};
   }
   const std::string name = prop.gcnArchName;
   const std::string arch =
       name.substr(0, name.find(':'));  // gfx950:sramecc+:xnack-
   if (hipSetDevice(static_cast<int>(device)) != hipSuccess)
-    return {error_code(Error::hip_failed), 0, {}, ""};
+    return {error_code(Error::hip_failed), 0, ""};
   // THE BUILD RUNS HERE where the device has our code object: a compiled
   // kernel's attributes answer exactly then.
   hipFuncAttributes attrs;
   const hipError_t found =
       hipFuncGetAttributes(&attrs, kAllReduceInstances[0].kernel);
   (void)hipGetLastError();
-  if (found != hipSuccess)
-    return {error_code(Error::device_not_built), 0, {}, ""};
+  if (found != hipSuccess) return {error_code(Error::device_not_built), 0, ""};
   int khz = 0, lds = 0, cus = 0, threads_a_cu = 0, wave = 0;
   size_t scratch = 0;
   if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
@@ -423,7 +440,10 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
                             hipDeviceAttributeMaxThreadsPerMultiProcessor,
                             static_cast<int>(device)) != hipSuccess ||
       hipDeviceGetLimit(&scratch, hipExtLimitScratchMax) != hipSuccess)
-    return {error_code(Error::hip_failed), 0, {}, ""};
+    return {error_code(Error::hip_failed), 0, ""};
+  hipUUID uuid{};
+  if (hipDeviceGetUuid(&uuid, static_cast<int>(device)) != hipSuccess)
+    return {error_code(Error::hip_failed), 0, ""};
 
   // ---- THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own
   // buffers are sized from the problem it serves*): each region holds its
@@ -497,6 +517,8 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
 
   // ---- THE STATE. ----
   auto* s = new CommsState();
+  s->group = process_group;
+  s->timeout_seconds = timeout_seconds;
   s->rank = static_cast<int>(rank);
   s->world = static_cast<int>(world);
   s->device.index = static_cast<int>(device);
@@ -563,137 +585,154 @@ OpenWire hip_custom_communicator_open(int64_t rank, int64_t world,
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
            input_table_slots * world * int64_t{sizeof(void*)}, false);
-  // THE REGIONS' IPC HANDLES, their bytes, in connect's order: the signals, the
-  // staging, the partials, the scales, the unfenced region.
-  std::vector<int64_t> handle;
-  for (const void* region : {static_cast<const void*>(symmetric.signals),
-                             static_cast<const void*>(symmetric.staging),
-                             static_cast<const void*>(symmetric.partials),
-                             static_cast<const void*>(symmetric.scales),
-                             static_cast<const void*>(symmetric.unfenced)}) {
-    hipIpcMemHandle_t h{};
-    made =
-        made && hipIpcGetMemHandle(&h, const_cast<void*>(region)) == hipSuccess;
-    for (size_t i = 0; i < sizeof(h); ++i)
-      handle.push_back(
-          static_cast<uint8_t>(reinterpret_cast<const char*>(&h)[i]));
-  }
-  if (!made || hipDeviceSynchronize() != hipSuccess) {
-    (void)hipGetLastError();
-    (void)hip_custom_communicator_free(reinterpret_cast<int64_t>(s));
-    return {error_code(Error::hip_failed), 0, {}, ""};
-  }
-
-  // ---- THE ANSWER: the handle, the regions' IPC handles' bytes, the arch.
-  // ----
-  return {std::nullopt, reinterpret_cast<int64_t>(s), handle, s->device.arch};
-}
-
-// CONNECT: the symmetric memory joined: every peer's regions opened from their
-// IPC handles (`handles`: a rank's five, as open answered them, rank after
-// rank; this rank's ignored), then each region's device array written (every
-// rank's address of it), and the eager input table, slot 0: every rank's
-// staging.
-ErrorCode hip_custom_communicator_connect(int64_t state,
-                                          const std::vector<int64_t>& handles) {
-  using namespace hip_custom_communicator;
-  if (state == 0) return error_code(Error::not_open);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
-  constexpr int kRegions = 5;  // open's handles: signals, staging, partials,
-                               // scales, unfenced
+  // WHAT THIS RANK SENDS ITS PEERS: its device's UUID, then its regions' IPC
+  // handles in this order: the signals, the staging, the partials, the scales,
+  // the unfenced region.
+  constexpr int kRegions = 5;
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
-  if (handles.size() != s.world * kRegions * kHandleBytes)
-    return error_code(Error::world_not_built);
-  SymmetricMemory& symmetric = s.symmetric;
+  std::string mine(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
   char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
                                symmetric.staging, symmetric.partials,
                                reinterpret_cast<char*>(symmetric.scales),
                                symmetric.unfenced};
+  for (char* region : own) {
+    hipIpcMemHandle_t h{};
+    made = made && hipIpcGetMemHandle(&h, region) == hipSuccess;
+    mine.append(reinterpret_cast<const char*>(&h), kHandleBytes);
+  }
+  if (!made || hipDeviceSynchronize() != hipSuccess) {
+    (void)hipGetLastError();
+    (void)hip_custom_communicator_close(reinterpret_cast<int64_t>(s), true);
+    return {error_code(Error::hip_failed), 0, ""};
+  }
+
+  // ---- THE EXCHANGE, over the group: every rank's UUID and handles. ----
+  const std::optional<std::vector<std::string>> everyone =
+      all_gathered(*process_group, mine, timeout_seconds);
+  if (!everyone) {
+    (void)hip_custom_communicator_close(reinterpret_cast<int64_t>(s), true);
+    return {error_code(Error::exchange_failed), 0, ""};
+  }
+
+  // ---- EVERY PEER REACHED: a peer's device this process sees (by its UUID)
+  // reachable from ours, every peer's regions opened, each region's device
+  // array written (every rank's address of it), and the eager input table,
+  // slot 0: every rank's staging. The first failure is this rank's. ----
+  std::optional<Error> failed;
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess) failed = Error::hip_failed;
+  for (int r = 0; r < world && !failed; ++r)
+    for (int d = 0; d < devices && r != rank && !failed; ++d) {
+      hipUUID theirs{};
+      int reachable = 0;
+      if (d == device || hipDeviceGetUuid(&theirs, d) != hipSuccess ||
+          std::memcmp(&theirs, (*everyone)[r].data(), sizeof(theirs)) != 0)
+        continue;
+      if (hipDeviceCanAccessPeer(&reachable, static_cast<int>(device), d) !=
+              hipSuccess ||
+          reachable == 0)
+        failed = Error::peer_not_accessible;
+    }
   const void* const arrays[kRegions] = {
       symmetric.signals_ptr_array, symmetric.staging_ptr_array,
       symmetric.partials_ptr_array, symmetric.scales_ptr_array,
       symmetric.unfenced_ptr_array};
-  std::vector<char*> staging(s.world);
-  for (int region = 0; region < kRegions; ++region) {
-    std::vector<char*> addresses(s.world);
-    for (int r = 0; r < s.world; ++r) {
-      if (r == s.rank) {
+  for (int region = 0; region < kRegions && !failed; ++region) {
+    std::vector<char*> addresses(world);
+    for (int r = 0; r < world && !failed; ++r) {
+      if (r == rank) {
         addresses[r] = own[region];
         continue;
       }
       hipIpcMemHandle_t h;
-      for (size_t i = 0; i < kHandleBytes; ++i)
-        reinterpret_cast<char*>(&h)[i] = static_cast<char>(
-            handles[(r * kRegions + region) * kHandleBytes + i]);
+      std::memcpy(&h,
+                  (*everyone)[r].data() + sizeof(uuid) + region * kHandleBytes,
+                  kHandleBytes);
       void* base = nullptr;
       if (hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess) !=
           hipSuccess) {
-        (void)hipGetLastError();
-        return error_code(Error::hip_failed);
+        failed = Error::peers_not_opened;
+        continue;
       }
       addresses[r] = static_cast<char*>(base);
       symmetric.peers.push_back(addresses[r]);
     }
-    if (hipMemcpy(const_cast<void*>(arrays[region]), addresses.data(),
-                  s.world * sizeof(char*),
-                  hipMemcpyHostToDevice) != hipSuccess) {
-      (void)hipGetLastError();
-      return error_code(Error::hip_failed);
-    }
-    if (region == 1) staging = addresses;
+    if (!failed &&
+        hipMemcpy(const_cast<void*>(arrays[region]), addresses.data(),
+                  world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
+      failed = Error::hip_failed;
+    if (!failed && region == 1 &&
+        hipMemcpy(s->input_tables.device, addresses.data(),
+                  world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
+      failed = Error::hip_failed;
   }
-  if (hipMemcpy(s.input_tables.device, staging.data(), s.world * sizeof(char*),
-                hipMemcpyHostToDevice) != hipSuccess) {
-    (void)hipGetLastError();
-    return error_code(Error::hip_failed);
+  (void)hipGetLastError();
+
+  // ---- EVERY RANK OPENED, or every rank closes (a flag a rank, over the
+  // group): this rank's failure, else a peer's (ranks_disagree). ----
+  const std::optional<std::vector<std::string>> opened = all_gathered(
+      *process_group, std::string(1, failed ? '0' : '1'), timeout_seconds);
+  const bool everyone_opened =
+      opened && std::count(opened->begin(), opened->end(), "1") == world;
+  if (!everyone_opened) {
+    (void)hip_custom_communicator_close(reinterpret_cast<int64_t>(s), !opened);
+    return {error_code(failed    ? *failed
+                       : !opened ? Error::exchange_failed
+                                 : Error::ranks_disagree),
+            0, ""};
   }
-  return std::nullopt;
+
+  // ---- THE ANSWER: the handle, the arch. ----
+  return {std::nullopt, reinterpret_cast<int64_t>(s), s->device.arch};
 }
 
-// THE CAPTURED LAUNCHES' INPUTS FOR THE PEERS (vLLM's
-// get_graph_buffer_ipc_meta): (the Error or none; each pending input's
-// allocation's IPC handle's bytes, an input after another, in the order
-// reserved; each input's offset in its allocation).
-GraphMetaWire hip_custom_communicator_graph_ipc_meta(int64_t state) {
-  using namespace hip_custom_communicator;
-  if (state == 0) return {error_code(Error::not_open), {}, {}};
-  const CommsState& s = *reinterpret_cast<const CommsState*>(state);
-  std::vector<int64_t> bytes, offsets;
-  for (const auto& [slot, input] : s.input_tables.pending) {
-    void* base = nullptr;
-    hipIpcMemHandle_t h;
-    if (hipPointerGetAttribute(&base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
-                               reinterpret_cast<hipDeviceptr_t>(
-                                   const_cast<void*>(input))) != hipSuccess ||
-        hipIpcGetMemHandle(&h, base) != hipSuccess) {
-      (void)hipGetLastError();
-      return {error_code(Error::hip_failed), {}, {}};
-    }
-    for (size_t i = 0; i < sizeof(h); ++i)
-      bytes.push_back(
-          static_cast<uint8_t>(reinterpret_cast<const char*>(&h)[i]));
-    offsets.push_back(static_cast<const char*>(input) -
-                      static_cast<const char*>(base));
-  }
-  return {std::nullopt, bytes, offsets};
-}
-
-// THE CAPTURED LAUNCHES' TABLES WRITTEN (vLLM's register_graph_buffers): every
-// rank's `graph_ipc_meta` (`handles`' bytes and `offsets`, a rank's after
-// another's, each as many as this rank has pending), each peer allocation
-// opened once (cached by its handle), every pending slot written, none pending
-// after. Ranks that captured different counts are refused (ranks_disagree).
-ErrorCode hip_custom_communicator_register_graph_buffers(
-    int64_t state, const std::vector<int64_t>& handles,
-    const std::vector<int64_t>& offsets) {
+// REGISTER THE CAPTURE'S INPUTS (vLLM's register_graph_buffers), once a capture
+// ends, before any replay: every rank's pending inputs (the in-place launches
+// it captured, in the order reserved) go round the group, each its
+// allocation's IPC handle and its offset in it; each peer allocation is opened
+// once (cached by its handle), every pending slot's table written, none
+// pending after. Ranks that captured different counts are refused
+// (ranks_disagree); a group that fails is exchange_failed.
+ErrorCode hip_custom_communicator_register_graph(int64_t state) {
   using namespace hip_custom_communicator;
   if (state == 0) return error_code(Error::not_open);
   CommsState& s = *reinterpret_cast<CommsState*>(state);
-  const size_t count = s.input_tables.pending.size();
-  if (offsets.size() != count * s.world ||
-      handles.size() != offsets.size() * sizeof(hipIpcMemHandle_t))
-    return error_code(Error::ranks_disagree);
-  for (size_t i = 0; i < count; ++i) {
+  // THIS RANK'S INPUTS: a handle and an offset each.
+  constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
+  constexpr size_t kEntryBytes = kHandleBytes + sizeof(int64_t);
+  bool made = true;
+  std::string mine;
+  for (const auto& [slot, input] : s.input_tables.pending) {
+    void* base = nullptr;
+    hipIpcMemHandle_t h{};
+    made = made &&
+           hipPointerGetAttribute(
+               &base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+               reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(input))) ==
+               hipSuccess &&
+           hipIpcGetMemHandle(&h, base) == hipSuccess;
+    const int64_t offset =
+        static_cast<const char*>(input) - static_cast<const char*>(base);
+    mine.append(reinterpret_cast<const char*>(&h), kHandleBytes);
+    mine.append(reinterpret_cast<const char*>(&offset), sizeof(offset));
+  }
+  (void)hipGetLastError();
+  // EVERY RANK'S COUNT FIRST (gloo's allgather moves equal lengths): a flag
+  // and the count, the same on every rank or refused; then the inputs.
+  const int64_t count = static_cast<int64_t>(s.input_tables.pending.size());
+  std::string header(1, made ? '1' : '0');
+  header.append(reinterpret_cast<const char*>(&count), sizeof(count));
+  const std::optional<std::vector<std::string>> headers =
+      all_gathered(*s.group, header, s.timeout_seconds);
+  if (!headers) return error_code(Error::exchange_failed);
+  if (!made) return error_code(Error::hip_failed);
+  for (const std::string& h : *headers)
+    if (h != header) return error_code(Error::ranks_disagree);
+  const std::optional<std::vector<std::string>> everyone =
+      count == 0 ? std::vector<std::string>(s.world)
+                 : all_gathered(*s.group, mine, s.timeout_seconds);
+  if (!everyone) return error_code(Error::exchange_failed);
+  for (int64_t i = 0; i < count; ++i) {
     const auto& [slot, input] = s.input_tables.pending[i];
     std::vector<const void*> table(s.world, nullptr);
     for (int r = 0; r < s.world; ++r) {
@@ -701,10 +740,10 @@ ErrorCode hip_custom_communicator_register_graph_buffers(
         table[r] = input;
         continue;
       }
-      const size_t at = r * count + i;
-      std::vector<char> key(
-          handles.begin() + at * sizeof(hipIpcMemHandle_t),
-          handles.begin() + (at + 1) * sizeof(hipIpcMemHandle_t));
+      const char* entry = (*everyone)[r].data() + i * kEntryBytes;
+      const std::vector<char> key(entry, entry + kHandleBytes);
+      int64_t offset = 0;
+      std::memcpy(&offset, entry + kHandleBytes, sizeof(offset));
       auto it = s.input_tables.opened.find(key);
       if (it == s.input_tables.opened.end()) {
         hipIpcMemHandle_t h;
@@ -717,7 +756,7 @@ ErrorCode hip_custom_communicator_register_graph_buffers(
         }
         it = s.input_tables.opened.emplace(key, static_cast<char*>(base)).first;
       }
-      table[r] = it->second + offsets[at];
+      table[r] = it->second + offset;
     }
     if (hipMemcpy(s.input_tables.device + slot * s.world, table.data(),
                   table.size() * sizeof(void*),
@@ -730,35 +769,35 @@ ErrorCode hip_custom_communicator_register_graph_buffers(
   return std::nullopt;
 }
 
-// CLOSE THE PEERS: every BORROWED mapping closed (the peers' regions, their
-// captured inputs), every one tried: the first failure's Error. Every launch
-// finished first, and every rank stopped (close is a collective).
-ErrorCode hip_custom_communicator_close_peers(int64_t state) {
+// CLOSE: every BORROWED mapping closed (the peers' regions, their captured
+// inputs), then this rank's OWNED buffers freed, and the state with them; every
+// step tried, the first failure's Error. Every launch on the device finished
+// first (the caller's). A COLLECTIVE unless `alone`: a handshake over the group
+// once every rank stopped, its peers' mappings closed, a second once every
+// rank closed its mappings of ours, then ours freed. A handshake a peer misses
+// within the state's timeout is exchange_failed, and the close carries on
+// alone (a peer that missed the first would pair this rank's second with its
+// own first). ALONE (an exit, a signal, a failed open): no handshake, never
+// waiting on a peer.
+ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
   using namespace hip_custom_communicator;
   if (state == 0) return error_code(Error::not_open);
-  CommsState& s = *reinterpret_cast<CommsState*>(state);
+  auto* s = reinterpret_cast<CommsState*>(state);
   ErrorCode first;
-  std::vector<char*> borrowed = s.symmetric.peers;
-  for (const auto& [key, base] : s.input_tables.opened)
+  if (!alone && !all_gathered(*s->group, "1", s->timeout_seconds)) {
+    first = error_code(Error::exchange_failed);
+    alone = true;
+  }
+  std::vector<char*> borrowed = s->symmetric.peers;
+  for (const auto& [key, base] : s->input_tables.opened)
     borrowed.push_back(base);
   for (char* base : borrowed)
     if (hipIpcCloseMemHandle(base) != hipSuccess) {
       (void)hipGetLastError();
       if (!first) first = error_code(Error::hip_failed);
     }
-  s.symmetric.peers.clear();
-  s.input_tables.opened.clear();
-  return first;
-}
-
-// FREE: this rank's OWNED buffers freed, every one tried (the first failure's
-// Error), and the state with them. Once no peer has them open (after every
-// rank's close_peers).
-ErrorCode hip_custom_communicator_free(int64_t state) {
-  using namespace hip_custom_communicator;
-  if (state == 0) return error_code(Error::not_open);
-  auto* s = reinterpret_cast<CommsState*>(state);
-  ErrorCode first;
+  if (!alone && !all_gathered(*s->group, "1", s->timeout_seconds) && !first)
+    first = error_code(Error::exchange_failed);
   for (const void* p :
        {static_cast<const void*>(s->symmetric.signals),
         static_cast<const void*>(s->symmetric.staging),
