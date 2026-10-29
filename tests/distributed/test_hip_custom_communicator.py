@@ -11,9 +11,12 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    _TABLE,
     AllReduceAddAttnResRmsNormConfig,
     AllReduceAddRmsNormConfig,
     HipCustomCommunicator,
+    TunedTable,
+    parse_tuned_table,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -45,6 +48,17 @@ INT4_ONE_SHOT_RELATIVE_RMS = 0.15
 INT4_TWO_SHOT_RELATIVE_RMS = 0.25
 
 
+def no_table_scans(m: pytest.MonkeyPatch) -> None:
+    """After open, a plain call reads its config off the picks decided at open
+    (`PlainPicks`): scanning the tuned table on a call fails the test (2026-10-29: a
+    scan on every call cost a worker ~1 s of host time in a 65 s window)."""
+
+    def scanned(*args, **kwargs):
+        raise AssertionError("a plain call scanned the tuned table")
+
+    m.setattr(TunedTable, "nearest", scanned)
+
+
 def int4_bar(config) -> float:
     """The INT4 bar of a call that ran `config`: a two-shot's where it moved INT4 in
     two shots (a split's all-reduce among them), else a one-shot's."""
@@ -74,6 +88,7 @@ def all_reduce_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, po
             max_cols=HIDDEN,
         )
         assert not comm.disabled, comm.lifecycle
+        no_table_scans(m)
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -155,6 +170,7 @@ def all_reduce_add_rms_norm_no_residual_ranks(
             max_cols=HIDDEN,
         )
         assert not comm.disabled, comm.lifecycle
+        no_table_scans(m)
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -269,6 +285,7 @@ def all_reduce_add_rms_norm_ranks(
             max_cols=HIDDEN,
         )
         assert not comm.disabled, comm.lifecycle
+        no_table_scans(m)
         try:
             for num_tokens in NUM_TOKENS:
                 for dtype in [torch.bfloat16, torch.float16]:
@@ -403,6 +420,7 @@ def all_reduce_add_attn_res_rms_norm_ranks(
             max_cols=HIDDEN,
         )
         assert not comm.disabled, comm.lifecycle
+        no_table_scans(m)
         dtype = torch.bfloat16
         try:
             for num_tokens in NUM_TOKENS:
@@ -700,3 +718,40 @@ def test_tuned_table(monkeypatch: pytest.MonkeyPatch, tp_size):
     if tp_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     multi_process_parallel(monkeypatch, tp_size, 1, tuned_table_ranks)
+
+
+def test_plain_picks_are_nearest():
+    """Every row count's pick decided at open (`TunedTable.by_rows`) is the one a scan
+    of the table finds (`TunedTable.nearest`), in each mode at each world the shipped
+    table holds, for each op, at its tuned widths and at widths it was not tuned at."""
+    table = parse_tuned_table(_TABLE, "gfx950")
+    assert isinstance(table, TunedTable), table
+    max_rows = 4096
+    for quantization, mode in [("exact", "exact"), ("int4", "quantized")]:
+        for world in sorted({i.world for i in table.picks}):
+            for op, residual in [
+                ("all_reduce", None),
+                ("all_reduce_add_rms_norm", False),
+                ("all_reduce_add_rms_norm", True),
+                ("all_reduce_add_attn_res_rms_norm", None),
+            ]:
+                tuned = {
+                    i.hidden
+                    for i in table.picks
+                    if i.op == op
+                    and i.residual == residual
+                    and i.mode == mode
+                    and i.world == world
+                }
+                if not tuned:
+                    continue
+                for cols in sorted(tuned | {4096, 5120}):
+                    picks = table.by_rows(
+                        op, residual, quantization, world, cols, max_rows
+                    )
+                    assert len(picks) == max_rows + 1
+                    for rows in [*range(0, 130), *range(130, max_rows + 1, 37)]:
+                        want = table.nearest(
+                            op, residual, quantization, world, rows, cols
+                        )[1]
+                        assert picks[rows] == want, (op, residual, world, cols, rows)

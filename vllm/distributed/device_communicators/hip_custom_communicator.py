@@ -9,9 +9,10 @@ CustomAllreduce) extended to every collective Kimi-K3 needs -- the all-reduce an
 all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 (`csrc/rocm/hip_custom_communicator.cu`).
 
-The caller names an op and Python looks its config up in the tuned table
-(`TunedTable.nearest`: the inputs tuned at the communicator's `quantization`; where it
-allows INT4 a pick moves INT4 or exact, whichever the tune found faster at its size),
+The caller names an op and Python reads its config off the picks decided at open
+from the tuned table (`PlainPicks`, each row count's `TunedTable.nearest`: the inputs
+tuned at the communicator's `quantization`; where it allows INT4 a pick moves INT4 or
+exact, whichever the tune found faster at its size),
 one config a pick: its algorithm the op's fused kernel's body, or, where the op is
 faster as two kernels of ours, a split (`<body>_split`: our all-reduce at that body,
 then the op on this rank's rows at the config's fields named for that kernel). The
@@ -190,8 +191,9 @@ _PACK_BYTES = 16
 # configs' in the order a plain call launches them: the op's one kernel, or our
 # all-reduce then the op's norm on rows). No format or version: it changes with this
 # file, in one commit. The arch's table is parsed and checked at open
-# (`parse_tuned_table`); a plain call launches its nearest input's pick
-# (`TunedTable.nearest`). Every tuned number is here, none in C++. A communicator
+# (`parse_tuned_table`), and every plain call's config decided from it then
+# (`PlainPicks`: its nearest input's pick, `TunedTable.nearest`, for every row count);
+# a call indexes it. Every tuned number is here, none in C++. A communicator
 # opened with another file's path runs that instead (the tuner's candidate).
 _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
 
@@ -532,6 +534,16 @@ class TunedInput:
     dtype: str
 
 
+def _nearest_size(
+    tuned: list[tuple[TunedInput, Config]], width: int, rows: int, cols: int
+) -> tuple[TunedInput, Config]:
+    """Of one width's tuned inputs, the nearest in size (rows x width) to `rows` x
+    `cols`, the fewer tokens on a tie: `nearest`'s last step."""
+    return min(
+        tuned, key=lambda ic: (abs(ic[0].tokens * width - rows * cols), ic[0].tokens)
+    )
+
+
 @dataclass(frozen=True)
 class TunedTable:
     """THE ARCH'S TUNED TABLE, parsed and checked (`parse_tuned_table`): each tuned
@@ -557,7 +569,22 @@ class TunedTable:
         Among the inputs whose every config's pack fits the row (whole packs at the
         input's dtype; a config the row is not whole packs of is refused,
         row_not_packs), where any does; then the nearest width, then the nearest size
-        (rows x width), the fewer tokens on a tie."""
+        (rows x width), the fewer tokens on a tie. A scan of the table: a plain call
+        reads its answer from `PlainPicks`, made from this once a width."""
+        width, tuned = self._at_width(op, residual, quantization, world, cols)
+        return _nearest_size(tuned, width, rows, cols)
+
+    def _at_width(
+        self,
+        op: Op,
+        residual: bool | None,
+        quantization: Quantization,
+        world: int,
+        cols: int,
+    ) -> tuple[int, list[tuple[TunedInput, Config]]]:
+        """`nearest`'s first steps, which a call's rows do not enter: the inputs of
+        `op` tuned in the mode at `world` whose configs fit the row (where any do), and
+        of them the nearest width's, with that width."""
         tuned = [
             (i, c)
             for i, c in self.picks.items()
@@ -573,9 +600,23 @@ class TunedTable:
         ]
         tuned = fitting or tuned
         width = min((i.hidden for i, _ in tuned), key=lambda h: abs(h - cols))
-        return min(
-            ((i, c) for i, c in tuned if i.hidden == width),
-            key=lambda ic: (abs(ic[0].tokens * width - rows * cols), ic[0].tokens),
+        return width, [(i, c) for i, c in tuned if i.hidden == width]
+
+    def by_rows(
+        self,
+        op: Op,
+        residual: bool | None,
+        quantization: Quantization,
+        world: int,
+        cols: int,
+        max_rows: int,
+    ) -> tuple[Config, ...]:
+        """`nearest`'s config for every row count from 0 to `max_rows` at `cols`, a
+        tuple indexed by rows: the table scanned once, each row count's nearest size
+        among the width's few inputs."""
+        width, tuned = self._at_width(op, residual, quantization, world, cols)
+        return tuple(
+            _nearest_size(tuned, width, rows, cols)[1] for rows in range(max_rows + 1)
         )
 
     def kernel_config(
@@ -648,6 +689,75 @@ class Lifecycle:
         what `__del__` warns about, read without a global lookup (collection can run at
         interpreter shutdown, when globals are None)."""
         return self.status in ("open", "capturing", "broken")
+
+
+# THE OPS A PLAIN CALL RUNS, each with its residual choice (the norm op's two).
+_PLAIN_OPS: tuple[tuple[Op, bool | None], ...] = (
+    ("all_reduce", None),
+    ("all_reduce_add_rms_norm", False),
+    ("all_reduce_add_rms_norm", True),
+    ("all_reduce_add_attn_res_rms_norm", None),
+)
+
+
+@dataclass(eq=False)
+class PlainPicks:
+    """WHAT EVERY PLAIN CALL RUNS, decided before the call: each op's config for every
+    row count up to `max_rows` at a width, a tuple indexed by rows
+    (`TunedTable.by_rows`), made at open for every width the table tuned in this mode
+    at this world (`plain_picks`), and for any other width once, at its first call. A
+    plain call indexes it, so no call scans the table (2026-10-29: `nearest` on every
+    call was ~1 s of a worker's host time in a 65 s window, Qwen3-8B at TP2). A row
+    count past `max_rows` (the exchange refuses it) is looked up as before."""
+
+    table: TunedTable
+    quantization: Quantization
+    world: int
+    max_rows: int
+    by_width: dict[tuple[Op, bool | None, int], tuple[Config, ...]] = field(
+        default_factory=dict
+    )
+
+    def config(self, op: Op, residual: bool | None, rows: int, cols: int) -> Config:
+        """`op`'s config on `rows` x `cols` (the norm op's with `residual` or
+        without): `TunedTable.nearest`'s, read off its width's tuple."""
+        picks = self.by_width.get((op, residual, cols))
+        if picks is None:
+            picks = self.table.by_rows(
+                op, residual, self.quantization, self.world, cols, self.max_rows
+            )
+            self.by_width[(op, residual, cols)] = picks
+        if rows < len(picks):
+            return picks[rows]
+        return self.table.nearest(
+            op, residual, self.quantization, self.world, rows, cols
+        )[1]
+
+
+def plain_picks(
+    table: TunedTable,
+    quantization: Quantization,
+    world: int,
+    max_rows: int,
+    max_cols: int,
+) -> PlainPicks:
+    """THE PLAIN CALLS' PICKS AT OPEN: every op's, at every width up to `max_cols` the
+    table tuned it at in this mode at this world, for every row count up to
+    `max_rows`."""
+    picks = PlainPicks(table, quantization, world, max_rows)
+    for op, residual in _PLAIN_OPS:
+        widths = {
+            i.hidden
+            for i in table.picks
+            if i.op == op
+            and i.residual == residual
+            and i.mode == _MODES[quantization]
+            and i.world == world
+            and i.hidden <= max_cols
+        }
+        for cols in sorted(widths):
+            picks.config(op, residual, 0, cols)
+    return picks
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1239,10 @@ class HipCustomCommunicator:
             logger.info("%s disabled: %s", type(self).__name__, error.name)
             return
         self.state = opened
+        # EVERY PLAIN CALL'S CONFIG, DECIDED NOW: a call indexes it.
+        self.picks = plain_picks(
+            opened.tuned_table, quantization, self.arguments.world, max_rows, max_cols
+        )
         self.lifecycle.status = "open"
         _open_communicators.add(self)
         # THE READY LINE, read by the benches' communicator proof: what the exchange is
@@ -1208,17 +1322,10 @@ class HipCustomCommunicator:
         if self.lifecycle.status == "capturing" and not capturing:
             return output
 
-        # THE CONFIG: the one given, else the tuned table's nearest input's.
+        # THE CONFIG: the one given, else its pick, decided at open (`PlainPicks`).
         if config is None:
             rows, cols = input.shape
-            _, picked = self.state.tuned_table.nearest(
-                "all_reduce",
-                None,
-                self.arguments.quantization,
-                self.arguments.world,
-                rows,
-                cols,
-            )
+            picked = self.picks.config("all_reduce", None, rows, cols)
             assert isinstance(picked, AllReduceConfig), picked
             config = picked
         # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
@@ -1313,19 +1420,12 @@ class HipCustomCommunicator:
         ):
             return (output, residual_output) if add else output
 
-        # THE CONFIG: the one given, else the tuned table's nearest input's, its
+        # THE CONFIG: the one given, else its pick, decided at open (`PlainPicks`), its
         # inputs with a residual or without as this call (one kernel, or the split:
         # our all-reduce, then the norm on this rank's rows).
         if config is None:
             rows, cols = input.shape
-            _, picked = self.state.tuned_table.nearest(
-                "all_reduce_add_rms_norm",
-                add,
-                self.arguments.quantization,
-                self.arguments.world,
-                rows,
-                cols,
-            )
+            picked = self.picks.config("all_reduce_add_rms_norm", add, rows, cols)
             assert isinstance(picked, AllReduceAddRmsNormConfig), picked
             config = picked
         # AN EXACT COMMUNICATOR MOVES NO INT4 (a quantized one runs either: its pick's).
@@ -1431,17 +1531,12 @@ class HipCustomCommunicator:
         ):
             return prefix_output, output
 
-        # THE CONFIG: the one given, else the tuned table's nearest input's (one
+        # THE CONFIG: the one given, else its pick, decided at open (`PlainPicks`) (one
         # kernel, or the split: our all-reduce, then the op on this rank's rows).
         if config is None:
             rows, cols = input.shape
-            _, picked = self.state.tuned_table.nearest(
-                "all_reduce_add_attn_res_rms_norm",
-                None,
-                self.arguments.quantization,
-                self.arguments.world,
-                rows,
-                cols,
+            picked = self.picks.config(
+                "all_reduce_add_attn_res_rms_norm", None, rows, cols
             )
             assert isinstance(picked, AllReduceAddAttnResRmsNormConfig), picked
             config = picked
@@ -1542,13 +1637,10 @@ class HipCustomCommunicator:
         self, op: Op, rows: int, cols: int, residual: bool | None = None
     ) -> Config:
         """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` RUNS here (the norm op's with
-        `residual` or without): its table's nearest input's config
-        (`TunedTable.nearest`)."""
+        `residual` or without): its table's nearest input's config, as the call reads
+        it (`PlainPicks`)."""
         assert self.state is not None, "an open communicator has its state"
-        _, config = self.state.tuned_table.nearest(
-            op, residual, self.arguments.quantization, self.arguments.world, rows, cols
-        )
-        return config
+        return self.picks.config(op, residual, rows, cols)
 
     @final
     def kernel_config(
