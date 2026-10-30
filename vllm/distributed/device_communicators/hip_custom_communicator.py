@@ -541,6 +541,9 @@ class TunedTable:
 
     picks: dict[TunedInput, Config]
     configs: tuple[Config, ...]
+    answers: dict[tuple, tuple[TunedInput, Config]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     def nearest(
         self,
@@ -558,6 +561,9 @@ class TunedTable:
         input's dtype; a config the row is not whole packs of is refused,
         row_not_packs), where any does; then the nearest width, then the nearest size
         (rows x width), the fewer tokens on a tie."""
+        question = (op, residual, quantization, world, rows, cols)
+        if question in self.answers:
+            return self.answers[question]
         tuned = [
             (i, c)
             for i, c in self.picks.items()
@@ -573,10 +579,12 @@ class TunedTable:
         ]
         tuned = fitting or tuned
         width = min((i.hidden for i, _ in tuned), key=lambda h: abs(h - cols))
-        return min(
+        answer = min(
             ((i, c) for i, c in tuned if i.hidden == width),
             key=lambda ic: (abs(ic[0].tokens * width - rows * cols), ic[0].tokens),
         )
+        self.answers[question] = answer
+        return answer
 
     def kernel_config(
         self,
