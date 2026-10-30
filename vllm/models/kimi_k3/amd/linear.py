@@ -14,6 +14,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.device_communicators.hip_custom_communicator import (
+    HipCustomCommunicator,
+    get_hip_custom_communicator,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
@@ -72,7 +76,6 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.kimi_k3.amd import hip_custom_communicator_fusions as fusions
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
@@ -146,11 +149,15 @@ class KimiRoutedOutputTransform(nn.Module):
         norm: RMSNorm | None,
         up_proj: ReplicatedLinear | ColumnParallelLinear,
         row_sharded: bool = False,
+        fused_communicator: HipCustomCommunicator | None = None,
     ) -> None:
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
         self.row_sharded = row_sharded
+        # The model's fused communicator (`_fused_communicator`), else None: the
+        # latent runner all-reduces the latent and its RMSNorm in one of its kernels.
+        self.fused_communicator = fused_communicator
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.norm is not None:
@@ -197,6 +204,35 @@ def _apply_attn_res(
     return result
 
 
+def _apply_attn_res_fused(
+    fused_communicator: HipCustomCommunicator,
+    prefix_sum: torch.Tensor | None,
+    delta: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    output_norm: RMSNorm,
+    num_valid_blocks: int,
+    block_write_idx: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_apply_attn_res` over `prefix_sum + all_reduce(delta)`, the TP all-reduce in
+    the same kernel (the model's fused communicator): returns the
+    reduced prefix and the output. A None `prefix_sum` is started by the reduced
+    delta."""
+    return fused_communicator.all_reduce_add_attn_res_rms_norm(
+        delta,
+        prefix_sum,
+        block_residual,
+        norm.weight,
+        proj.weight.squeeze(0),
+        output_norm.weight,
+        num_valid_blocks,
+        block_write_idx,
+        norm.variance_epsilon,
+        output_norm.variance_epsilon,
+    )
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -204,8 +240,8 @@ class KimiMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_idx: int = 0,
-        latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner,
         reduce_results: bool = True,
+        fused_communicator: HipCustomCommunicator | None = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -321,6 +357,7 @@ class KimiMoE(nn.Module):
                 self.routed_expert_norm,
                 self.routed_expert_up_proj,
                 row_sharded=shard_up_proj,
+                fused_communicator=fused_communicator,
             )
         else:
             self.routed_expert_down_proj = None
@@ -348,7 +385,7 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
-            runner_cls=latent_runner_cls if self.use_latent_moe else None,
+            runner_cls=ROCmLatentMoERunner if self.use_latent_moe else None,
             reduce_results=reduce_results,
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
@@ -541,12 +578,13 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
-        fuse_all_reduces: bool = False,
+        fused_communicator: HipCustomCommunicator | None = None,
     ) -> None:
         super().__init__()
-        # With fuse_all_reduces (hip_custom_communicator_fusions), attention and the
-        # MLP leave their outputs unreduced and each AttnRes reduces its delta.
-        self.fuse_all_reduces = fuse_all_reduces
+        # The model's fused communicator, else None: with it, attention and the MLP
+        # leave their outputs unreduced and each AttnRes reduces its delta
+        # (`_apply_attn_res_fused`).
+        self.fused_communicator = fused_communicator
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
 
@@ -566,7 +604,7 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
-                    reduce_results=not fuse_all_reduces,
+                    reduce_results=fused_communicator is None,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -600,7 +638,7 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
-                reduce_results=not fuse_all_reduces,
+                reduce_results=fused_communicator is None,
             )
 
         if (
@@ -614,15 +652,11 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                reduce_results=not fuse_all_reduces,
-                latent_runner_cls=(
-                    fusions.ROCmLatentMoERunnerAllReduceRmsNorm
-                    if fuse_all_reduces
-                    else ROCmLatentMoERunner
-                ),
+                reduce_results=fused_communicator is None,
+                fused_communicator=fused_communicator,
             )
             self.mlp = self.block_sparse_moe
-            assert not fuse_all_reduces or (
+            assert fused_communicator is None or (
                 self.mlp.experts.moe_config.skip_final_all_reduce
             ), "the MoE ignored reduce_results=False; it would reduce twice"
         else:
@@ -634,7 +668,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                reduce_results=not fuse_all_reduces,
+                reduce_results=fused_communicator is None,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -666,7 +700,6 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
-        # The model's final AttnRes is unfused, so the last layer reduces its output.
         self.is_last_layer = layer_idx == config.num_hidden_layers - 1
 
     def _run_self_attn(
@@ -692,12 +725,7 @@ class KimiDecoderLayer(nn.Module):
     ):
         if self.use_attn_residuals:
             assert residual is not None
-            forward_attn_residual = (
-                self.forward_attn_residual_fused
-                if self.fuse_all_reduces
-                else self.forward_attn_residual
-            )
-            return forward_attn_residual(
+            return self.forward_attn_residual(
                 positions, hidden_states, residual, prefix_delta
             )
 
@@ -729,73 +757,11 @@ class KimiDecoderLayer(nn.Module):
             if isinstance(self.self_attn, (KimiK3DeltaAttention, KimiMLAAttention))
             else None
         )
-        hidden_states = _apply_attn_res(
-            prefix_sum,
-            block_residual,
-            self.self_attention_res_proj,
-            self.self_attention_res_norm,
-            self.prev_valid_blocks,
-            delta=prefix_delta,
-            output_norm=self.input_layernorm,
-            block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
-            quant_key=attention_quant_key,
-        )
-
-        if self.is_block_write_layer:
-            prefix_sum = None
-
-        hidden_states = self._run_self_attn(positions, hidden_states)
-
-        if prefix_sum is None:
-            prefix_sum = hidden_states
-            prefix_delta = None
-        else:
-            prefix_delta = hidden_states
-
-        mlp_valid_blocks = self.prev_valid_blocks + (
-            1 if self.is_block_write_layer else 0
-        )
-        hidden_states = _apply_attn_res(
-            prefix_sum,
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            mlp_valid_blocks,
-            delta=prefix_delta,
-            output_norm=self.post_attention_layernorm,
-            quant_key=(
-                self.mlp.get_input_quant_key()
-                if isinstance(self.mlp, KimiMLP)
-                else None
-            ),
-        )
-
-        hidden_states = self.mlp(hidden_states)
-        return prefix_sum, block_residual, hidden_states
-
-    def forward_attn_residual_fused(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        block_residual: torch.Tensor,
-        prefix_delta: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # `prefix_delta` is the previous layer's MLP output, unreduced; the first
-        # layer has none, and its input (the embedding) is already whole.
-        prefix_sum: torch.Tensor | None = hidden_states
-        block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
-        if prefix_delta is None:
-            hidden_states = _apply_attn_res(
-                hidden_states,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.prev_valid_blocks,
-                output_norm=self.input_layernorm,
-                block_write_idx=block_write_idx,
-            )
-        else:
-            prefix_sum, hidden_states = fusions.fused_attn_res(
+        if self.fused_communicator is not None and prefix_delta is not None:
+            # FUSED: the delta (the previous layer's MLP output) arrives unreduced and
+            # the AttnRes reduces it in the same kernel, returning the reduced prefix.
+            prefix_sum, hidden_states = _apply_attn_res_fused(
+                self.fused_communicator,
                 prefix_sum,
                 prefix_delta,
                 block_residual,
@@ -803,31 +769,149 @@ class KimiDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 self.prev_valid_blocks,
-                block_write_idx,
+                self.block_write_idx if self.is_block_write_layer else -1,
+            )
+        else:
+            hidden_states = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.prev_valid_blocks,
+                delta=prefix_delta,
+                output_norm=self.input_layernorm,
+                block_write_idx=(
+                    self.block_write_idx if self.is_block_write_layer else -1
+                ),
+                quant_key=attention_quant_key,
             )
 
         if self.is_block_write_layer:
             prefix_sum = None
 
-        attn_out = self._run_self_attn(positions, hidden_states)
+        hidden_states = self._run_self_attn(positions, hidden_states)
 
         mlp_valid_blocks = self.prev_valid_blocks + (
             1 if self.is_block_write_layer else 0
         )
-        prefix, hidden_states = fusions.fused_attn_res(
-            prefix_sum,
-            attn_out,
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            self.post_attention_layernorm,
-            mlp_valid_blocks,
-        )
+        if self.fused_communicator is not None:
+            # FUSED: the attention output arrives unreduced (a block-write layer's
+            # starts the prefix, reduced).
+            prefix_sum, hidden_states = _apply_attn_res_fused(
+                self.fused_communicator,
+                prefix_sum,
+                hidden_states,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+                mlp_valid_blocks,
+            )
+        else:
+            if prefix_sum is None:
+                prefix_sum = hidden_states
+                prefix_delta = None
+            else:
+                prefix_delta = hidden_states
+
+            hidden_states = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                mlp_valid_blocks,
+                delta=prefix_delta,
+                output_norm=self.post_attention_layernorm,
+                quant_key=(
+                    self.mlp.get_input_quant_key()
+                    if isinstance(self.mlp, KimiMLP)
+                    else None
+                ),
+            )
 
         hidden_states = self.mlp(hidden_states)
-        if self.is_last_layer:
+        if self.fused_communicator is not None and self.is_last_layer:
+            # The model's final AttnRes is unfused: it takes this output reduced.
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        return prefix, block_residual, hidden_states
+        return prefix_sum, block_residual, hidden_states
+
+
+# SPECULATIVE METHODS THAT CAPTURE LAYERS' HIDDEN STATES: each needs one whole.
+_AUX_HIDDEN_STATE_METHODS = ("eagle3", "extract_hidden_states", "dflash", "dspark")
+
+
+def _fused_communicator(
+    config: KimiLinearConfig, vllm_config: VllmConfig
+) -> HipCustomCommunicator | None:
+    """THE ONE DECISION, handed down to every layer: the TP group's
+    HipCustomCommunicator where the decoder layers fuse their all-reduces (attention's
+    and the MLP's outputs left unreduced, each reduced in the AttnRes after it, and the
+    latent MoE's with its RMSNorm), else None and the standard layers run: it runs the
+    TP all-reduce, the served config is one the fused layers compute exactly, and it
+    admits every fused call at the model's widths and dtype."""
+    communicator = get_hip_custom_communicator()
+    if communicator is None:
+        return None
+    from vllm.models.kimi_k3.amd.specialized_decode.runtime import (
+        SPECIALIZED,
+        decode_backend,
+    )
+
+    kda_config = config.linear_attn_config
+    parallel = vllm_config.parallel_config
+    speculative = vllm_config.speculative_config
+    tp_size = get_tensor_model_parallel_world_size()
+    latent_width = getattr(config, "routed_expert_hidden_size", None)
+    latent = latent_width is not None
+    # EVERY FUSED CALL ADMITTED, asked once here at the model's widths and dtype from
+    # one row to the most a step carries (meta tensors: nothing allocated), so no fused
+    # call is refused in the forward: each AttnRes, and the latent's with its RMSNorm.
+    dtype = vllm_config.model_config.dtype
+
+    def meta(*shape: int) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    admitted = all(
+        communicator.should_allreduce_add_attn_res_rms_norm(
+            meta(rows, config.hidden_size)
+        )
+        and (
+            latent_width is None
+            or not config.latent_moe_use_norm
+            or communicator.should_allreduce_add_rms_norm(
+                meta(rows, latent_width), meta(latent_width)
+            )
+        )
+        for rows in (1, communicator.arguments.max_rows)
+    )
+    why = (
+        "the model has no AttnRes"
+        if config.attn_res_block_size is None
+        else "Kimi-Linear's delta attention reduces its own output"
+        if kda_config is not None and not kda_config.get("use_full_rank_gate", False)
+        else "a pipeline split passes the reduced sum"
+        if get_pp_group().world_size != 1
+        else "the speculative method captures hidden states, which must be whole"
+        if speculative is not None and speculative.method in _AUX_HIDDEN_STATE_METHODS
+        else "the specialized decode's layers take and return a reduced delta"
+        if decode_backend(vllm_config) == SPECIALIZED
+        else "expert parallelism reduces the MoE's output itself"
+        if parallel.enable_expert_parallel or parallel.use_sequence_parallel_moe
+        else "the latent MoE reduces its output early (its up-projection unsharded)"
+        if latent
+        and (
+            config.num_shared_experts is None
+            or config.routed_scaling_factor != 1.0
+            or config.hidden_size % tp_size != 0
+        )
+        else f"the communicator does not run every fused call at {dtype}"
+        if not admitted
+        else None
+    )
+    if why is not None:
+        logger.info("Kimi-K3 keeps its all-reduces unfused: %s", why)
+        return None
+    return communicator
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin):
@@ -848,14 +932,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        fuse_all_reduces = fusions.fuse_all_reduces(config, vllm_config)
+        fused_communicator = _fused_communicator(config, vllm_config)
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(
                 config,
                 vllm_config,
                 prefix,
-                fuse_all_reduces=fuse_all_reduces,
+                fused_communicator=fused_communicator,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(

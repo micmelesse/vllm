@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import ClassVar, Literal, cast, final, get_args
+from typing import Any, ClassVar, Literal, cast, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -66,6 +66,7 @@ __all__ = [
     "AllReduceConfig",
     "AllReduceAddRmsNormConfig",
     "AllReduceAddAttnResRmsNormConfig",
+    "get_hip_custom_communicator",
 ]
 
 
@@ -712,7 +713,37 @@ def parse_tuned_table(path: Path, arch: str) -> TunedTable | Error:
     quantized (a quantized one's exact or INT4); every tuned op
     an input in each mode at every world the table tunes, the norm op's with a residual
     and without (the lookup reads one there)."""
-    tables = json.loads(path.read_text())
+    try:
+        tables = json.loads(path.read_text())
+    except OSError as e:
+        logger.error(
+            "HipCustomCommunicator open: %s: %s",
+            Error.no_tuned_table.name,
+            f"{path} cannot be read ({e})",
+        )
+        return Error.no_tuned_table
+    except ValueError as e:
+        logger.error(
+            "HipCustomCommunicator open: %s: %s",
+            Error.tuned_table_unsound.name,
+            f"{path} is not JSON ({e})",
+        )
+        return Error.tuned_table_unsound
+    # A RECORD THE CHECKS DO NOT NAME (a field missing, a value of the wrong kind) is an
+    # unsound table too, returned as the checks' are, never raised.
+    try:
+        return _table_of(tables, path, arch)
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(
+            "HipCustomCommunicator open: %s: %s",
+            Error.tuned_table_unsound.name,
+            f"{path}: {type(e).__name__}: {e}",
+        )
+        return Error.tuned_table_unsound
+
+
+def _table_of(tables: Any, path: Path, arch: str) -> TunedTable | Error:
+    """`parse_tuned_table`'s checks, on the file's JSON."""
     if arch not in tables:
         logger.error(
             "HipCustomCommunicator open: %s: %s",
@@ -971,6 +1002,22 @@ def open_state(
                     sig, functools.partial(on_exit_signal, signal.getsignal(sig))
                 )
     return CommsState(handle=handle, arch=arch, tuned_table=tuned_table)
+
+
+def get_hip_custom_communicator() -> "HipCustomCommunicator | None":
+    """THE TP GROUP'S HipCustomCommunicator, when it runs (TP above one, built and not
+    disabled); None otherwise: what a model's fused ops ask for."""
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+    )
+
+    if get_tensor_model_parallel_world_size() <= 1:
+        return None
+    communicator = getattr(
+        get_tp_group().device_communicator, "hip_custom_communicator", None
+    )
+    return None if communicator is None or communicator.disabled else communicator
 
 
 def close_state(handle: int, alone: bool) -> None:

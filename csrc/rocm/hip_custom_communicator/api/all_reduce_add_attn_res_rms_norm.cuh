@@ -477,8 +477,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   const int64_t m = input_size_m, n = input_size_n;
   const int64_t e = input.element_size();
   // THE SPLIT'S SUM, this rank's [m, n]: the all-reduce's output, AttnRes's
-  // input.
-  torch::Tensor summed = torch::empty_like(input);
+  // input, from torch's caching allocator (a capture's from its own pool). An
+  // allocation that fails throws; caught, it is an Error, as C++ raises
+  // nothing.
+  torch::Tensor summed;
+  try {
+    summed = torch::empty_like(input);
+  } catch (const std::exception&) {
+    return error_code(Error::hip_failed);
+  }
   void* summed_ptr = summed.data_ptr();
   const int64_t summed_stride_m = summed.stride(0),
                 summed_stride_n = summed.stride(1);

@@ -710,7 +710,10 @@ class GroupCoordinator:
                 hip_custom_communicator = (
                     self.device_communicator.hip_custom_communicator
                 )
-                if hip_custom_communicator is not None:
+                if (
+                    hip_custom_communicator is not None
+                    and not hip_custom_communicator.disabled
+                ):
                     maybe_hip_custom_communicator_context = (
                         hip_custom_communicator.capture()
                     )

@@ -145,26 +145,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if (
-            self.world_size > 1
+            use_custom_allreduce
+            and register
+            and self.world_size > 1
             and current_platform.is_rocm()
             and envs.VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR
         ):
-            # HIP CUSTOM COMMS OWNS THE ALL-REDUCE, all of it. When on, none of
-            # upstream's TP all-reduce paths are built -- not AITER's, not
-            # CustomAllreduce, not QuickReduce -- so an arm is not a mixture of two.
-            # When off, upstream's code below runs untouched.
+            # HIP CUSTOM COMMS OWNS THE TP ALL-REDUCE, all of it, where custom
+            # all-reduce is allowed (the TP group; not --disable-custom-all-reduce;
+            # graph buffers it can IPC-register). When it runs, none of upstream's TP
+            # all-reduce paths are built, so an arm is not a mixture of two; when it
+            # disables itself, or is off, upstream's code below runs untouched.
             from vllm.distributed.device_communicators import hip_custom_communicator
 
             # Both groups (mirrors DeviceCommunicatorBase); it exchanges its IPC
             # handles over the cpu group.
-            self.hip_custom_communicator = (
-                hip_custom_communicator.HipCustomCommunicator(
-                    cpu_group=self.cpu_group,
-                    device_group=self.device_group,
-                    device=self.device,
-                )
+            communicator = hip_custom_communicator.HipCustomCommunicator(
+                cpu_group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
             )
-        else:
+            if not communicator.disabled:
+                self.hip_custom_communicator = communicator
+        if self.hip_custom_communicator is None:
             if (
                 self.use_flashinfer_pcie_ipc_allreduce
                 and self.world_size > 1

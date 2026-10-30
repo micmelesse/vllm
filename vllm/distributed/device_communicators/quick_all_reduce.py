@@ -261,7 +261,6 @@ class QuickAllReduce:
         self.create_shared_buffer()
         self._flydsl_int4 = self._init_flydsl_int4(vllm_config)
         self.disabled = False
-        logger.info("QuickReduce ready: quantization=%s", self.qr_quant_level.name)
 
     def _init_flydsl_int4(self, vllm_config) -> Any:
         if (
