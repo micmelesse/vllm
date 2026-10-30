@@ -914,12 +914,12 @@ def open_state(
             "the CPU and device groups differ",
         )
         return Error.groups_disagree
-    if torch.cuda.current_device() != device.index:
+    if torch.accelerator.current_device_index() != device.index:
         logger.error(
             "HipCustomCommunicator open: %s: %s",
             Error.wrong_device.name,
-            f"the current device is {torch.cuda.current_device()}, not the "
-            f"communicator's {device.index}",
+            f"the current device is {torch.accelerator.current_device_index()}, "
+            f"not the communicator's {device.index}",
         )
         return Error.wrong_device
     error, handle, arch = torch.ops._rocm_C.hip_custom_communicator_open(
@@ -1612,7 +1612,7 @@ class HipCustomCommunicator:
             if self.state is None:
                 return
             try:
-                torch.cuda.synchronize(self.arguments.device)
+                torch.accelerator.synchronize(self.arguments.device)
             except RuntimeError as e:
                 # A KERNEL FAULT IS STICKY: logged, and the teardown carries on (a
                 # process must not die holding its peers' memory open).
@@ -1647,7 +1647,7 @@ class HipCustomCommunicator:
 
             def synchronize() -> None:
                 try:
-                    torch.cuda.synchronize(self.arguments.device)
+                    torch.accelerator.synchronize(self.arguments.device)
                 except BaseException as e:  # noqa: BLE001 -- reported as not finished
                     failed.append(e)
 
