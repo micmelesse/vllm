@@ -19,7 +19,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 // undefined symbols. vLLM uses default/Triton GEMM for these ops on gfx1250.
 #ifndef VLLM_SKIP_SKINNY_GEMMS
   // Custom gemm op for matrix-vector multiplication
-  rocm_ops.def("LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> Tensor");
+  rocm_ops.def(
+      "LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> "
+      "Tensor");
   rocm_ops.impl("LLMM1", torch::kCUDA, &LLMM1);
 
   // Custom gemm op for skinny matrix-matrix multiplication
@@ -32,9 +34,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // optional zero points [M/8, K/group_size] int32 for asymmetric
   // quantization
   rocm_ops.def(
-      "wvSplitK_int4_g(Tensor in_a, Tensor in_b, Tensor in_scale, Tensor? "
-      "in_zero_points, "
-      "Tensor? in_bias, int CuCount, int group_size) -> Tensor");
+      "wvSplitK_int4_g(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "Tensor? in_zero_points, Tensor? in_bias, int CuCount, "
+      "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
   // Custom gemm op for skinny matrix-matrix multiplication
@@ -52,26 +54,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
 #ifdef VLLM_ROCM_GFX1100
+  // MXFP4 weights x int8 activations GEMV for RDNA3/RDNA3.5 (gfx11) decode,
+  // 1 <= M <= 8. Weights [N, K/2] uint8 E2M1, scales [N, K/32] uint8 E8M0.
+  rocm_ops.def(
+      "mxfp4_w4a8_gemv_rdna3(Tensor a, Tensor b_q, Tensor b_scale) -> Tensor");
+  rocm_ops.impl("mxfp4_w4a8_gemv_rdna3", torch::kCUDA, &mxfp4_w4a8_gemv_rdna3);
+
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
-      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, Tensor "
-      "b_scales, "
-      "bool use_v2_format) -> Tensor");
+      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
 
   rocm_ops.def(
       "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, "
-      "bool use_v2_format) -> Tensor");
+      "Tensor b_scales, bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
 
   rocm_ops.def(
-      "moe_gptq_gemm_rdna3(Tensor a, Tensor! c, Tensor b_q_weight, Tensor "
-      "b_scales, "
-      "Tensor b_qzeros, Tensor topk_weights, Tensor sorted_token_ids, Tensor "
-      "expert_ids, "
-      "Tensor num_tokens_post_padded, int top_k, int block_size_m, bool "
-      "mul_topk_weight, "
+      "moe_gptq_gemm_rdna3(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor b_qzeros, Tensor topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
       "int output_topk) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
@@ -80,18 +85,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
   rocm_ops.def(
-      "paged_attention(Tensor! out, Tensor exp_sums,                Tensor "
-      "max_logits, "
-      "Tensor tmp_out,                Tensor query, Tensor key_cache, "
-      "               Tensor value_cache, int num_kv_heads,                "
-      "float scale, "
-      "Tensor block_tables,                Tensor seq_lens, "
-      "               Tensor? query_start_loc,                int block_size, "
-      "               int max_seq_len,                Tensor? alibi_slopes, "
-      "               str kv_cache_dtype,                Tensor k_scale, "
-      "Tensor v_scale, "
-      "               Tensor? fp8_out_scale,                str mfma_type) -> "
-      "()");
+      "paged_attention(Tensor! out, Tensor exp_sums,"
+      "                Tensor max_logits, Tensor tmp_out,"
+      "                Tensor query, Tensor key_cache,"
+      "                Tensor value_cache, int num_kv_heads,"
+      "                float scale, Tensor block_tables,"
+      "                Tensor seq_lens,"
+      "                Tensor? query_start_loc,"
+      "                int block_size,"
+      "                int max_seq_len,"
+      "                Tensor? alibi_slopes,"
+      "                str kv_cache_dtype,"
+      "                Tensor k_scale, Tensor v_scale,"
+      "                Tensor? fp8_out_scale,"
+      "                str mfma_type,"
+      "                bool use_interleaved_v_cache=False) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 
   // hip_custom_communicator.cu is built only with gfx950 in the arch list

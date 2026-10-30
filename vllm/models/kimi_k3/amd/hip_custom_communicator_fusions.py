@@ -85,7 +85,12 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
-        up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
+        weight = transform.up_proj.weight
+        up_proj_shard = (
+            weight
+            if self._up_proj_preshard
+            else weight.narrow(0, shard_start, shard_size)
+        )
         hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
         # hidden_shard += latent @ up_proj_shard.T, in the GEMM's beta-add epilogue.
         hidden_shard.addmm_(latent, up_proj_shard.t())
