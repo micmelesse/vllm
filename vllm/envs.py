@@ -155,6 +155,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR: bool = False
+    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION: Literal["NONE", "INT4"] = "NONE"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1388,6 +1390,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
         in ("true", "1")
+    ),
+    # Whether HipCustomCommunicator (device_communicators/hip_custom_communicator.py)
+    # owns the TP all-reduce and its fused ops. By default is disabled.
+    "VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR": lambda: (
+        os.getenv("VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR", "False").lower()
+        in ("true", "1")
+    ),
+    # What HipCustomCommunicator's two-shot all-reduces move across the links: NONE,
+    # the input as it is (the default), or INT4, quick reduce's format, from each op's
+    # crossover up (select.cuh's). Lossy, so opt-in, as quick reduce's is.
+    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION": env_with_choices(
+        "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", "NONE", ["NONE", "INT4"]
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
