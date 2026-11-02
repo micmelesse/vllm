@@ -1226,8 +1226,8 @@ class HipCustomCommunicator:
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce(input)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
-        # them: C++ runs an empty call) in a dtype the kernels are compiled at, whole
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at, whole
         # packs a row, inside the box the exchange was sized for (C++ sized every
         # region for it at every dtype). Python alone, no C++ call, as vLLM's
         # `should_custom_ar`; C++ refuses no call this admits (the private suite
@@ -1238,7 +1238,7 @@ class HipCustomCommunicator:
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.shape[1] > 0
+            and input.numel() > 0
             and input.shape[1] * input.element_size() % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
@@ -1262,11 +1262,6 @@ class HipCustomCommunicator:
         output = torch.empty_like(input)
         capturing = torch.cuda.is_current_stream_capturing()
         if self.lifecycle.status == "capturing" and not capturing:
-            return output
-        # NO ROWS, AN ADMITTED CALL: the sum of nothing, so nothing launches and nothing
-        # is captured (an empty input has no memory to register with the peers). One
-        # not admitted goes on to C++, which refuses it by name.
-        if input.shape[0] == 0 and self.should_allreduce(input):
             return output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's.
@@ -1318,8 +1313,8 @@ class HipCustomCommunicator:
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(input, weight, ..., residual=residual)` runs
         here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
-        # them) in a dtype the kernels are compiled at; its weight one row of it, in
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at; its weight one row of it, in
         # its dtype or fp32, contiguous, starting on a pack; a residual (if any) its
         # shape and dtype, contiguous; all on its device; whole packs a row, inside
         # the box the exchange was sized for (C++ sized every region for it at every
@@ -1331,7 +1326,7 @@ class HipCustomCommunicator:
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.shape[1] > 0
+            and input.numel() > 0
             and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
             and weight.dim() == 1
             and weight.shape[0] == input.shape[1]
@@ -1385,13 +1380,6 @@ class HipCustomCommunicator:
         if (
             self.lifecycle.status == "capturing"
             and not torch.cuda.is_current_stream_capturing()
-        ):
-            return (output, residual_output) if add else output
-        # NO ROWS, AN ADMITTED CALL: nothing to sum or norm, so nothing launches and
-        # nothing is captured (an empty input has no memory to register with the peers).
-        # One not admitted goes on to C++, which refuses it by name.
-        if input.shape[0] == 0 and self.should_allreduce_add_rms_norm(
-            input, weight, residual
         ):
             return (output, residual_output) if add else output
 
@@ -1468,8 +1456,8 @@ class HipCustomCommunicator:
     ) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(input, prefix, blocks, norm_weight,
         qk_weight, output_norm_weight, num_blocks, write_index, ...)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
-        # them) in a dtype the kernels are compiled at, whole packs a row, inside the
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at, whole packs a row, inside the
         # box the exchange was sized for; every tensor in its dtype and on its device;
         # the blocks [rows, blocks, cols], their rows and blocks on whole packs,
         # starting on a pack, the sources the first `num_blocks` and the one written
@@ -1495,7 +1483,7 @@ class HipCustomCommunicator:
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.shape[1] > 0
+            and input.numel() > 0
             and input.shape[1] * e % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
@@ -1567,20 +1555,6 @@ class HipCustomCommunicator:
         if (
             self.lifecycle.status == "capturing"
             and not torch.cuda.is_current_stream_capturing()
-        ):
-            return prefix_output, output
-        # NO ROWS, AN ADMITTED CALL: nothing to sum, nothing to write, so nothing
-        # launches and nothing is captured (an empty input has no memory to register
-        # with the peers). One not admitted goes on to C++, which refuses it by name.
-        if input.shape[0] == 0 and self.should_allreduce_add_attn_res_rms_norm(
-            input,
-            prefix,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight,
-            num_blocks,
-            write_index,
         ):
             return prefix_output, output
 

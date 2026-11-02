@@ -45,7 +45,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   if (!input.is_cuda() || !norm_weight.is_cuda() || !qk_weight.is_cuda() ||
       !prefix_output.is_cuda() || !output.is_cuda() || !blocks.is_cuda())
     return error_code(Error::not_on_device);
-  if (input.dim() != 2) return error_code(Error::shape_mismatch);
+  // [rows, cols], at least one of each: an empty input is no call.
+  if (input.dim() != 2 || input.size(0) < 1 || input.size(1) < 1)
+    return error_code(Error::shape_mismatch);
   const int64_t width = input.size(1);
   if (prefix_output.sizes() != input.sizes() ||
       output.sizes() != input.sizes() || blocks.dim() != 3 ||

@@ -26,7 +26,9 @@ ErrorCode hip_custom_communicator_all_reduce(
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   if (!input.is_cuda() || !output.is_cuda())
     return error_code(Error::not_on_device);
-  if (input.dim() != 2 || output.sizes() != input.sizes())
+  // [rows, cols], at least one of each: an empty input is no call.
+  if (input.dim() != 2 || input.size(0) < 1 || input.size(1) < 1 ||
+      output.sizes() != input.sizes())
     return error_code(Error::shape_mismatch);
   if (output.scalar_type() != input.scalar_type())
     return error_code(Error::dtype_mismatch);
