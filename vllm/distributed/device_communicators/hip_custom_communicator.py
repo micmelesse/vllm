@@ -1263,6 +1263,10 @@ class HipCustomCommunicator:
         capturing = torch.cuda.is_current_stream_capturing()
         if self.lifecycle.status == "capturing" and not capturing:
             return output
+        # NO ROWS: the sum of nothing, so nothing launches and nothing is captured (an
+        # empty input has no memory to register with the peers).
+        if input.shape[0] == 0:
+            return output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's.
         if config is None:
@@ -1381,6 +1385,10 @@ class HipCustomCommunicator:
             self.lifecycle.status == "capturing"
             and not torch.cuda.is_current_stream_capturing()
         ):
+            return (output, residual_output) if add else output
+        # NO ROWS: nothing to sum or norm, so nothing launches and nothing is captured
+        # (an empty input has no memory to register with the peers).
+        if input.shape[0] == 0:
             return (output, residual_output) if add else output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's, its
@@ -1556,6 +1564,10 @@ class HipCustomCommunicator:
             self.lifecycle.status == "capturing"
             and not torch.cuda.is_current_stream_capturing()
         ):
+            return prefix_output, output
+        # NO ROWS: nothing to sum, nothing to write, so nothing launches and nothing is
+        # captured (an empty input has no memory to register with the peers).
+        if input.shape[0] == 0:
             return prefix_output, output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's (one
