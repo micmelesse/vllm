@@ -1263,9 +1263,10 @@ class HipCustomCommunicator:
         capturing = torch.cuda.is_current_stream_capturing()
         if self.lifecycle.status == "capturing" and not capturing:
             return output
-        # NO ROWS: the sum of nothing, so nothing launches and nothing is captured (an
-        # empty input has no memory to register with the peers).
-        if input.shape[0] == 0:
+        # NO ROWS, AN ADMITTED CALL: the sum of nothing, so nothing launches and nothing
+        # is captured (an empty input has no memory to register with the peers). One
+        # not admitted goes on to C++, which refuses it by name.
+        if input.shape[0] == 0 and self.should_allreduce(input):
             return output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's.
@@ -1386,9 +1387,12 @@ class HipCustomCommunicator:
             and not torch.cuda.is_current_stream_capturing()
         ):
             return (output, residual_output) if add else output
-        # NO ROWS: nothing to sum or norm, so nothing launches and nothing is captured
-        # (an empty input has no memory to register with the peers).
-        if input.shape[0] == 0:
+        # NO ROWS, AN ADMITTED CALL: nothing to sum or norm, so nothing launches and
+        # nothing is captured (an empty input has no memory to register with the peers).
+        # One not admitted goes on to C++, which refuses it by name.
+        if input.shape[0] == 0 and self.should_allreduce_add_rms_norm(
+            input, weight, residual
+        ):
             return (output, residual_output) if add else output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's, its
@@ -1565,9 +1569,19 @@ class HipCustomCommunicator:
             and not torch.cuda.is_current_stream_capturing()
         ):
             return prefix_output, output
-        # NO ROWS: nothing to sum, nothing to write, so nothing launches and nothing is
-        # captured (an empty input has no memory to register with the peers).
-        if input.shape[0] == 0:
+        # NO ROWS, AN ADMITTED CALL: nothing to sum, nothing to write, so nothing
+        # launches and nothing is captured (an empty input has no memory to register with
+        # the peers). One not admitted goes on to C++, which refuses it by name.
+        if input.shape[0] == 0 and self.should_allreduce_add_attn_res_rms_norm(
+            input,
+            prefix,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            num_blocks,
+            write_index,
+        ):
             return prefix_output, output
 
         # THE CONFIG: the one given, else the tuned table's nearest input's (one
