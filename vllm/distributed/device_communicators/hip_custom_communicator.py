@@ -1632,37 +1632,58 @@ class HipCustomCommunicator:
     def capture(self) -> Iterator[None]:
         """Enter around a cudagraph capture. Required: a captured launch records an
         address that is not valid yet, so a backend has to be told. From `open`
-        only (not nested, not closed); a capture that raises leaves it broken,
-        since its peers may have registered what this rank did not."""
+        only (not nested, not closed). However the capture ends, its inputs are
+        registered (a collective: every rank's count must agree, else
+        ranks_disagree), so the ranks find out together whether they diverged. A
+        call refused by name inside it reserved nothing, so the communicator stays
+        open and the refusal goes on to the caller; it is broken only where the
+        ranks diverged, the registration failed, or anything other than a refusal
+        (a device fault, the caller's own error) ended the capture."""
         with self.lifecycle.lock:
             if self.lifecycle.status != "open":
                 raise RuntimeError(
                     f"capture_not_open: capture() while {self.lifecycle.status}"
                 )
             self.lifecycle.status = "capturing"
+        raised: BaseException | None = None
         try:
             yield
-            # THE CAPTURED IN-PLACE LAUNCHES' INPUTS, registered before any replay
-            # (C++'s register_graph, vLLM's register_graph_buffers): a collective over
-            # the CPU group, so every rank exits its capture together.
-            assert self.state is not None
-            error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
-                state=self.state.handle
-            )
-            if error is not None:
-                raise RuntimeError(f"{Error(error).name}: the captured inputs")
         except BaseException as e:
-            # BROKEN, once: every later call raises (`disabled`), the cause logged.
-            life = self.lifecycle
-            with life.lock:
+            raised = e
+        # THE CAPTURED IN-PLACE LAUNCHES' INPUTS, registered before any replay (C++'s
+        # register_graph, vLLM's register_graph_buffers): a collective over the CPU
+        # group, so every rank leaves its capture together, and the one place the
+        # ranks compare what they captured.
+        assert self.state is not None
+        error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
+            state=self.state.handle
+        )
+        refused = (
+            isinstance(raised, RuntimeError)
+            and str(raised).split(":")[0] in Error.__members__
+            and not str(raised).startswith(Error.hip_failed.name)
+        )
+        why = (
+            f"{Error(error).name}: the captured inputs"
+            if error is not None
+            else None
+            if raised is None or refused
+            else f"{type(raised).__name__}: {raised}"
+        )
+        life = self.lifecycle
+        with life.lock:
+            if why is not None:
+                # BROKEN, once: every later call raises (`disabled`), the cause logged.
                 if life.status not in ("broken", "abandoned", "closed"):
                     life.status, life.error = "broken", Error.capture_raised
-                    life.detail = f"{type(e).__name__}: {e}"
-                    logger.error("%s broken: %s", type(self).__name__, life.detail)
-            raise
-        with self.lifecycle.lock:
-            if self.lifecycle.status == "capturing":
-                self.lifecycle.status = "open"
+                    life.detail = why
+                    logger.error("%s broken: %s", type(self).__name__, why)
+            elif life.status == "capturing":
+                life.status = "open"
+        if raised is not None:
+            raise raised
+        if error is not None:
+            raise RuntimeError(f"{Error(error).name}: the captured inputs")
 
     @final
     def tuned(
