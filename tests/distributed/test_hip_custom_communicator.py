@@ -452,7 +452,16 @@ def all_reduce_add_attn_res_rms_norm_ranks(
                         ATTN_RES_EPS,
                         EPS,
                     )
-                    assert comm.should_allreduce_add_attn_res_rms_norm(x)
+                    assert comm.should_allreduce_add_attn_res_rms_norm(
+                        x,
+                        prefix,
+                        blocks,
+                        norm_weight,
+                        qk_weight,
+                        output_norm_weight,
+                        num_blocks,
+                        write_index,
+                    )
 
                     # Eager: the table's pick, then each algorithm of the fused
                     # kernel forced at the table's build of it in this mode (one

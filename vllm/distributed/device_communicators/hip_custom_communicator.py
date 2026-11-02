@@ -1226,18 +1226,19 @@ class HipCustomCommunicator:
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce(input)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
+        # them: C++ runs an empty call) in a dtype the kernels are compiled at, whole
+        # packs a row, inside the box the exchange was sized for (C++ sized every
+        # region for it at every dtype). Python alone, no C++ call, as vLLM's
+        # `should_custom_ar`; C++ refuses no call this admits (the private suite
+        # holds the two to each other).
         return (
             not self.disabled
             and self.state is not None
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.numel() > 0
+            and input.shape[1] > 0
             and input.shape[1] * input.element_size() % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
@@ -1312,22 +1313,36 @@ class HipCustomCommunicator:
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(input, weight, ..., residual=residual)` runs
         here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, its weight in its dtype or fp32, a residual (if
-        # any) its shape and dtype, whole packs a row, inside the box the exchange
-        # was sized for (C++ sized every region for it at every dtype). Python alone,
-        # no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this admits.
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
+        # them) in a dtype the kernels are compiled at; its weight one row of it, in
+        # its dtype or fp32, contiguous, starting on a pack; a residual (if any) its
+        # shape and dtype, contiguous; all on its device; whole packs a row, inside
+        # the box the exchange was sized for (C++ sized every region for it at every
+        # dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses
+        # no call this admits (the private suite holds the two to each other).
         return (
             not self.disabled
             and self.state is not None
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.numel() > 0
+            and input.shape[1] > 0
             and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
+            and weight.dim() == 1
+            and weight.shape[0] == input.shape[1]
+            and weight.is_contiguous()
+            and weight.device == input.device
+            and weight.data_ptr()
+            % (_PACK_BYTES // input.element_size() * weight.element_size())
+            == 0
             and (
                 residual is None
-                or (residual.shape == input.shape and residual.dtype == input.dtype)
+                or (
+                    residual.shape == input.shape
+                    and residual.dtype == input.dtype
+                    and residual.is_contiguous()
+                    and residual.device == input.device
+                )
             )
             and input.shape[1] * input.element_size() % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
@@ -1428,23 +1443,80 @@ class HipCustomCommunicator:
         return (output, residual_output) if add else output
 
     @final
-    def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
-        """Whether `all_reduce_add_attn_res_rms_norm(input, ...)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
+    def should_allreduce_add_attn_res_rms_norm(
+        self,
+        input: torch.Tensor,
+        prefix: torch.Tensor | None,
+        blocks: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qk_weight: torch.Tensor,
+        output_norm_weight: torch.Tensor | None,
+        num_blocks: int,
+        write_index: int,
+    ) -> bool:
+        """Whether `all_reduce_add_attn_res_rms_norm(input, prefix, blocks, norm_weight,
+        qk_weight, output_norm_weight, num_blocks, write_index, ...)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] (no rows among
+        # them) in a dtype the kernels are compiled at, whole packs a row, inside the
+        # box the exchange was sized for; every tensor in its dtype and on its device;
+        # the blocks [rows, blocks, cols], their rows and blocks on whole packs,
+        # starting on a pack, the sources the first `num_blocks` and the one written
+        # (if any) a later one; each weight one row of it, contiguous; a prefix (if
+        # any) its shape, its rows on whole packs, sharing no memory with the block
+        # written. Python alone, no C++ call; C++ refuses no call this admits (the
+        # private suite holds the two to each other). A meta tensor (the model's
+        # question at construction) has no memory, so no overlap to ask about.
+        e = input.element_size()
+        weights = [norm_weight, qk_weight]
+        if output_norm_weight is not None:
+            weights.append(output_norm_weight)
+        overlaps = (
+            prefix is not None
+            and write_index >= 0
+            and prefix.device.type != "meta"
+            and prefix.untyped_storage().data_ptr()
+            == blocks.untyped_storage().data_ptr()
+        )
         return (
             not self.disabled
             and self.state is not None
             and input.dtype in _INPUT_DTYPES
             and input.is_contiguous()
             and input.dim() == 2
-            and input.numel() > 0
-            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[1] > 0
+            and input.shape[1] * e % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
+            and blocks.dim() == 3
+            and blocks.shape[0] == input.shape[0]
+            and blocks.shape[2] == input.shape[1]
+            and blocks.dtype == input.dtype
+            and blocks.device == input.device
+            and blocks.stride(2) == 1
+            and blocks.stride(0) * e % _PACK_BYTES == 0
+            and blocks.stride(1) * e % _PACK_BYTES == 0
+            and blocks.data_ptr() % _PACK_BYTES == 0
+            and 0 <= num_blocks <= blocks.shape[1]
+            and (write_index < 0 or num_blocks <= write_index < blocks.shape[1])
+            and all(
+                w.dim() == 1
+                and w.shape[0] == input.shape[1]
+                and w.dtype == input.dtype
+                and w.device == input.device
+                and w.is_contiguous()
+                for w in weights
+            )
+            and (
+                prefix is None
+                or (
+                    prefix.shape == input.shape
+                    and prefix.dtype == input.dtype
+                    and prefix.device == input.device
+                    and prefix.stride(1) == 1
+                    and prefix.stride(0) * e % _PACK_BYTES == 0
+                )
+            )
+            and not overlaps
         )
 
     @final
