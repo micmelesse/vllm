@@ -1570,8 +1570,8 @@ class HipCustomCommunicator:
         ):
             return prefix_output, output
         # NO ROWS, AN ADMITTED CALL: nothing to sum, nothing to write, so nothing
-        # launches and nothing is captured (an empty input has no memory to register with
-        # the peers). One not admitted goes on to C++, which refuses it by name.
+        # launches and nothing is captured (an empty input has no memory to register
+        # with the peers). One not admitted goes on to C++, which refuses it by name.
         if input.shape[0] == 0 and self.should_allreduce_add_attn_res_rms_norm(
             input,
             prefix,
