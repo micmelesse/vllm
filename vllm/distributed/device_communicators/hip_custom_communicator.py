@@ -214,6 +214,31 @@ _MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
 _INT4_OPS = os.environ.get("VLLM_HIP_INT4_OPS")
 
 
+# CAPTURE, temporary (not for review): VLLM_HIP_DUMP_DIR, where each rank saves the
+# first VLLM_HIP_DUMP_ROWS rows of its first VLLM_HIP_DUMP_CALLS eager AttnRes inputs of
+# at least 136 rows (the quantized table's INT4), a file a call: Kimi's real deltas.
+_DUMP_DIR = os.environ.get("VLLM_HIP_DUMP_DIR")
+_DUMP_ROWS = int(os.environ.get("VLLM_HIP_DUMP_ROWS", "256"))
+_DUMP_CALLS = int(os.environ.get("VLLM_HIP_DUMP_CALLS", "400"))
+_dumped = [0]
+
+
+def _dump(op: str, rank: int, input: torch.Tensor) -> None:
+    if (
+        _DUMP_DIR is None
+        or _dumped[0] >= _DUMP_CALLS
+        or input.shape[0] < 136
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    torch.save(
+        {"op": op, "rows": input.shape[0], "input": input[:_DUMP_ROWS].cpu().clone()},
+        f"{_DUMP_DIR}/r{rank}_c{_dumped[0]:04d}.pt",
+    )
+    _dumped[0] += 1
+
+
 def _ablated(op: str, quantization: Quantization) -> Quantization:
     if quantization == "int4" and _INT4_OPS is not None and op not in _INT4_OPS.split(","):
         return "exact"
@@ -1573,6 +1598,7 @@ class HipCustomCommunicator:
         # kernel, or the split: our all-reduce, then the op on this rank's rows).
         if config is None:
             rows, cols = input.shape
+            _dump("all_reduce_add_attn_res_rms_norm", self.arguments.rank, input)
             _, picked = self.state.tuned_table.nearest(
                 "all_reduce_add_attn_res_rms_norm",
                 None,
