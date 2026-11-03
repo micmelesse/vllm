@@ -209,6 +209,17 @@ _QUALIFIED = "hip_custom_communicator."
 _MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
 
 
+# ABLATION, temporary (not for review): VLLM_HIP_INT4_OPS, a comma list of ops; a
+# quantized communicator's other ops look up their exact-mode picks (unset: every op).
+_INT4_OPS = os.environ.get("VLLM_HIP_INT4_OPS")
+
+
+def _ablated(op: str, quantization: Quantization) -> Quantization:
+    if quantization == "int4" and _INT4_OPS is not None and op not in _INT4_OPS.split(","):
+        return "exact"
+    return quantization
+
+
 # A TUNED INPUT'S DTYPE's element bytes, as the table names it.
 _DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
 
@@ -1270,7 +1281,7 @@ class HipCustomCommunicator:
             _, picked = self.state.tuned_table.nearest(
                 "all_reduce",
                 None,
-                self.arguments.quantization,
+                _ablated("all_reduce", self.arguments.quantization),
                 self.arguments.world,
                 rows,
                 cols,
@@ -1391,7 +1402,7 @@ class HipCustomCommunicator:
             _, picked = self.state.tuned_table.nearest(
                 "all_reduce_add_rms_norm",
                 add,
-                self.arguments.quantization,
+                _ablated("all_reduce_add_rms_norm", self.arguments.quantization),
                 self.arguments.world,
                 rows,
                 cols,
@@ -1565,7 +1576,7 @@ class HipCustomCommunicator:
             _, picked = self.state.tuned_table.nearest(
                 "all_reduce_add_attn_res_rms_norm",
                 None,
-                self.arguments.quantization,
+                _ablated("all_reduce_add_attn_res_rms_norm", self.arguments.quantization),
                 self.arguments.world,
                 rows,
                 cols,
@@ -1694,7 +1705,8 @@ class HipCustomCommunicator:
         (`TunedTable.nearest`)."""
         assert self.state is not None, "an open communicator has its state"
         _, config = self.state.tuned_table.nearest(
-            op, residual, self.arguments.quantization, self.arguments.world, rows, cols
+            op, residual, _ablated(op, self.arguments.quantization), self.arguments.world,
+            rows, cols
         )
         return config
 
