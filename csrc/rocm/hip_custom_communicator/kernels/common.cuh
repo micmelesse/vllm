@@ -75,7 +75,7 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // (csrc/quickreduce): a GROUP is 32 consecutive elements of a row, held as
 // 4-bit values biased by 8 (a word 8 elements, its elements 2i and 2i + 1 in
 // bits 4i and 16 + 4i, so one shift and mask puts both in a 16-bit pair, quick
-// reduce's layout) and one fp16 scale, the group's largest magnitude / 7,
+// reduce's layout) and one fp16 scale, the group's largest magnitude / 8,
 // ROUNDED TO FP16 BEFORE THE VALUES
 // ARE, so each is rounded against the scale stored; an element is (q - 8) *
 // scale. A quantized buffer is two buffers, its values ([m, n / 2] bytes) and
@@ -1891,7 +1891,8 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 // map is a parameter, not implied by the encoding (R7).
 // THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm
 // [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each
-// step); a group a thread, the thread's own. THE SCALE from it: / 7, to fp16
+// step); a group a thread, the thread's own. THE SCALE from it: / 8, to fp16
+// (quick reduce's: every one of the 16 levels used, the largest clipped to +7)
 // (past its largest, clamped to it). THE INVERSE the values are rounded at,
 // CORRECTLY ROUNDED as the format's 1 / scale (v_rcp_f32's ulp flipped 0.6% of
 // a two-shot's elements a step against it: torch emulation of the 2048 x 7168
@@ -1930,7 +1931,7 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
     amax = __builtin_bit_cast(float, bits);
   }
   scale = static_cast<float>(
-      static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
+      static_cast<__fp16>(fminf(amax * (1.0f / 8.0f), 65504.0f)));
   const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
   // A PACK'S WORD from its 8 values at the inverse.
   const auto word = [](const float (&v)[P], float inverse) {

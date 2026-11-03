@@ -36,7 +36,7 @@ MAX_TOKENS = 2048
 EPS = 1e-5
 ATTN_RES_EPS = 1e-6
 # INT4's error against the exact op, end to end (relative RMS): the format's
-# rounding (a group's largest value / 7 a step) summed over the ranks. A one-shot
+# rounding (a group's largest value / 8 a step) summed over the ranks. A one-shot
 # quantizes once (each rank's input); a two-shot twice (the inputs for the
 # reduce-scatter, the sums for the all-gather), as QuickReduce's two-shot does:
 # its bar the looser (measured: AttnRes's two-shots 0.19 at 16 tokens, world 8,
