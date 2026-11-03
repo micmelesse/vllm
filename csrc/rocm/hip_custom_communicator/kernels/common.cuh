@@ -75,24 +75,23 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // (csrc/quickreduce): a GROUP is 32 consecutive elements of a row, held as
 // 4-bit values biased by 8 (a word 8 elements, its elements 2i and 2i + 1 in
 // bits 4i and 16 + 4i, so one shift and mask puts both in a 16-bit pair, quick
-// reduce's layout) and one fp16 scale, the group's largest magnitude / 8,
-// ROUNDED TO FP16 BEFORE THE VALUES
-// ARE, so each is rounded against the scale stored; an element is (q - 8) *
-// scale. A quantized buffer is two buffers, its values ([m, n / 2] bytes) and
-// its scales ([m, n / 32] fp16), each a pointer, its strides and its sizes.
-// Every function that moves the exchange takes a QUANTIZE_INT4 and both forms
-// of each buffer it moves (reduce_scatter, all_gather); load and store take
-// QUANTIZE_INT4 and work out the INT4 payload's layout from the region's own
-// sizes. A LOAD DEQUANTIZES INTO ITS REGISTERS' DTYPE, each element rounded
-// once, as quick reduce lands its values in its dtype; a sum is fp32 and
-// quantized from fp32.
-// A THREAD'S PACK IS ONE WORD OF ITS GROUP (8 elements of a 16-bit dtype), so a
-// group is the packs of 4 consecutive lanes: a layout's THREADS_N and offs_n
-// are whole groups, and its scale is the lanes' largest magnitude, two DPP
-// steps with every lane of the quad active. One thread holding a whole group of
-// every peer was 46-62 registers and spilled (the int4-wip prototype); the flat
-// walk's (reduce_scatter.cuh) holds one, a group a thread: the plain kernel 135
-// VGPRs, none spilled (ISA 2026-10-16T03-10-32Z).
+// reduce's layout) and one fp16 scale, the group's signed extreme / -8
+// (Int4Format), ROUNDED TO FP16 BEFORE THE VALUES ARE, so each is rounded
+// against the scale stored; an element is (q - 8) * scale. A quantized buffer
+// is two buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32]
+// fp16), each a pointer, its strides and its sizes. Every function that moves
+// the exchange takes a QUANTIZE_INT4 and both forms of each buffer it moves
+// (reduce_scatter, all_gather); load and store take QUANTIZE_INT4 and work out
+// the INT4 payload's layout from the region's own sizes. A LOAD DEQUANTIZES
+// INTO ITS REGISTERS' DTYPE, each element rounded once, as quick reduce lands
+// its values in its dtype; a sum is fp32 and quantized from fp32. A THREAD'S
+// PACK IS ONE WORD OF ITS GROUP (8 elements of a 16-bit dtype), so a group is
+// the packs of 4 consecutive lanes: a layout's THREADS_N and offs_n are whole
+// groups, and its scale is the lanes' largest magnitude, two DPP steps with
+// every lane of the quad active. One thread holding a whole group of every peer
+// was 46-62 registers and spilled (the int4-wip prototype); the flat walk's
+// (reduce_scatter.cuh) holds one, a group a thread: the plain kernel 135 VGPRs,
+// none spilled (ISA 2026-10-16T03-10-32Z).
 // =============================================================================
 
 // THE FORMAT'S DEFINITION (the quantization `int4`), its one statement: a group
@@ -100,9 +99,20 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // tunable: a group size is the format's accuracy and bytes (a scale's 2 bytes a
 // group's 16), and 32 is the size whose words fill a quad's packs (above);
 // another size is another format, with its own name and layout.
-constexpr int kInt4Group = 32;      // values a group
-constexpr int kInt4WordBytes = 4;   // a pack's values, 8 of 4 bits
-constexpr int kInt4ScaleBytes = 2;  // a group's scale, fp16
+// THE FORMAT AS A TYPE (quantize and dequantize take it as a template
+// parameter, so a variant is a struct, not edits): its group, and the levels
+// its values are rounded to, lowest to highest. A GROUP'S SIGNED EXTREME (its
+// largest magnitude, with its sign) lands on `lowest`, so it is never clipped
+// and all of the levels are used (AITER's FlyDSL INT4 QuickReduce, vLLM's path
+// for bf16 since #59478); a value is stored biased by -lowest.
+struct Int4Format {
+  static constexpr int group = 32;
+  static constexpr int lowest = -8;
+  static constexpr int highest = 7;
+};
+constexpr int kInt4Group = Int4Format::group;  // values a group
+constexpr int kInt4WordBytes = 4;              // a pack's values, 8 of 4 bits
+constexpr int kInt4ScaleBytes = 2;             // a group's scale, fp16
 constexpr uint32_t kInt4ZeroWord =
     0x88888888u;  // a word of zeros (each value stored q + 8)
 // A GROUP'S PACKS: a pack is a word of its group's values.
@@ -227,12 +237,12 @@ enum class Layout { tile, run, flat, group_run, group_flat, line };
 
 // THE OPERATIONS THE INTERNALS CALL, declared before them (defined below,
 // QUANTIZE_INT4).
-template <typename U, int P>
+template <typename FORMAT = Int4Format, typename U, int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]);
-template <typename DTYPE, int SLOTS, int K, int P>
+template <typename DTYPE, typename FORMAT = Int4Format, int SLOTS, int K, int P>
 DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]);
-template <int THREAD_PACKS, typename T, int P>
+template <typename FORMAT = Int4Format, int THREAD_PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
                       uint32_t (&words)[THREAD_PACKS], float& scale);
 
@@ -1764,14 +1774,16 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
-template <typename U, int P>
+template <typename FORMAT, typename U, int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
                 "fp32 terms or a 16-bit dtype");
   const float scale16 = scale * 0.0625f;
-  const float bias = scale * -1032.0f;
-  const float bias16 = scale * -72.0f;
+  // (q - lowest) * scale from the word's 1024 + q (and, the high nibbles,
+  // 64 + q / 16): the lowest level's bias in each.
+  const float bias = scale * -(1024.0f - FORMAT::lowest);
+  const float bias16 = scale * -(64.0f - FORMAT::lowest);
   float term[P];
   uint32_t p0, p1, p2, p3;
   asm volatile(
@@ -1833,7 +1845,7 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
 // and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
 // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts),
 // the one arch built (CMakeLists.txt).
-template <typename DTYPE, int SLOTS, int K, int P>
+template <typename DTYPE, typename FORMAT, int SLOTS, int K, int P>
 DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]) {
   // Slot w's scale of pack k's group (every pack of a group carries it: its
@@ -1856,8 +1868,8 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
       for (; w + 1 < SLOTS; w += 2) {
         float a[P], b[P];
-        dequantize(words[w][0][k][0], scale_of(w, k), a);
-        dequantize(words[w + 1][0][k][0], scale_of(w + 1, k), b);
+        dequantize<FORMAT>(words[w][0][k][0], scale_of(w, k), a);
+        dequantize<FORMAT>(words[w + 1][0][k][0], scale_of(w + 1, k), b);
 #pragma unroll
         for (int j = 0; j < P; ++j)
           sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -1874,7 +1886,7 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
     for (; w < SLOTS; ++w) {
       float a[P];
-      dequantize(words[w][0][k][0], scale_of(w, k), a);
+      dequantize<FORMAT>(words[w][0][k][0], scale_of(w, k), a);
 #pragma unroll
       for (int j = 0; j < P; ++j)
         sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
@@ -1891,15 +1903,15 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 // map is a parameter, not implied by the encoding (R7).
 // THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm
 // [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each
-// step); a group a thread, the thread's own. THE SCALE from it: / 8, to fp16
-// (quick reduce's: every one of the 16 levels used, the largest clipped to +7)
-// (past its largest, clamped to it). THE INVERSE the values are rounded at,
-// CORRECTLY ROUNDED as the format's 1 / scale (v_rcp_f32's ulp flipped 0.6% of
-// a two-shot's elements a step against it: torch emulation of the 2048 x 7168
-// test, 2026-10-16); a group of zeros: 0, so all 8s at scale 0.
-// A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale
-// stored, BY THE MAGIC
-// NUMBER: x * inv, rounded to fp32 as the format's product is, plus 1.5 * 2^23
+// step); a group a thread, the thread's own. THE SCALE from it: its SIGNED
+// extreme over the format's lowest level, to fp16 (past its largest, clamped):
+// the extreme lands on -8, never clipped, every level used. THE INVERSE the
+// values are rounded at, CORRECTLY ROUNDED as the format's 1 / scale
+// (v_rcp_f32's ulp flipped 0.6% of a two-shot's elements a step against it:
+// torch emulation of the 2048 x 7168 test, 2026-10-16); a group of zeros: 0, so
+// all 8s at scale 0. A PACK'S WORD: each value rounded to the nearest of -8..7
+// times the scale stored, BY THE MAGIC NUMBER: x * inv, rounded to fp32 as the
+// format's product is, plus 1.5 * 2^23
 // + 8 rounds it to an integer (the sum's ulp is 1) and leaves q + 8 in the low
 // 4 bits, the rest of its low byte 0; clamped by med3 (two elements a packed
 // mul and add). NOT AN FMA: the exact product rounded once flipped 0.8% of the
@@ -1907,45 +1919,56 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
-template <int THREAD_PACKS, typename T, int P>
+template <typename FORMAT, int THREAD_PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
                       uint32_t (&words)[THREAD_PACKS], float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
+  static_assert(
+      FORMAT::group == kInt4Group,
+      "the layouts are a 32-value group's (another is another format)");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
                 "a pack a thread (its quad's group) or a group a thread");
+  // THE GROUP'S SIGNED EXTREME as one key, its magnitude's bits above its sign
+  // bit: the unsigned max of two keys is the larger magnitude (a tie, the
+  // negative one), so the quad's reduction is the same two DPP max steps.
   float x[THREAD_PACKS][P];
-  float amax = 0.0f;
+  uint32_t key = 0;
 #pragma unroll
   for (int k = 0; k < THREAD_PACKS; ++k)
 #pragma unroll
     for (int j = 0; j < P; ++j) {
       x[k][j] = static_cast<float>(input[k][j]);
-      amax = fmaxf(amax, fabsf(x[k][j]));
+      const uint32_t bits = __builtin_bit_cast(uint32_t, x[k][j]);
+      key = max(key, (bits << 1) | (bits >> 31));
     }
   if constexpr (THREAD_PACKS == 1) {
-    uint32_t bits = __builtin_bit_cast(uint32_t, amax);
-    bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                         static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
-    bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                         static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
-    amax = __builtin_bit_cast(float, bits);
+    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(key), 0xb1, 0xf, 0xf, false)));
+    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(key), 0x4e, 0xf, 0xf, false)));
   }
-  scale = static_cast<float>(
-      static_cast<__fp16>(fminf(amax * (1.0f / 8.0f), 65504.0f)));
-  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+  const float extreme = __builtin_bit_cast(float, (key >> 1) | (key << 31));
+  // THE SCALE: the extreme over the lowest level (so the extreme is lowest
+  // times it), to fp16, clamped to its range; it carries the extreme's sign.
+  scale = static_cast<float>(static_cast<__fp16>(
+      fminf(fmaxf(extreme * (1.0f / FORMAT::lowest), -65504.0f), 65504.0f)));
+  const float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
   // A PACK'S WORD from its 8 values at the inverse.
   const auto word = [](const float (&v)[P], float inverse) {
-    constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
+    constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q - lowest = 0
+    constexpr float kBias = -FORMAT::lowest;
+    constexpr float kLevels = FORMAT::highest - FORMAT::lowest;
     uint32_t q[P];
 #pragma unroll
     for (int p = 0; p < P / 2; ++p) {
 #pragma clang fp contract(off)
       const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
-                      f32x2{kLowest + 8.0f, kLowest + 8.0f};
+                      f32x2{kLowest + kBias, kLowest + kBias};
 #pragma unroll
       for (int e = 0; e < 2; ++e)
         q[2 * p + e] = __builtin_bit_cast(
-            uint32_t, __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + 15.0f));
+            uint32_t,
+            __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + kLevels));
     }
     // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2
     // (QUANTIZE_INT4's layout)
