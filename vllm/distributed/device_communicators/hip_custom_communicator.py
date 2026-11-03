@@ -239,6 +239,65 @@ def _dump(op: str, rank: int, input: torch.Tensor) -> None:
     _dumped[0] += 1
 
 
+# SHADOW, temporary (not for review): VLLM_HIP_SHADOW_DIR. Every eager INT4 AttnRes call
+# also computed exactly (RCCL's fp32 all-reduce, then vLLM's AttnRes); a call whose output
+# or prefix is not finite, or off by more than VLLM_HIP_SHADOW_BAR (relative RMS), is
+# logged and saved whole (inputs, config, ours, the reference), up to 20 a rank.
+_SHADOW_DIR = os.environ.get("VLLM_HIP_SHADOW_DIR")
+_SHADOW_BAR = float(os.environ.get("VLLM_HIP_SHADOW_BAR", "0.5"))
+_shadowed = [0, 0]  # calls checked, calls saved
+
+
+def _shadow(comm: "HipCustomCommunicator", config: Any, args: dict, got: tuple) -> None:
+    import torch.distributed as dist
+
+    from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+
+    x = args["input"]
+    summed32 = x.float()
+    dist.all_reduce(summed32, group=comm.arguments.device_group)
+    summed = summed32.to(x.dtype)
+    has_prefix = args["prefix"] is not None
+    want_prefix = args["prefix"].clone() if has_prefix else summed.clone()
+    blocks = args["blocks"].clone()
+    want_out = attn_res(
+        want_prefix, summed if has_prefix else None, blocks, args["norm_weight"],
+        args["qk_weight"], args["output_norm_weight"], args["num_blocks"],
+        args["write_index"], args["eps"], args["output_eps"],
+    )
+    got_prefix, got_out = got
+
+    def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+        return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+    finite = bool(torch.isfinite(got_out).all() and torch.isfinite(got_prefix).all())
+    errors = (rel(got_out, want_out), rel(got_prefix, want_prefix))
+    _shadowed[0] += 1
+    if finite and max(errors) <= _SHADOW_BAR:
+        return
+    logger.warning(
+        "SHADOW: call %d rank %d rows %d: finite %s, out %.4f prefix %.4f, config %s, "
+        "prefix %s, num_blocks %d, write_index %d, input amax %.4g",
+        _shadowed[0], comm.arguments.rank, x.shape[0], finite, errors[0], errors[1],
+        config, has_prefix, args["num_blocks"], args["write_index"],
+        x.float().abs().max().item(),
+    )
+    if _shadowed[1] < 20:
+        os.makedirs(_SHADOW_DIR, exist_ok=True)
+        torch.save(
+            {
+                "config": repr(config), "errors": errors, "finite": finite,
+                "args": {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                         for k, v in args.items()},
+                "got_prefix": got_prefix.cpu(), "got_out": got_out.cpu(),
+                "want_prefix": want_prefix.cpu(), "want_out": want_out.cpu(),
+                "summed": summed.cpu(),
+            },
+            f"{_SHADOW_DIR}/r{comm.arguments.rank}_call{_shadowed[0]:06d}.pt",
+        )
+        _shadowed[1] += 1
+
+
 def _ablated(op: str, quantization: Quantization) -> Quantization:
     if quantization == "int4" and _INT4_OPS is not None and op not in _INT4_OPS.split(","):
         return "exact"
@@ -1618,6 +1677,18 @@ class HipCustomCommunicator:
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
+        shadowing = (
+            _SHADOW_DIR is not None
+            and config.quantization != "exact"
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if shadowing:
+            shadow_args = dict(
+                input=input.clone(), prefix=None if prefix is None else prefix.clone(),
+                blocks=blocks.clone(), norm_weight=norm_weight, qk_weight=qk_weight,
+                output_norm_weight=output_norm_weight, num_blocks=num_blocks,
+                write_index=write_index, eps=eps, output_eps=output_eps,
+            )
         # ONE C++ CALL: the fused kernel at the config's algorithm, or the split
         # (`<the all-reduce's body>_split`: the all-reduce at the config's fields, then
         # AttnRes on rows at its add_attn_res_rms_norm_ fields).
@@ -1662,6 +1733,8 @@ class HipCustomCommunicator:
         )
         if error is not None:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
+        if shadowing:
+            _shadow(self, config, shadow_args, (prefix_output, output))
         return prefix_output, output
 
     @final
