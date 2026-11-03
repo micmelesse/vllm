@@ -1226,11 +1226,12 @@ class HipCustomCommunicator:
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce(input)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at, whole
+        # packs a row, inside the box the exchange was sized for (C++ sized every
+        # region for it at every dtype). Python alone, no C++ call, as vLLM's
+        # `should_custom_ar`; C++ refuses no call this admits (the private suite
+        # holds the two to each other).
         return (
             not self.disabled
             and self.state is not None
@@ -1312,11 +1313,13 @@ class HipCustomCommunicator:
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(input, weight, ..., residual=residual)` runs
         here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, its weight in its dtype or fp32, a residual (if
-        # any) its shape and dtype, whole packs a row, inside the box the exchange
-        # was sized for (C++ sized every region for it at every dtype). Python alone,
-        # no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this admits.
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at; its weight one row of it, in
+        # its dtype or fp32, contiguous, starting on a pack; a residual (if any) its
+        # shape and dtype, contiguous; all on its device; whole packs a row, inside
+        # the box the exchange was sized for (C++ sized every region for it at every
+        # dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses
+        # no call this admits (the private suite holds the two to each other).
         return (
             not self.disabled
             and self.state is not None
@@ -1325,9 +1328,21 @@ class HipCustomCommunicator:
             and input.dim() == 2
             and input.numel() > 0
             and weight.dtype in (input.dtype, *_WEIGHT_DTYPES)
+            and weight.dim() == 1
+            and weight.shape[0] == input.shape[1]
+            and weight.is_contiguous()
+            and weight.device == input.device
+            and weight.data_ptr()
+            % (_PACK_BYTES // input.element_size() * weight.element_size())
+            == 0
             and (
                 residual is None
-                or (residual.shape == input.shape and residual.dtype == input.dtype)
+                or (
+                    residual.shape == input.shape
+                    and residual.dtype == input.dtype
+                    and residual.is_contiguous()
+                    and residual.device == input.device
+                )
             )
             and input.shape[1] * input.element_size() % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
@@ -1428,13 +1443,40 @@ class HipCustomCommunicator:
         return (output, residual_output) if add else output
 
     @final
-    def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
-        """Whether `all_reduce_add_attn_res_rms_norm(input, ...)` runs here."""
-        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols] in a dtype the
-        # kernels are compiled at, whole packs a
-        # row, inside the box the exchange was sized for (C++ sized every region for
-        # it at every dtype). Python alone, no C++ call, as vLLM's `should_custom_ar`;
-        # C++ refuses no call this admits.
+    def should_allreduce_add_attn_res_rms_norm(
+        self,
+        input: torch.Tensor,
+        prefix: torch.Tensor | None,
+        blocks: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qk_weight: torch.Tensor,
+        output_norm_weight: torch.Tensor | None,
+        num_blocks: int,
+        write_index: int,
+    ) -> bool:
+        """Whether `all_reduce_add_attn_res_rms_norm(input, prefix, blocks, norm_weight,
+        qk_weight, output_norm_weight, num_blocks, write_index, ...)` runs here."""
+        # A PLAIN CALL (nothing forced) RUNS where it is [rows, cols], at least one
+        # of each, in a dtype the kernels are compiled at, whole packs a row, inside the
+        # box the exchange was sized for; every tensor in its dtype and on its device;
+        # the blocks [rows, blocks, cols], their rows and blocks on whole packs,
+        # starting on a pack, the sources the first `num_blocks` and the one written
+        # (if any) a later one; each weight one row of it, contiguous; a prefix (if
+        # any) its shape, its rows on whole packs, sharing no memory with the block
+        # written. Python alone, no C++ call; C++ refuses no call this admits (the
+        # private suite holds the two to each other). A meta tensor (the model's
+        # question at construction) has no memory, so no overlap to ask about.
+        e = input.element_size()
+        weights = [norm_weight, qk_weight]
+        if output_norm_weight is not None:
+            weights.append(output_norm_weight)
+        overlaps = (
+            prefix is not None
+            and write_index >= 0
+            and prefix.device.type != "meta"
+            and prefix.untyped_storage().data_ptr()
+            == blocks.untyped_storage().data_ptr()
+        )
         return (
             not self.disabled
             and self.state is not None
@@ -1442,9 +1484,39 @@ class HipCustomCommunicator:
             and input.is_contiguous()
             and input.dim() == 2
             and input.numel() > 0
-            and input.shape[1] * input.element_size() % _PACK_BYTES == 0
+            and input.shape[1] * e % _PACK_BYTES == 0
             and input.shape[0] <= self.arguments.max_rows
             and input.shape[1] <= self.arguments.max_cols
+            and blocks.dim() == 3
+            and blocks.shape[0] == input.shape[0]
+            and blocks.shape[2] == input.shape[1]
+            and blocks.dtype == input.dtype
+            and blocks.device == input.device
+            and blocks.stride(2) == 1
+            and blocks.stride(0) * e % _PACK_BYTES == 0
+            and blocks.stride(1) * e % _PACK_BYTES == 0
+            and blocks.data_ptr() % _PACK_BYTES == 0
+            and 0 <= num_blocks <= blocks.shape[1]
+            and (write_index < 0 or num_blocks <= write_index < blocks.shape[1])
+            and all(
+                w.dim() == 1
+                and w.shape[0] == input.shape[1]
+                and w.dtype == input.dtype
+                and w.device == input.device
+                and w.is_contiguous()
+                for w in weights
+            )
+            and (
+                prefix is None
+                or (
+                    prefix.shape == input.shape
+                    and prefix.dtype == input.dtype
+                    and prefix.device == input.device
+                    and prefix.stride(1) == 1
+                    and prefix.stride(0) * e % _PACK_BYTES == 0
+                )
+            )
+            and not overlaps
         )
 
     @final
@@ -1560,37 +1632,58 @@ class HipCustomCommunicator:
     def capture(self) -> Iterator[None]:
         """Enter around a cudagraph capture. Required: a captured launch records an
         address that is not valid yet, so a backend has to be told. From `open`
-        only (not nested, not closed); a capture that raises leaves it broken,
-        since its peers may have registered what this rank did not."""
+        only (not nested, not closed). However the capture ends, its inputs are
+        registered (a collective: every rank's count must agree, else
+        ranks_disagree), so the ranks find out together whether they diverged. A
+        call refused by name inside it reserved nothing, so the communicator stays
+        open and the refusal goes on to the caller; it is broken only where the
+        ranks diverged, the registration failed, or anything other than a refusal
+        (a device fault, the caller's own error) ended the capture."""
         with self.lifecycle.lock:
             if self.lifecycle.status != "open":
                 raise RuntimeError(
                     f"capture_not_open: capture() while {self.lifecycle.status}"
                 )
             self.lifecycle.status = "capturing"
+        raised: BaseException | None = None
         try:
             yield
-            # THE CAPTURED IN-PLACE LAUNCHES' INPUTS, registered before any replay
-            # (C++'s register_graph, vLLM's register_graph_buffers): a collective over
-            # the CPU group, so every rank exits its capture together.
-            assert self.state is not None
-            error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
-                state=self.state.handle
-            )
-            if error is not None:
-                raise RuntimeError(f"{Error(error).name}: the captured inputs")
         except BaseException as e:
-            # BROKEN, once: every later call raises (`disabled`), the cause logged.
-            life = self.lifecycle
-            with life.lock:
+            raised = e
+        # THE CAPTURED IN-PLACE LAUNCHES' INPUTS, registered before any replay (C++'s
+        # register_graph, vLLM's register_graph_buffers): a collective over the CPU
+        # group, so every rank leaves its capture together, and the one place the
+        # ranks compare what they captured.
+        assert self.state is not None
+        error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
+            state=self.state.handle
+        )
+        refused = (
+            isinstance(raised, RuntimeError)
+            and str(raised).split(":")[0] in Error.__members__
+            and not str(raised).startswith(Error.hip_failed.name)
+        )
+        why = (
+            f"{Error(error).name}: the captured inputs"
+            if error is not None
+            else None
+            if raised is None or refused
+            else f"{type(raised).__name__}: {raised}"
+        )
+        life = self.lifecycle
+        with life.lock:
+            if why is not None:
+                # BROKEN, once: every later call raises (`disabled`), the cause logged.
                 if life.status not in ("broken", "abandoned", "closed"):
                     life.status, life.error = "broken", Error.capture_raised
-                    life.detail = f"{type(e).__name__}: {e}"
-                    logger.error("%s broken: %s", type(self).__name__, life.detail)
-            raise
-        with self.lifecycle.lock:
-            if self.lifecycle.status == "capturing":
-                self.lifecycle.status = "open"
+                    life.detail = why
+                    logger.error("%s broken: %s", type(self).__name__, why)
+            elif life.status == "capturing":
+                life.status = "open"
+        if raised is not None:
+            raise raised
+        if error is not None:
+            raise RuntimeError(f"{Error(error).name}: the captured inputs")
 
     @final
     def tuned(

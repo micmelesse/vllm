@@ -865,15 +865,26 @@ def _fused_communicator(
     latent = latent_width is not None
     # EVERY FUSED CALL ADMITTED, asked once here at the model's widths and dtype from
     # one row to the most a step carries (meta tensors: nothing allocated), so no fused
-    # call is refused in the forward: each AttnRes, and the latent's with its RMSNorm.
+    # call is refused in the forward: each AttnRes (a prefix, its blocks, its three
+    # weights, the most sources and the last block written), and the latent's with its
+    # RMSNorm.
     dtype = vllm_config.model_config.dtype
 
     def meta(*shape: int) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="meta")
 
-    admitted = all(
+    hidden = config.hidden_size
+    blocks = cdiv(config.num_hidden_layers, config.attn_res_block_size or 1)
+    admitted = config.attn_res_block_size is not None and all(
         communicator.should_allreduce_add_attn_res_rms_norm(
-            meta(rows, config.hidden_size)
+            meta(rows, hidden),
+            meta(rows, hidden),
+            meta(rows, blocks, hidden),
+            meta(hidden),
+            meta(hidden),
+            meta(hidden),
+            blocks - 1,
+            blocks - 1,
         )
         and (
             latent_width is None

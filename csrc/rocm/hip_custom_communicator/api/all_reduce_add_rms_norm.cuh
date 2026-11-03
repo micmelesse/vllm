@@ -40,8 +40,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   if (!input.is_cuda() || !weight.is_cuda() || !output.is_cuda())
     return error_code(Error::not_on_device);
-  if (input.dim() != 2 || output.sizes() != input.sizes() ||
-      weight.dim() != 1 || weight.numel() != input.size(1))
+  // [rows, cols], at least one of each: an empty input is no call.
+  if (input.dim() != 2 || input.size(0) < 1 || input.size(1) < 1 ||
+      output.sizes() != input.sizes() || weight.dim() != 1 ||
+      weight.numel() != input.size(1))
     return error_code(Error::shape_mismatch);
   if (output.scalar_type() != input.scalar_type())
     return error_code(Error::dtype_mismatch);
