@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -11,6 +12,7 @@ from vllm import envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -164,6 +166,36 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+# TRACE, temporary (not for review): VLLM_KIMI_TRACE_DIR. Once `<dir>/go` exists, rank 0
+# saves each layer's AttnRes prefix and output (a tensor; a fused-quant one is not) of the
+# first forward of at least 512 rows: one prefill, every layer, to compare runs.
+_TRACE_DIR = os.environ.get("VLLM_KIMI_TRACE_DIR")
+_traced: set[str] = set()
+
+
+def _trace(name: str, prefix: torch.Tensor | None, output: Any) -> None:
+    if (
+        _TRACE_DIR is None
+        or prefix is None
+        or prefix.shape[0] < 512
+        or name in _traced
+        or torch.cuda.is_current_stream_capturing()
+        or get_tensor_model_parallel_rank() != 0
+        or not os.path.exists(f"{_TRACE_DIR}/go")
+    ):
+        return
+    _traced.add(name)
+    torch.save(
+        {
+            "prefix": prefix.detach().cpu().clone(),
+            "output": output.detach().cpu().clone()
+            if isinstance(output, torch.Tensor)
+            else None,
+        },
+        f"{_TRACE_DIR}/{name}.pt",
+    )
 
 
 def _apply_attn_res(
@@ -785,6 +817,7 @@ class KimiDecoderLayer(nn.Module):
                 ),
                 quant_key=attention_quant_key,
             )
+        _trace(f"L{self.layer_idx:03d}_a", prefix_sum, hidden_states)
 
         if self.is_block_write_layer:
             prefix_sum = None
@@ -829,6 +862,7 @@ class KimiDecoderLayer(nn.Module):
                 ),
             )
 
+        _trace(f"L{self.layer_idx:03d}_m", prefix_sum, hidden_states)
         hidden_states = self.mlp(hidden_states)
         if self.fused_communicator is not None and self.is_last_layer:
             # The model's final AttnRes is unfused: it takes this output reduced.
