@@ -1763,28 +1763,23 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
   __syncthreads();
 }
 
-// DEQUANTIZE: a word's 8 values at their group's scale. Its own function
-// because load lands them in U and the INT4 sum adds them in fp32 from the
-// words (reduce_scatter's, never a decoded tile). U float: the exact terms, (q
-// - 8) * scale. U a 16-bit dtype: each rounded once to U, made as a loaded pack
-// is, four 32-bit words copied in whole: element by element, each 16-bit value
-// held a register of its own and the pull norms' two rows of every peer's packs
-// spilled 188 VGPRs (256 VGPRs, 592 B of partials; 2026-10-15T22-21-26Z).
-// THE TERMS, EXACT in fp32, by quick reduce's 0x6400 magic: a mask puts
-// elements 2i and 2i + 1 in an fp16 pair, each 1024 + q (i = 0, 2) or 1024 +
-// 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd with 0x6400;
-// then one v_fma_mix_f32 a value takes a half at scale (or scale / 16) plus
-// bias (-1032 * scale, or -72 * scale): a 22-bit product, then an exact
-// difference. 13 instructions a word, in one asm block: left to the compiler,
-// each half was converted and fed to packed fmas (1.5 a value, a gfx950 probe
-// compile, 2026-10-16). VOLATILE, so the blocks keep their order
+// DEQUANTIZE: an encoded pack's 8 values at its group's scale. U float: the
+// exact terms, (q - 8) * scale. U a 16-bit dtype: each rounded once to U, made
+// as a loaded pack is, four 32-bit words copied in whole: element by element,
+// each 16-bit value held a register of its own and the pull norms' two rows of
+// every peer's packs spilled 188 VGPRs (256 VGPRs, 592 B of partials;
+// 2026-10-15T22-21-26Z). THE TERMS, EXACT in fp32, by quick reduce's 0x6400
+// magic: a mask puts elements 2i and 2i + 1 in an fp16 pair, each 1024 + q (i =
+// 0, 2) or 1024 + 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd
+// with 0x6400; then one v_fma_mix_f32 a value takes a half at scale (or scale /
+// 16) plus bias (-1032 * scale, or -72 * scale): a 22-bit product, then an
+// exact difference. 13 instructions a word, in one asm block: left to the
+// compiler, each half was converted and fed to packed fmas (1.5 a value, a
+// gfx950 probe compile, 2026-10-16). VOLATILE, so the blocks keep their order
 // (reduce_scatter's int4 sum pins what consumes them between).
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
-
-// DEQUANTIZE: an encoded pack's 8 values (fp32, or rounded once to a 16-bit
-// dtype).
 template <int LOWEST, int HIGHEST, typename U, int P>
 DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]) {
   // THE ENCODED PACK: its word, and its group's scale from its fp16 bits. A
@@ -1854,7 +1849,7 @@ DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]) {
   }
 }
 
-// DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: raw INT4 registers of every slot
+// DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: the encoded packs of every slot
 // (a pushed inbox's writers, or every rank's: load's or recv's uint32_t form,
 // [0] a word and [1] its group's scale), summed in fp32 in slot order, each
 // element (q - 8) * scale landed in DTYPE first, as a quantized load lands it.
@@ -1921,10 +1916,10 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
   }
 }
 
-// QUANTIZE: a group's packs to their words and the group's scale. Its own
-// function because store (a pack a thread, THREAD_PACKS 1) and the INT4 flat
-// walk (a group a thread, THREAD_PACKS kInt4GroupPacks) share it; the thread
-// map is a parameter, not implied by the encoding (R7).
+// QUANTIZE: a group's packs, encoded: each pack's word and the group's scale
+// as fp16 bits. A pack a thread (its quad's group, PACKS 1) or a group a thread
+// (PACKS kInt4GroupPacks): the thread map is a parameter, not implied by the
+// encoding (R7).
 // THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm
 // [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each
 // step); a group a thread, the thread's own. THE SCALE from it: its SIGNED
@@ -1943,10 +1938,6 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
-
-// QUANTIZE: a pack a thread (its quad's group, PACKS 1) or a group a thread
-// (PACKS kInt4GroupPacks), encoded: each pack's word and its group's scale's
-// fp16 bits.
 template <int LOWEST, int HIGHEST, int PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[PACKS][P],
                       uint32_t (&encoded)[PACKS][2]) {
