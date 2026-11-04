@@ -118,15 +118,8 @@ DINLINE void reduce_scatter_flat_pull(
             input_size_m, input_size_n, input_size_m, len, x, 0,
             g0 * kInt4Group, 1);
         // QUANTIZED ONCE, by this thread alone (its group).
-        uint32_t words[kInt4GroupPacks];
-        float scale;
-        quantize(x[0], words, scale);
         uint32_t payload[1][kInt4GroupPacks][2];
-#pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k) {
-          payload[0][k][0] = words[k];
-          payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
-        }
+        quantize(x[0], payload[0]);
         store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, true,
               Layout::group_run, TAIL>(
             payload, staging_ptr_array, staging_ptr_array_size, rank, r, slice,
@@ -303,15 +296,8 @@ DINLINE void reduce_scatter_flat_push(
             input_size_m, input_size_n, input_size_m, len, x, 0,
             g0 * kInt4Group, 1);
         // QUANTIZED ONCE, by this thread alone (its group).
-        uint32_t words[kInt4GroupPacks];
-        float scale;
-        quantize(x[0], words, scale);
         uint32_t payload[1][kInt4GroupPacks][2];
-#pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k) {
-          payload[0][k][0] = words[k];
-          payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
-        }
+        quantize(x[0], payload[0]);
         send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, true,
              Layout::group_run, TAIL>(
             payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
@@ -782,10 +768,8 @@ DINLINE void reduce_scatter_columns_push(
 #pragma unroll
               for (; w + 1 < WORLD; w += 2) {
                 float a[kPackElems], b[kPackElems];
-                dequantize(raw[w][0][0][0],
-                           __builtin_bit_cast(float, raw[w][0][0][1]), a);
-                dequantize(raw[w + 1][0][0][0],
-                           __builtin_bit_cast(float, raw[w + 1][0][0][1]), b);
+                dequantize(raw[w][0][0], a);
+                dequantize(raw[w + 1][0][0], b);
 #pragma unroll
                 for (int j = 0; j < kPackElems; ++j)
                   sum[j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -799,8 +783,7 @@ DINLINE void reduce_scatter_columns_push(
 #pragma unroll
             for (; w < WORLD; ++w) {
               float a[kPackElems];
-              dequantize(raw[w][0][0][0],
-                         __builtin_bit_cast(float, raw[w][0][0][1]), a);
+              dequantize(raw[w][0][0], a);
 #pragma unroll
               for (int j = 0; j < kPackElems; ++j)
                 sum[j] += static_cast<float>(static_cast<DTYPE>(a[j]));
@@ -815,11 +798,7 @@ DINLINE void reduce_scatter_columns_push(
           // payload sent to all.
           [[maybe_unused]] uint32_t payload[1][1][2];
           if constexpr (QUANTIZE_INT4) {
-            uint32_t word[1];
-            float scale;
-            quantize(rounded[0], word, scale);
-            payload[0][0][0] = word[0];
-            payload[0][0][1] = __builtin_bit_cast(uint32_t, scale);
+            quantize(rounded[0], payload[0]);
           }
           for (int r = 0; r < WORLD; ++r) {
             if constexpr (QUANTIZE_INT4)

@@ -111,8 +111,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
         DTYPE x[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
-          dequantize(words[0][k][0], __builtin_bit_cast(float, words[0][k][1]),
-                     x[0][k]);
+          dequantize(words[0][k], x[0][k]);
         store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kOutput, TAIL>(
             x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
             WORLD, output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
@@ -197,9 +196,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
               partials_size_n, output_size_m, output_size_n, raw[k], offs_m + i,
               offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k)
-          dequantize(raw[k][0][0][0],
-                     __builtin_bit_cast(float, raw[k][0][0][1]), output[i][k]);
+        for (int k = 0; k < kPacks; ++k) dequantize(raw[k][0][0], output[i][k]);
       }
     }
   } else {
@@ -251,9 +248,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k)
-          dequantize(raw[k][i][0][0],
-                     __builtin_bit_cast(float, raw[k][i][0][1]), output[i][k]);
+        for (int k = 0; k < kPacks; ++k) dequantize(raw[k][i][0], output[i][k]);
     }
   }
 }
@@ -308,12 +303,9 @@ DINLINE void all_gather(const DTYPE (&mine)[ROWS][PACKS][ELEMS],
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
-      for (int k = 0; k < PACKS; ++k) {
-        float scale;
+      for (int k = 0; k < PACKS; ++k)
         quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
-                 reinterpret_cast<uint32_t (&)[1]>(payload[i][k][0]), scale);
-        payload[i][k][1] = __builtin_bit_cast(uint32_t, scale);
-      }
+                 reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
       send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::line>(
