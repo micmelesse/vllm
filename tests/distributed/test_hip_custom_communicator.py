@@ -13,6 +13,7 @@ import torch.distributed as dist
 from vllm.distributed.device_communicators.hip_custom_communicator import (
     AllReduceAddAttnResRmsNormConfig,
     AllReduceAddRmsNormConfig,
+    AllReduceConfig,
     HipCustomCommunicator,
 )
 from vllm.distributed.parallel_state import get_tp_group
@@ -603,6 +604,158 @@ def test_all_reduce_add_attn_res_rms_norm(
     multi_process_parallel(
         monkeypatch, tp_size, 1, all_reduce_add_attn_res_rms_norm_ranks
     )
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def outputs_independent_of_memory_ranks(
+    monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port
+):
+    """Every op at every algorithm the table builds in this mode, twice: the memory
+    its outputs are allocated from filled first with NaN, then with a finite
+    pattern. A kernel that reads an output before writing it answers differently;
+    one that does not, bit for bit the same and finite. (An AttnRes read its new
+    prefix back where another thread had not stored it yet: in a fresh process the
+    leftover memory was finite and the answer right, in vLLM's server it was
+    sometimes NaN, and GSM8K fell to 0.909.)"""
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        dist.all_reduce(torch.zeros(1, device=device), group=group.device_group)
+        torch.accelerator.synchronize()
+        comm = HipCustomCommunicator(
+            group.cpu_group,
+            group.device_group,
+            device,
+            max_rows=MAX_TOKENS,
+            max_cols=HIDDEN,
+        )
+        assert not comm.disabled, comm.lifecycle
+        dtype = torch.bfloat16
+        try:
+            # A row whole tiles and one with a tail (3584 and 7168 on the INT4
+            # picks' 4096 and 8192 tiles), at decode and prefill rows.
+            for cols in [HIDDEN, HIDDEN // 2]:
+                for num_tokens in [8, 256, MAX_TOKENS]:
+                    # Normal values, 8 channels 50x (the model's outliers): sums
+                    # that round in INT4 as the model's do.
+                    g = torch.Generator(device=device).manual_seed(rank)
+                    x = torch.randn((num_tokens, cols), generator=g, device=device)
+                    g.manual_seed(0)
+                    x[:, torch.randperm(cols, generator=g, device=device)[:8]] *= 50
+                    x = x.to(dtype)
+                    # Everything else the same on every rank.
+                    residual = torch.randn(
+                        (num_tokens, cols), generator=g, device=device
+                    ).to(dtype)
+                    prefix = (
+                        torch.randn((num_tokens, cols), generator=g, device=device) * 4
+                    ).to(dtype)
+                    blocks = torch.randn(
+                        (num_tokens, 10, cols), generator=g, device=device
+                    ).to(dtype)
+                    weight = torch.empty(cols, dtype=dtype, device=device)
+                    weight.normal_(mean=1.0, std=0.1, generator=g)
+                    qk_weight = torch.empty(cols, dtype=dtype, device=device)
+                    qk_weight.normal_(mean=0.0, std=0.1, generator=g)
+
+                    # Each op, and AttnRes as both its layers: one adding to the
+                    # prefix, one whose sum starts it and is stored as block 4.
+                    calls = [
+                        ("all_reduce", "all_reduce"),
+                        ("rms_norm", "all_reduce_add_rms_norm"),
+                        ("add_rms_norm", "all_reduce_add_rms_norm"),
+                        ("attn_res", "all_reduce_add_attn_res_rms_norm"),
+                        ("attn_res_block_write", "all_reduce_add_attn_res_rms_norm"),
+                    ]
+                    for variant, op in calls:
+                        algorithms = {
+                            "all_reduce": AllReduceConfig,
+                            "all_reduce_add_rms_norm": AllReduceAddRmsNormConfig,
+                            "all_reduce_add_attn_res_rms_norm": (
+                                AllReduceAddAttnResRmsNormConfig
+                            ),
+                        }[op].algorithms
+                        forced = [
+                            comm.kernel_config(
+                                op,
+                                algorithm,
+                                num_tokens,
+                                cols,
+                                comm.arguments.quantization,
+                            )
+                            for algorithm in algorithms
+                        ]
+                        for config in [None, *(c for c in forced if c is not None)]:
+                            answers = []
+                            for fill in [float("nan"), 1e4]:
+                                # The allocator's next blocks of this size, filled
+                                # and freed: the op's outputs are allocated from
+                                # them.
+                                poison = [torch.full_like(x, fill) for _ in range(4)]
+                                del poison
+                                if variant == "all_reduce":
+                                    outputs = [comm.all_reduce(x, config=config)]
+                                elif variant == "rms_norm":
+                                    outputs = [
+                                        comm.all_reduce_add_rms_norm(
+                                            x, weight, EPS, config=config
+                                        )
+                                    ]
+                                elif variant == "add_rms_norm":
+                                    outputs = list(
+                                        comm.all_reduce_add_rms_norm(
+                                            x,
+                                            weight,
+                                            EPS,
+                                            residual=residual,
+                                            config=config,
+                                        )
+                                    )
+                                else:
+                                    # AttnRes writes a block: each call its copy.
+                                    has_prefix = variant == "attn_res"
+                                    written = blocks.clone()
+                                    outputs = [
+                                        written,
+                                        *comm.all_reduce_add_attn_res_rms_norm(
+                                            x,
+                                            prefix if has_prefix else None,
+                                            written,
+                                            weight,
+                                            qk_weight,
+                                            weight,
+                                            4,
+                                            -1 if has_prefix else 4,
+                                            ATTN_RES_EPS,
+                                            EPS,
+                                            config=config,
+                                        ),
+                                    ]
+                                answers.append([t.clone() for t in outputs])
+                            torch.accelerator.synchronize()
+                            where = (variant, config, num_tokens, cols)
+                            for poisoned_nan, poisoned_finite in zip(*answers):
+                                assert torch.isfinite(poisoned_nan).all(), where
+                                assert torch.equal(poisoned_nan, poisoned_finite), where
+        finally:
+            comm.close()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+@pytest.mark.parametrize("quantization", ["NONE", "INT4"])
+def test_outputs_independent_of_memory(
+    monkeypatch: pytest.MonkeyPatch, tp_size, quantization
+):
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", quantization)
+    multi_process_parallel(monkeypatch, tp_size, 1, outputs_independent_of_memory_ranks)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
