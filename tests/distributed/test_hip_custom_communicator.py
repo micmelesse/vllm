@@ -884,3 +884,67 @@ def test_tuned_table(monkeypatch: pytest.MonkeyPatch, tp_size):
     if tp_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     multi_process_parallel(monkeypatch, tp_size, 1, tuned_table_ranks)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def osp_probe_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, port):
+    """SCRATCH: which output elements one_shot_push INT4 leaves unwritten."""
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        dist.all_reduce(torch.zeros(1, device=device), group=group.device_group)
+        torch.accelerator.synchronize()
+        comm = HipCustomCommunicator(
+            group.cpu_group, group.device_group, device, max_rows=MAX_TOKENS,
+            max_cols=HIDDEN,
+        )
+        lines = []
+        try:
+            for rows, cols in [(8, 7168), (8, 3584), (256, 7168), (1, 512), (1, 1024),
+                               (3, 2048)]:
+                for algorithm in ["one_shot_push", "one_shot_pull", "two_shot_push"]:
+                    cfg = comm.kernel_config("all_reduce", algorithm, rows, cols, "int4")
+                    if cfg is None:
+                        continue
+                    g = torch.Generator(device=device).manual_seed(rank)
+                    x = torch.randn((rows, cols), generator=g, device=device).to(
+                        torch.bfloat16)
+                    want = x.float()
+                    dist.all_reduce(want, group=group.device_group)
+                    for fill in [float("nan"), 7.0]:
+                        poison = [torch.full_like(x, fill) for _ in range(4)]
+                        del poison
+                        out = comm.all_reduce(x, config=cfg).float()
+                        torch.accelerator.synchronize()
+                        bad = ~torch.isfinite(out) if fill != fill else out == 7.0
+                        cb = bad.any(0).nonzero().flatten()
+                        rb = bad.any(1).nonzero().flatten()
+                        ok = ~bad
+                        err = ((out[ok] - want[ok]).norm() / want[ok].norm()).item()
+                        lines.append(
+                            f"{rows}x{cols} {algorithm} tile_n={cfg.tile_n} "
+                            f"grid={cfg.grid_x} block={cfg.block_x} fill={fill}: "
+                            f"bad {int(bad.sum())}/{bad.numel()} rows "
+                            f"{rb.numel()} cols {cb.numel()}; err(ok) {err:.4f}")
+                        if cb.numel():
+                            lines.append(
+                                f"   cols {cb[:12].tolist()}..{cb[-4:].tolist()} "
+                                f"col%32 {sorted(set((cb % 32).tolist()))[:32]} "
+                                f"col%1024 first {sorted(set((cb % 1024).tolist()))[:8]}"
+                                f" row0 bad {int(bad[rb[0]].sum())}")
+        finally:
+            comm.close()
+        if rank == 0:
+            raise AssertionError("\n" + "\n".join(lines))
+
+
+@pytest.mark.parametrize("tp_size", [2])
+def test_osp_probe(monkeypatch: pytest.MonkeyPatch, tp_size):
+    monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", "INT4")
+    multi_process_parallel(monkeypatch, tp_size, 1, osp_probe_ranks)
