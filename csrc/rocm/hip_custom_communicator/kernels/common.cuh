@@ -608,6 +608,12 @@ DINLINE void read_buffer(
             dequantize(got[c][i][k][0][0],
                        __builtin_bit_cast(float, got[c][i][k][0][2]),
                        output[c][i][k]);
+            if (blockIdx.x == 0 && threadIdx.x == 0 && i == 0 && k == 0)
+              printf("DECODED rank %d from %d: %f %f %f %f %f %f %f %f\n", rank,
+                     c, (float)output[c][i][k][0], (float)output[c][i][k][1],
+                     (float)output[c][i][k][2], (float)output[c][i][k][3],
+                     (float)output[c][i][k][4], (float)output[c][i][k][5],
+                     (float)output[c][i][k][6], (float)output[c][i][k][7]);
           } else {
             uint32_t words[2 * kLines];
 #pragma unroll

@@ -318,6 +318,14 @@ DINLINE void all_reduce_one_shot_push(
             acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
+    if (QUANTIZE_INT4 && blockIdx.x == 0 && threadIdx.x == 0)
+      printf("OSP rank %d t %d kPacks %d kPackElems %d kRows %d: copies0 %f %f "
+             "copies1 %f %f rounded %f %f mine %f %f\n", rank, t, kPacks,
+             kPackElems, kRows, (float)copies[0][0][0][0],
+             (float)copies[0][0][0][1], (float)copies[1 % WORLD][0][0][0],
+             (float)copies[1 % WORLD][0][0][1], (float)rounded[0][0][0],
+             (float)rounded[0][0][1], (float)mine[0][0][0],
+             (float)mine[0][0][1]);
     store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
