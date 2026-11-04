@@ -919,6 +919,8 @@ def osp_probe_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, por
                 for attempt in range(1):
                     out = comm.all_reduce(x, config=cfg).float()
                     torch.accelerator.synchronize()
+                    import ctypes
+                    ctypes.CDLL(None).fflush(None)
                     # Wrong: off from the exact sum by more than INT4 could be.
                     tol = 0.25 * want.abs().amax(1, keepdim=True) + 1e-3
                     bad = ~torch.isfinite(out) | ((out - want).abs() > tol)
