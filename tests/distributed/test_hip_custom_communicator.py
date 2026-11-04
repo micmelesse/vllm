@@ -906,38 +906,36 @@ def osp_probe_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, por
         )
         lines = []
         try:
-            for rows, cols in [(8, 7168), (8, 3584), (256, 7168), (1, 512), (1, 1024),
-                               (3, 2048)]:
-                for algorithm in ["one_shot_push", "one_shot_pull", "two_shot_push"]:
-                    cfg = comm.kernel_config("all_reduce", algorithm, rows, cols, "int4")
-                    if cfg is None:
-                        continue
-                    g = torch.Generator(device=device).manual_seed(rank)
-                    x = torch.randn((rows, cols), generator=g, device=device).to(
-                        torch.bfloat16)
-                    want = x.float()
-                    dist.all_reduce(want, group=group.device_group)
-                    for fill in [float("nan"), 7.0]:
-                        poison = [torch.full_like(x, fill) for _ in range(4)]
-                        del poison
-                        out = comm.all_reduce(x, config=cfg).float()
-                        torch.accelerator.synchronize()
-                        bad = ~torch.isfinite(out) if fill != fill else out == 7.0
-                        cb = bad.any(0).nonzero().flatten()
-                        rb = bad.any(1).nonzero().flatten()
-                        ok = ~bad
-                        err = ((out[ok] - want[ok]).norm() / want[ok].norm()).item()
+            for rows, cols in [(1, 512), (8, 7168), (3, 2048)]:
+                cfg = comm.kernel_config("all_reduce", "one_shot_push", rows, cols, "int4")
+                ref = comm.kernel_config("all_reduce", "one_shot_pull", rows, cols, "int4")
+                g = torch.Generator(device=device).manual_seed(rank)
+                x = torch.randn((rows, cols), generator=g, device=device).to(
+                    torch.bfloat16)
+                xs = [torch.empty_like(x) for _ in range(tp_size)]
+                dist.all_gather(xs, x, group=group.device_group)
+                want = torch.stack([t.float() for t in xs]).sum(0)
+                pulled = comm.all_reduce(x, config=ref).float()
+                for attempt in range(3):
+                    out = comm.all_reduce(x, config=cfg).float()
+                    torch.accelerator.synchronize()
+                    # Wrong: off from the exact sum by more than INT4 could be.
+                    tol = 0.25 * want.abs().amax(1, keepdim=True) + 1e-3
+                    bad = ~torch.isfinite(out) | ((out - want).abs() > tol)
+                    lines.append(f"{rows}x{cols} attempt {attempt}: wrong "
+                                 f"{int(bad.sum())}/{bad.numel()}; pull wrong "
+                                 f"{int(((pulled - want).abs() > tol).sum())}")
+                    for r, c in bad.nonzero().tolist()[:6]:
+                        pk = c // 8 * 8
+                        o = out[r, pk:pk + 8]
+                        w = want[r, pk:pk + 8]
+                        hit = (want[r] - out[r, c]).abs().argmin().item()
+                        mine = [round(t[r, c].item(), 3) for t in xs]
                         lines.append(
-                            f"{rows}x{cols} {algorithm} tile_n={cfg.tile_n} "
-                            f"grid={cfg.grid_x} block={cfg.block_x} fill={fill}: "
-                            f"bad {int(bad.sum())}/{bad.numel()} rows "
-                            f"{rb.numel()} cols {cb.numel()}; err(ok) {err:.4f}")
-                        if cb.numel():
-                            lines.append(
-                                f"   cols {cb[:12].tolist()}..{cb[-4:].tolist()} "
-                                f"col%32 {sorted(set((cb % 32).tolist()))[:32]} "
-                                f"col%1024 first {sorted(set((cb % 1024).tolist()))[:8]}"
-                                f" row0 bad {int(bad[rb[0]].sum())}")
+                            f"   [{r},{c}] out {out[r, c].item():.4g} want "
+                            f"{w[c - pk].item():.4g} pull {pulled[r, c].item():.4g}; "
+                            f"pack out/want {(o / w).tolist()}; nearest want col "
+                            f"{hit} ({want[r, hit].item():.4g}); ranks' {mine}")
         finally:
             comm.close()
         if rank == 0:
