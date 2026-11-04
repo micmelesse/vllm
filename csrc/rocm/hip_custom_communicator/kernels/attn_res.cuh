@@ -206,7 +206,7 @@ DINLINE void attn_res(
               ss_k = fmaf(static_cast<float>(v[s][m][k][j]),
                           static_cast<float>(v[s][m][k][j]), ss_k);
             const int n = pack_at(k);
-            ss[m] += (n < input_size_n / P ? 1.0f : 0.0f) * ss_k;
+            ss[m] += n < input_size_n / P ? ss_k : 0.0f;
           }
         }
 #pragma unroll
@@ -219,7 +219,7 @@ DINLINE void attn_res(
             for (int j = 0; j < P; ++j)
               dw_k = fmaf(static_cast<float>(v[s][m][k][j]), w[0][k][j], dw_k);
             const int n = pack_at(k);
-            dw[m] += (n < input_size_n / P ? 1.0f : 0.0f) * dw_k;
+            dw[m] += n < input_size_n / P ? dw_k : 0.0f;
           }
         }
 #pragma unroll
@@ -445,9 +445,9 @@ DINLINE void attn_res(
                                   static_cast<float>(qk_weight[0][k][j]),
                               dw_k);
                 }
-                const float in = pack_at(k, c) < n_all / P ? 1.0f : 0.0f;
-                sums[0][(m * TILE_K + s) * 2] += in * ss_k;
-                sums[0][(m * TILE_K + s) * 2 + 1] += in * dw_k;
+                const bool in = pack_at(k, c) < n_all / P;
+                sums[0][(m * TILE_K + s) * 2] += in ? ss_k : 0.0f;
+                sums[0][(m * TILE_K + s) * 2 + 1] += in ? dw_k : 0.0f;
               }
           }
         }
