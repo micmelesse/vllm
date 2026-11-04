@@ -637,6 +637,17 @@ def outputs_independent_of_memory_ranks(
         )
         assert not comm.disabled, comm.lifecycle
         dtype = torch.bfloat16
+        # A config forced at a size it does not take is refused by name, before
+        # it launches: not this test's to judge.
+        refused_at_size = (
+            "staging_too_small",
+            "partials_too_small",
+            "unfenced_too_small",
+            "grid_not_resident",
+            "launch_out_of_range",
+        )
+        # Every failure, so one run names them all.
+        failures = []
         try:
             # A row whole tiles and one with a tail (3584 and 7168 on the INT4
             # picks' 4096 and 8192 tiles), at decode and prefill rows.
@@ -693,56 +704,67 @@ def outputs_independent_of_memory_ranks(
                         ]
                         for config in [None, *(c for c in forced if c is not None)]:
                             answers = []
+                            where = (variant, config, num_tokens, cols)
                             for fill in [float("nan"), 1e4]:
                                 # The allocator's next blocks of this size, filled
                                 # and freed: the op's outputs are allocated from
                                 # them.
                                 poison = [torch.full_like(x, fill) for _ in range(4)]
                                 del poison
-                                if variant == "all_reduce":
-                                    outputs = [comm.all_reduce(x, config=config)]
-                                elif variant == "rms_norm":
-                                    outputs = [
-                                        comm.all_reduce_add_rms_norm(
-                                            x, weight, EPS, config=config
+                                try:
+                                    outputs = []
+                                    if variant == "all_reduce":
+                                        outputs = [comm.all_reduce(x, config=config)]
+                                    elif variant == "rms_norm":
+                                        outputs = [
+                                            comm.all_reduce_add_rms_norm(
+                                                x, weight, EPS, config=config
+                                            )
+                                        ]
+                                    elif variant == "add_rms_norm":
+                                        outputs = list(
+                                            comm.all_reduce_add_rms_norm(
+                                                x,
+                                                weight,
+                                                EPS,
+                                                residual=residual,
+                                                config=config,
+                                            )
                                         )
-                                    ]
-                                elif variant == "add_rms_norm":
-                                    outputs = list(
-                                        comm.all_reduce_add_rms_norm(
-                                            x,
-                                            weight,
-                                            EPS,
-                                            residual=residual,
-                                            config=config,
-                                        )
-                                    )
-                                else:
-                                    # AttnRes writes a block: each call its copy.
-                                    has_prefix = variant == "attn_res"
-                                    written = blocks.clone()
-                                    outputs = [
-                                        written,
-                                        *comm.all_reduce_add_attn_res_rms_norm(
-                                            x,
-                                            prefix if has_prefix else None,
+                                    else:
+                                        # AttnRes writes a block: each call its copy.
+                                        has_prefix = variant == "attn_res"
+                                        written = blocks.clone()
+                                        outputs = [
                                             written,
-                                            weight,
-                                            qk_weight,
-                                            weight,
-                                            4,
-                                            -1 if has_prefix else 4,
-                                            ATTN_RES_EPS,
-                                            EPS,
-                                            config=config,
-                                        ),
-                                    ]
+                                            *comm.all_reduce_add_attn_res_rms_norm(
+                                                x,
+                                                prefix if has_prefix else None,
+                                                written,
+                                                weight,
+                                                qk_weight,
+                                                weight,
+                                                4,
+                                                -1 if has_prefix else 4,
+                                                ATTN_RES_EPS,
+                                                EPS,
+                                                config=config,
+                                            ),
+                                        ]
+                                except RuntimeError as e:
+                                    if not str(e).startswith(refused_at_size):
+                                        raise
+                                    break
                                 answers.append([t.clone() for t in outputs])
                             torch.accelerator.synchronize()
-                            where = (variant, config, num_tokens, cols)
+                            if len(answers) < 2:
+                                continue
                             for poisoned_nan, poisoned_finite in zip(*answers):
-                                assert torch.isfinite(poisoned_nan).all(), where
-                                assert torch.equal(poisoned_nan, poisoned_finite), where
+                                if not torch.isfinite(poisoned_nan).all():
+                                    failures.append(("not finite", *where))
+                                elif not torch.equal(poisoned_nan, poisoned_finite):
+                                    failures.append(("differs", *where))
+            assert not failures, "\n".join(map(str, failures))
         finally:
             comm.close()
 
