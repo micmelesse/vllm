@@ -105,11 +105,11 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // magnitude, with its sign) lands on LOWEST, so it is never clipped and all of
 // the levels are used (AITER's FlyDSL INT4 QuickReduce, vLLM's path for bf16
 // since #59478); a value is stored biased by -LOWEST.
-constexpr int kInt4Group = 32;   // values a group
-constexpr int kInt4Lowest = -8;  // the lowest level
-constexpr int kInt4Highest = 7;  // the highest level
-constexpr int kInt4WordBytes = 4;              // a pack's values, 8 of 4 bits
-constexpr int kInt4ScaleBytes = 2;             // a group's scale, fp16
+constexpr int kInt4Group = 32;      // values a group
+constexpr int kInt4Lowest = -8;     // the lowest level
+constexpr int kInt4Highest = 7;     // the highest level
+constexpr int kInt4WordBytes = 4;   // a pack's values, 8 of 4 bits
+constexpr int kInt4ScaleBytes = 2;  // a group's scale, fp16
 constexpr uint32_t kInt4ZeroWord =
     0x88888888u;  // a word of zeros (each value stored q + 8)
 // A GROUP'S PACKS: a pack is a word of its group's values.
@@ -232,19 +232,24 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 // or on abort, as a barrier's wait does).
 enum class Layout { tile, run, flat, group_run, group_flat, line };
 
-// THE OPERATIONS THE INTERNALS CALL, declared before them (defined below,
-// QUANTIZE_INT4).
+// THE ENCODING (QUANTIZE_INT4), its one owner: quantize, values to encoded,
+// and dequantize, encoded to values (defined below). AN ENCODED PACK is
+// uint32_t[2]: [0] its word (8 values of 4 bits), [1] its group's scale as
+// fp16 bits (the high half 0), the bytes a buffer stores. Every other function
+// moves encoded packs as bytes and never reads into them.
 template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest, typename U,
           int P>
-DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]);
+DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]);
 template <typename DTYPE, int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest,
           int SLOTS, int K, int P>
-DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
+DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]);
-template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest,
-          int THREAD_PACKS, typename T, int P>
-DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
-                      uint32_t (&words)[THREAD_PACKS], float& scale);
+template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest, int PACKS,
+          typename T, int P>
+DINLINE void quantize(const T (&input)[PACKS][P],
+                      uint32_t (&encoded)[PACKS][2]);
+template <typename T, int K, int P>
+DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&encoded)[1][K][2]);
 
 namespace internal {
 
@@ -599,13 +604,13 @@ DINLINE void read_buffer(
             output[c][i][k][0] = got[c][i][k][0][0];
             output[c][i][k][1] = got[c][i][k][0][2];
           } else if constexpr (QUANTIZE_INT4) {
-            // THE LINE'S TWO DATA WORDS copied out whole, as the exact payload's
-            // are: the scale taken as an element of the loaded vector was the
-            // word's bits in a pushed one-shot's build.
-            uint32_t words[4];
-            __builtin_memcpy(words, &got[c][i][k][0], sizeof(words));
-            dequantize(words[0], __builtin_bit_cast(float, words[2]),
-                       output[c][i][k]);
+            // THE ENCODED PACK, the line's two data words, copied out whole as
+            // the exact payload's are (taken as elements of the loaded vector,
+            // the second was the first's bits in a pushed one-shot's build).
+            uint32_t line[4];
+            __builtin_memcpy(line, &got[c][i][k][0], sizeof(line));
+            const uint32_t encoded[2] = {line[0], line[2]};
+            dequantize(encoded, output[c][i][k]);
           } else {
             uint32_t words[2 * kLines];
 #pragma unroll
@@ -826,11 +831,11 @@ DINLINE void read_buffer(
 #pragma unroll
       for (int c = 0; c < kCopies; ++c) {
         const u32x4 words = *(const global_u32x4*)(values[c] + value_at);
+        // The encoding's scale: the stored fp16's bits, as they are.
         const uint32_t scale = __builtin_bit_cast(
-            uint32_t,
-            static_cast<float>(
-                *(const global_f16*)(reinterpret_cast<const char*>(scales[c]) +
-                                     scale_at)));
+            uint16_t,
+            *(const global_f16*)(reinterpret_cast<const char*>(scales[c]) +
+                                 scale_at));
         auto& out = [&]() -> U(&)[kPacks][kPackElems] {
           if constexpr (kSlots)
             return output[c][0];
@@ -980,7 +985,7 @@ DINLINE void read_buffer(
     for (int c = 0; c < kCopies; ++c)
       scales[c] = reinterpret_cast<const char*>(values[c] + scales_at);
     uint32_t words[kCopies][kRows][kPacks];
-    float group_scales[kCopies][kRows][kPacks];
+    uint32_t group_scales[kCopies][kRows][kPacks];  // the encoding's fp16 bits
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (skips(i)) continue;
@@ -997,7 +1002,8 @@ DINLINE void read_buffer(
 #pragma unroll
         for (int c = 0; c < kCopies; ++c) {
           words[c][i][k] = *(const global_u32*)(values[c] + value_at);
-          group_scales[c][i][k] = *(const global_f16*)(scales[c] + scale_at);
+          group_scales[c][i][k] = __builtin_bit_cast(
+              uint16_t, *(const global_f16*)(scales[c] + scale_at));
         }
       }
     }
@@ -1015,11 +1021,12 @@ DINLINE void read_buffer(
             else
               return output[i][k];
           }();
+          const uint32_t encoded[2] = {words[c][i][k], group_scales[c][i][k]};
           if constexpr (kRaw) {
-            out[0] = words[c][i][k];
-            out[1] = __builtin_bit_cast(uint32_t, group_scales[c][i][k]);
+            out[0] = encoded[0];
+            out[1] = encoded[1];
           } else {
-            dequantize(words[c][i][k], group_scales[c][i][k], out);
+            dequantize(encoded, out);
           }
         }
   }
@@ -1135,11 +1142,8 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
             payload[i][k][0] = input[i][k][0];
             payload[i][k][1] = input[i][k][1];
           } else {
-            float scale;
             quantize(reinterpret_cast<const U(&)[1][kPackElems]>(input[i][k]),
-                     reinterpret_cast<uint32_t (&)[1]>(payload[i][k][0]),
-                     scale);
-            payload[i][k][1] = __builtin_bit_cast(uint32_t, scale);
+                     reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
           }
         }
     }
@@ -1302,14 +1306,15 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       // dense payload at the slot's place; quantized here by its thread alone,
       // or already (raw registers).
       static_assert(kRun, "an INT4 payload is dense");
-      uint32_t words[kInt4GroupPacks];
-      float scale;
+      uint32_t encoded[kInt4GroupPacks][2];
       if constexpr (kRaw) {
 #pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k) words[k] = input[0][k][0];
-        scale = __builtin_bit_cast(float, input[0][0][1]);
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          encoded[k][0] = input[0][k][0];
+          encoded[k][1] = input[0][k][1];
+        }
       } else {
-        quantize(input[0], words, scale);
+        quantize(input[0], encoded);
       }
       if (g < (TAIL ? static_cast<int>(int4_groups(clip_n))
                     : clip_n / kInt4Group)) {
@@ -1330,15 +1335,16 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
             clip_n / (kInt4Group / kInt4GroupPacks) - g * kInt4GroupPacks;
         if (!TAIL || words_in >= kInt4GroupPacks) {
           *(global_u32x4*)(values + value_at) =
-              u32x4{words[0], words[1], words[2], words[3]};
+              u32x4{encoded[0][0], encoded[1][0], encoded[2][0], encoded[3][0]};
         } else {
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k)
             if (k < words_in)
-              *(global_u32*)(values + value_at + k * kInt4WordBytes) = words[k];
+              *(global_u32*)(values + value_at + k * kInt4WordBytes) =
+                  encoded[k][0];
         }
         *(global_f16*)(reinterpret_cast<char*>(scales) + scale_at) =
-            static_cast<__fp16>(scale);
+            __builtin_bit_cast(__fp16, static_cast<uint16_t>(encoded[0][1]));
       }
     }
   } else if constexpr (!QUANTIZE_INT4) {
@@ -1370,19 +1376,17 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     static_assert(kThreadsN % kInt4GroupPacks == 0,
                   "a group is 4 lanes' packs");
     constexpr int kInt4PackElems = kInt4Group / kInt4GroupPacks;
-    uint32_t words[kRows][kPacks];
-    float scales[kRows][kPacks];
+    uint32_t encoded[kRows][kPacks][2];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         if constexpr (kRaw) {
-          words[i][k] = input[i][k][0];
-          scales[i][k] = __builtin_bit_cast(float, input[i][k][1]);
+          encoded[i][k][0] = input[i][k][0];
+          encoded[i][k][1] = input[i][k][1];
         } else {
           quantize(reinterpret_cast<const U(&)[1][kPackElems]>(input[i][k]),
-                   reinterpret_cast<uint32_t (&)[1]>(words[i][k]),
-                   scales[i][k]);
+                   reinterpret_cast<uint32_t (&)[1][2]>(encoded[i][k]));
         }
       }
     const int64_t values_stride_m = output_size_n / 2;
@@ -1404,10 +1408,10 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
             (row * scales_stride_m + pack / kInt4GroupPacks) * kInt4ScaleBytes);
         asm volatile("" : "+v"(value_at));
         asm volatile("" : "+v"(scale_at));
-        *(global_u32*)(at_copy + value_at) = words[i][k];
+        *(global_u32*)(at_copy + value_at) = encoded[i][k][0];
         if (pack % kInt4GroupPacks == 0)
-          *(global_f16*)(at_copy + scales_at + scale_at) =
-              static_cast<__fp16>(scales[i][k]);
+          *(global_f16*)(at_copy + scales_at + scale_at) = __builtin_bit_cast(
+              __fp16, static_cast<uint16_t>(encoded[i][k][1]));
       }
     }
   }
@@ -1759,27 +1763,35 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
   __syncthreads();
 }
 
-// DEQUANTIZE: a word's 8 values at their group's scale. Its own function
-// because load lands them in U and the INT4 sum adds them in fp32 from the
-// words (reduce_scatter's, never a decoded tile). U float: the exact terms, (q
-// - 8) * scale. U a 16-bit dtype: each rounded once to U, made as a loaded pack
-// is, four 32-bit words copied in whole: element by element, each 16-bit value
-// held a register of its own and the pull norms' two rows of every peer's packs
-// spilled 188 VGPRs (256 VGPRs, 592 B of partials; 2026-10-15T22-21-26Z).
-// THE TERMS, EXACT in fp32, by quick reduce's 0x6400 magic: a mask puts
-// elements 2i and 2i + 1 in an fp16 pair, each 1024 + q (i = 0, 2) or 1024 +
-// 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd with 0x6400;
-// then one v_fma_mix_f32 a value takes a half at scale (or scale / 16) plus
-// bias (-1032 * scale, or -72 * scale): a 22-bit product, then an exact
-// difference. 13 instructions a word, in one asm block: left to the compiler,
-// each half was converted and fed to packed fmas (1.5 a value, a gfx950 probe
-// compile, 2026-10-16). VOLATILE, so the blocks keep their order
+// DEQUANTIZE: an encoded pack's 8 values at its group's scale. U float: the
+// exact terms, (q - 8) * scale. U a 16-bit dtype: each rounded once to U, made
+// as a loaded pack is, four 32-bit words copied in whole: element by element,
+// each 16-bit value held a register of its own and the pull norms' two rows of
+// every peer's packs spilled 188 VGPRs (256 VGPRs, 592 B of partials;
+// 2026-10-15T22-21-26Z). THE TERMS, EXACT in fp32, by quick reduce's 0x6400
+// magic: a mask puts elements 2i and 2i + 1 in an fp16 pair, each 1024 + q (i =
+// 0, 2) or 1024 + 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd
+// with 0x6400; then one v_fma_mix_f32 a value takes a half at scale (or scale /
+// 16) plus bias (-1032 * scale, or -72 * scale): a 22-bit product, then an
+// exact difference. 13 instructions a word, in one asm block: left to the
+// compiler, each half was converted and fed to packed fmas (1.5 a value, a
+// gfx950 probe compile, 2026-10-16). VOLATILE, so the blocks keep their order
 // (reduce_scatter's int4 sum pins what consumes them between).
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
 template <int LOWEST, int HIGHEST, typename U, int P>
-DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
+DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]) {
+  // THE ENCODED PACK: its word, and its group's scale from its fp16 bits. A
+  // DEBUG BUILD TRAPS ON A SCALE THAT IS NOT a finite fp16's bits: whatever
+  // else sits there (a word, another field, memory nobody wrote) is caught
+  // where it is read, not as wrong sums.
+  const uint32_t word = encoded[0];
+  const float scale = static_cast<float>(
+      __builtin_bit_cast(__fp16, static_cast<uint16_t>(encoded[1])));
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      ((encoded[1] >> 16) != 0 || !__builtin_isfinite(scale)))
+    __builtin_trap();
   static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
                 "fp32 terms or a 16-bit dtype");
@@ -1837,7 +1849,7 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   }
 }
 
-// DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: raw INT4 registers of every slot
+// DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: the encoded packs of every slot
 // (a pushed inbox's writers, or every rank's: load's or recv's uint32_t form,
 // [0] a word and [1] its group's scale), summed in fp32 in slot order, each
 // element (q - 8) * scale landed in DTYPE first, as a quantized load lands it.
@@ -1850,17 +1862,17 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
 // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts),
 // the one arch built (CMakeLists.txt).
 template <typename DTYPE, int LOWEST, int HIGHEST, int SLOTS, int K, int P>
-DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
+DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]) {
+  const auto& words = encoded;
   // Slot w's scale of pack k's group (every pack of a group carries it: its
   // first's read; one group a thread, pack 0's, the index a constant as it
   // always was).
   const auto scale_of = [&](int w, int k) {
     if constexpr (K == kInt4GroupPacks)
-      return __builtin_bit_cast(float, words[w][0][0][1]);
+      return words[w][0][0][1];
     else
-      return __builtin_bit_cast(
-          float, words[w][0][k / kInt4GroupPacks * kInt4GroupPacks][1]);
+      return words[w][0][k / kInt4GroupPacks * kInt4GroupPacks][1];
   };
 #pragma unroll
   for (int k = 0; k < K; ++k) {
@@ -1872,8 +1884,10 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
       for (; w + 1 < SLOTS; w += 2) {
         float a[P], b[P];
-        dequantize<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
-        dequantize<LOWEST, HIGHEST>(words[w + 1][0][k][0], scale_of(w + 1, k), b);
+        const uint32_t pack_a[2] = {words[w][0][k][0], scale_of(w, k)};
+        dequantize<LOWEST, HIGHEST>(pack_a, a);
+        const uint32_t pack_b[2] = {words[w + 1][0][k][0], scale_of(w + 1, k)};
+        dequantize<LOWEST, HIGHEST>(pack_b, b);
 #pragma unroll
         for (int j = 0; j < P; ++j)
           sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -1890,7 +1904,8 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
     for (; w < SLOTS; ++w) {
       float a[P];
-      dequantize<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
+      const uint32_t pack_a[2] = {words[w][0][k][0], scale_of(w, k)};
+      dequantize<LOWEST, HIGHEST>(pack_a, a);
 #pragma unroll
       for (int j = 0; j < P; ++j)
         sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
@@ -1901,10 +1916,10 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
   }
 }
 
-// QUANTIZE: a group's packs to their words and the group's scale. Its own
-// function because store (a pack a thread, THREAD_PACKS 1) and the INT4 flat
-// walk (a group a thread, THREAD_PACKS kInt4GroupPacks) share it; the thread
-// map is a parameter, not implied by the encoding (R7).
+// QUANTIZE: a group's packs, encoded: each pack's word and the group's scale
+// as fp16 bits. A pack a thread (its quad's group, PACKS 1) or a group a thread
+// (PACKS kInt4GroupPacks): the thread map is a parameter, not implied by the
+// encoding (R7).
 // THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm
 // [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each
 // step); a group a thread, the thread's own. THE SCALE from it: its SIGNED
@@ -1923,9 +1938,12 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
-template <int LOWEST, int HIGHEST, int THREAD_PACKS, typename T, int P>
-DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
-                      uint32_t (&words)[THREAD_PACKS], float& scale) {
+template <int LOWEST, int HIGHEST, int PACKS, typename T, int P>
+DINLINE void quantize(const T (&input)[PACKS][P],
+                      uint32_t (&encoded)[PACKS][2]) {
+  constexpr int THREAD_PACKS = PACKS;
+  uint32_t words[PACKS];
+  float scale;
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
                 "a pack a thread (its quad's group) or a group a thread");
@@ -1989,30 +2007,29 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
   };
 #pragma unroll
   for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
+  // ENCODED: each pack's word and the group's scale's fp16 bits.
+  const uint32_t bits =
+      __builtin_bit_cast(uint16_t, static_cast<__fp16>(scale));
+#pragma unroll
+  for (int k = 0; k < PACKS; ++k) {
+    encoded[k][0] = words[k];
+    encoded[k][1] = bits;
+  }
 }
 
 // QUANTIZE A THREAD'S GROUPS (Layout::group_run's registers, several groups a
-// thread), each by itself (its scale its own 32 values'), into the raw payload
-// send and store take: [0] a pack's word, [1] its group's scale as fp32 bits.
-// (One group a thread, the kernels call the form above directly: through this
-// one the TAIL builds scheduled differently, ISA 2026-10-22.)
+// thread), each by itself (its scale its own 32 values'), encoded. (One group a
+// thread, the kernels call the form above directly: through this one the TAIL
+// builds scheduled differently, ISA 2026-10-22.)
 template <typename T, int K, int P>
-DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&payload)[1][K][2]) {
+DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&encoded)[1][K][2]) {
   static_assert(K % kInt4GroupPacks == 0, "a thread holds whole groups");
 #pragma unroll
-  for (int jg = 0; jg < K / kInt4GroupPacks; ++jg) {
-    uint32_t words[kInt4GroupPacks];
-    float scale;
+  for (int jg = 0; jg < K / kInt4GroupPacks; ++jg)
     quantize(reinterpret_cast<const T(&)[kInt4GroupPacks][P]>(
                  input[0][jg * kInt4GroupPacks]),
-             words, scale);
-#pragma unroll
-    for (int k = 0; k < kInt4GroupPacks; ++k) {
-      payload[0][jg * kInt4GroupPacks + k][0] = words[k];
-      payload[0][jg * kInt4GroupPacks + k][1] =
-          __builtin_bit_cast(uint32_t, scale);
-    }
-  }
+             reinterpret_cast<uint32_t (&)[kInt4GroupPacks][2]>(
+                 encoded[0][jg * kInt4GroupPacks]));
 }
 
 // =============================================================================
