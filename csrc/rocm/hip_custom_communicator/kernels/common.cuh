@@ -76,7 +76,7 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // 4-bit values biased by 8 (a word 8 elements, its elements 2i and 2i + 1 in
 // bits 4i and 16 + 4i, so one shift and mask puts both in a 16-bit pair, quick
 // reduce's layout) and one fp16 scale, the group's signed extreme / -8
-// (Int4Format), ROUNDED TO FP16 BEFORE THE VALUES ARE, so each is rounded
+// (kInt4Lowest), ROUNDED TO FP16 BEFORE THE VALUES ARE, so each is rounded
 // against the scale stored; an element is (q - 8) * scale. A quantized buffer
 // is two buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32]
 // fp16), each a pointer, its strides and its sizes. Every function that moves
@@ -99,18 +99,15 @@ typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 // tunable: a group size is the format's accuracy and bytes (a scale's 2 bytes a
 // group's 16), and 32 is the size whose words fill a quad's packs (above);
 // another size is another format, with its own name and layout.
-// THE FORMAT AS A TYPE (quantize and dequantize take it as a template
-// parameter, so a variant is a struct, not edits): its group, and the levels
-// its values are rounded to, lowest to highest. A GROUP'S SIGNED EXTREME (its
-// largest magnitude, with its sign) lands on `lowest`, so it is never clipped
-// and all of the levels are used (AITER's FlyDSL INT4 QuickReduce, vLLM's path
-// for bf16 since #59478); a value is stored biased by -lowest.
-struct Int4Format {
-  static constexpr int group = 32;
-  static constexpr int lowest = -8;
-  static constexpr int highest = 7;
-};
-constexpr int kInt4Group = Int4Format::group;  // values a group
+// THE LEVELS its values are rounded to, lowest to highest: quantize's and
+// dequantize's template parameters LOWEST and HIGHEST, these their defaults, so
+// a variant is an argument, not edits. A GROUP'S SIGNED EXTREME (its largest
+// magnitude, with its sign) lands on LOWEST, so it is never clipped and all of
+// the levels are used (AITER's FlyDSL INT4 QuickReduce, vLLM's path for bf16
+// since #59478); a value is stored biased by -LOWEST.
+constexpr int kInt4Group = 32;   // values a group
+constexpr int kInt4Lowest = -8;  // the lowest level
+constexpr int kInt4Highest = 7;  // the highest level
 constexpr int kInt4WordBytes = 4;              // a pack's values, 8 of 4 bits
 constexpr int kInt4ScaleBytes = 2;             // a group's scale, fp16
 constexpr uint32_t kInt4ZeroWord =
@@ -237,12 +234,15 @@ enum class Layout { tile, run, flat, group_run, group_flat, line };
 
 // THE OPERATIONS THE INTERNALS CALL, declared before them (defined below,
 // QUANTIZE_INT4).
-template <typename FORMAT = Int4Format, typename U, int P>
+template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest, typename U,
+          int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]);
-template <typename DTYPE, typename FORMAT = Int4Format, int SLOTS, int K, int P>
+template <typename DTYPE, int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest,
+          int SLOTS, int K, int P>
 DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]);
-template <typename FORMAT = Int4Format, int THREAD_PACKS, typename T, int P>
+template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest,
+          int THREAD_PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
                       uint32_t (&words)[THREAD_PACKS], float& scale);
 
@@ -1774,7 +1774,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
-template <typename FORMAT, typename U, int P>
+template <int LOWEST, int HIGHEST, typename U, int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
@@ -1782,8 +1782,8 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   const float scale16 = scale * 0.0625f;
   // (q - lowest) * scale from the word's 1024 + q (and, the high nibbles,
   // 64 + q / 16): the lowest level's bias in each.
-  const float bias = scale * -(1024.0f - FORMAT::lowest);
-  const float bias16 = scale * -(64.0f - FORMAT::lowest);
+  const float bias = scale * -(1024.0f - LOWEST);
+  const float bias16 = scale * -(64.0f - LOWEST);
   float term[P];
   uint32_t p0, p1, p2, p3;
   asm volatile(
@@ -1845,7 +1845,7 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
 // and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
 // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts),
 // the one arch built (CMakeLists.txt).
-template <typename DTYPE, typename FORMAT, int SLOTS, int K, int P>
+template <typename DTYPE, int LOWEST, int HIGHEST, int SLOTS, int K, int P>
 DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
                         float (&sum)[1][K][P]) {
   // Slot w's scale of pack k's group (every pack of a group carries it: its
@@ -1868,8 +1868,8 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
       for (; w + 1 < SLOTS; w += 2) {
         float a[P], b[P];
-        dequantize<FORMAT>(words[w][0][k][0], scale_of(w, k), a);
-        dequantize<FORMAT>(words[w + 1][0][k][0], scale_of(w + 1, k), b);
+        dequantize<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
+        dequantize<LOWEST, HIGHEST>(words[w + 1][0][k][0], scale_of(w + 1, k), b);
 #pragma unroll
         for (int j = 0; j < P; ++j)
           sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -1886,7 +1886,7 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 #pragma unroll
     for (; w < SLOTS; ++w) {
       float a[P];
-      dequantize<FORMAT>(words[w][0][k][0], scale_of(w, k), a);
+      dequantize<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
 #pragma unroll
       for (int j = 0; j < P; ++j)
         sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
@@ -1919,13 +1919,10 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
-template <typename FORMAT, int THREAD_PACKS, typename T, int P>
+template <int LOWEST, int HIGHEST, int THREAD_PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
                       uint32_t (&words)[THREAD_PACKS], float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  static_assert(
-      FORMAT::group == kInt4Group,
-      "the layouts are a 32-value group's (another is another format)");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
                 "a pack a thread (its quad's group) or a group a thread");
   // THE GROUP'S SIGNED EXTREME as one key, its magnitude's bits above its sign
@@ -1951,13 +1948,13 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P],
   // THE SCALE: the extreme over the lowest level (so the extreme is lowest
   // times it), to fp16, clamped to its range; it carries the extreme's sign.
   scale = static_cast<float>(static_cast<__fp16>(
-      fminf(fmaxf(extreme * (1.0f / FORMAT::lowest), -65504.0f), 65504.0f)));
+      fminf(fmaxf(extreme * (1.0f / LOWEST), -65504.0f), 65504.0f)));
   const float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
   // A PACK'S WORD from its 8 values at the inverse.
   const auto word = [](const float (&v)[P], float inverse) {
     constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q - lowest = 0
-    constexpr float kBias = -FORMAT::lowest;
-    constexpr float kLevels = FORMAT::highest - FORMAT::lowest;
+    constexpr float kBias = -LOWEST;
+    constexpr float kLevels = HIGHEST - LOWEST;
     uint32_t q[P];
 #pragma unroll
     for (int p = 0; p < P / 2; ++p) {
