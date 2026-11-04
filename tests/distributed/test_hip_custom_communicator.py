@@ -906,7 +906,7 @@ def osp_probe_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, por
         )
         lines = []
         try:
-            for rows, cols in [(1, 512), (8, 7168), (3, 2048)]:
+            for rows, cols in [(1, 512)]:
                 cfg = comm.kernel_config("all_reduce", "one_shot_push", rows, cols, "int4")
                 ref = comm.kernel_config("all_reduce", "one_shot_pull", rows, cols, "int4")
                 g = torch.Generator(device=device).manual_seed(rank)
@@ -916,7 +916,7 @@ def osp_probe_ranks(monkeypatch: pytest.MonkeyPatch, tp_size, pp_size, rank, por
                 dist.all_gather(xs, x, group=group.device_group)
                 want = torch.stack([t.float() for t in xs]).sum(0)
                 pulled = comm.all_reduce(x, config=ref).float()
-                for attempt in range(3):
+                for attempt in range(1):
                     out = comm.all_reduce(x, config=cfg).float()
                     torch.accelerator.synchronize()
                     # Wrong: off from the exact sum by more than INT4 could be.

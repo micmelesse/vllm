@@ -599,6 +599,12 @@ DINLINE void read_buffer(
             output[c][i][k][0] = got[c][i][k][0][0];
             output[c][i][k][1] = got[c][i][k][0][2];
           } else if constexpr (QUANTIZE_INT4) {
+            if (blockIdx.x == 0 && threadIdx.x < 2 && i == 0 && k == 0)
+              printf("RECV rank %d tid %d from %d: line_at %u slot_bytes %u "
+                     "got %08x %08x %08x %08x flag %08x\n", rank,
+                     (int)threadIdx.x, c, line_at[i][k], slot_bytes,
+                     got[c][i][k][0][0], got[c][i][k][0][1], got[c][i][k][0][2],
+                     got[c][i][k][0][3], flags[i]);
             dequantize(got[c][i][k][0][0],
                        __builtin_bit_cast(float, got[c][i][k][0][2]),
                        output[c][i][k]);
@@ -1182,6 +1188,11 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         uint32_t at = static_cast<uint32_t>(row) * half * kLineScale +
                       static_cast<uint32_t>(col) * uint32_t{kLineBytes};
         asm volatile("" : "+v"(at));
+        if (QUANTIZE_INT4 && blockIdx.x == 0 && tid < 2 && i == 0 && k == 0)
+          printf("SEND tid %d to slot %d: slot_off %ld at %u words %08x %08x "
+                 "flag %08x kRaw %d kElems %d\n", tid, output_slot,
+                 (long)(slot - reinterpret_cast<char*>(output)), at, words[0],
+                 words[1], flags[i], (int)kRaw, kElems);
 #pragma unroll
         for (int h = 0; h < kLines; ++h)
           __builtin_nontemporal_store(
