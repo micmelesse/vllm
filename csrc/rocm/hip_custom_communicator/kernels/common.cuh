@@ -608,6 +608,17 @@ DINLINE void read_buffer(
             dequantize(got[c][i][k][0][0],
                        __builtin_bit_cast(float, got[c][i][k][0][2]),
                        output[c][i][k]);
+            if (blockIdx.x == 0 && threadIdx.x == 0 && i == 0 && k == 0) {
+              const uint32_t w0 = got[c][i][k][0][0];
+              const float s0 = __builtin_bit_cast(float, got[c][i][k][0][2]);
+              const int sh[8] = {0, 16, 4, 20, 8, 24, 12, 28};
+              printf("PASSED rank %d from %d: word %08x scale %f ref %f %f %f %f\n",
+                     rank, c, w0, s0,
+                     (float(int((w0 >> sh[0]) & 15u)) + kInt4Lowest) * s0,
+                     (float(int((w0 >> sh[1]) & 15u)) + kInt4Lowest) * s0,
+                     (float(int((w0 >> sh[2]) & 15u)) + kInt4Lowest) * s0,
+                     (float(int((w0 >> sh[3]) & 15u)) + kInt4Lowest) * s0);
+            }
             if (blockIdx.x == 0 && threadIdx.x == 0 && i == 0 && k == 0)
               printf("DECODED rank %d from %d: %f %f %f %f %f %f %f %f\n", rank,
                      c, (float)output[c][i][k][0], (float)output[c][i][k][1],
