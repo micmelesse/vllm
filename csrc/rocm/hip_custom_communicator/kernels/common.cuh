@@ -1782,6 +1782,8 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
+namespace internal {
+
 template <int LOWEST, int HIGHEST, typename U, int P>
 DINLINE void dequantize_word(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P == 8, "a word is 8 values");
@@ -1853,12 +1855,14 @@ DINLINE float encoded_scale(uint32_t bits) {
   return scale;
 }
 
+}  // namespace internal
+
 // DEQUANTIZE: an encoded pack's 8 values (fp32, or rounded once to a 16-bit
 // dtype).
 template <int LOWEST, int HIGHEST, typename U, int P>
 DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]) {
-  dequantize_word<LOWEST, HIGHEST>(encoded[0], encoded_scale(encoded[1]),
-                                   output);
+  internal::dequantize_word<LOWEST, HIGHEST>(
+      encoded[0], internal::encoded_scale(encoded[1]), output);
 }
 
 // DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: raw INT4 registers of every slot
@@ -1882,7 +1886,7 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
   // always was).
   const auto scale_of = [&](int w, int k) {
     if constexpr (K == kInt4GroupPacks)
-      return encoded_scale(words[w][0][0][1]);
+      return internal::encoded_scale(words[w][0][0][1]);
     else
       return encoded_scale(
           words[w][0][k / kInt4GroupPacks * kInt4GroupPacks][1]);
@@ -1897,9 +1901,10 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
 #pragma unroll
       for (; w + 1 < SLOTS; w += 2) {
         float a[P], b[P];
-        dequantize_word<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
-        dequantize_word<LOWEST, HIGHEST>(words[w + 1][0][k][0],
-                                         scale_of(w + 1, k), b);
+        internal::dequantize_word<LOWEST, HIGHEST>(words[w][0][k][0],
+                                                   scale_of(w, k), a);
+        internal::dequantize_word<LOWEST, HIGHEST>(words[w + 1][0][k][0],
+                                                   scale_of(w + 1, k), b);
 #pragma unroll
         for (int j = 0; j < P; ++j)
           sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -1916,7 +1921,8 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
 #pragma unroll
     for (; w < SLOTS; ++w) {
       float a[P];
-      dequantize_word<LOWEST, HIGHEST>(words[w][0][k][0], scale_of(w, k), a);
+      internal::dequantize_word<LOWEST, HIGHEST>(words[w][0][k][0],
+                                                 scale_of(w, k), a);
 #pragma unroll
       for (int j = 0; j < P; ++j)
         sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
@@ -1949,6 +1955,8 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
+namespace internal {
+
 template <int LOWEST, int HIGHEST, int THREAD_PACKS, typename T, int P>
 DINLINE void quantize_words(const T (&input)[THREAD_PACKS][P],
                             uint32_t (&words)[THREAD_PACKS], float& scale) {
@@ -2017,6 +2025,8 @@ DINLINE void quantize_words(const T (&input)[THREAD_PACKS][P],
   for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
 }
 
+}  // namespace internal
+
 // QUANTIZE: a pack a thread (its quad's group, PACKS 1) or a group a thread
 // (PACKS kInt4GroupPacks), encoded: each pack's word and its group's scale's
 // fp16 bits.
@@ -2025,7 +2035,7 @@ DINLINE void quantize(const T (&input)[PACKS][P],
                       uint32_t (&encoded)[PACKS][2]) {
   uint32_t words[PACKS];
   float scale;
-  quantize_words<LOWEST, HIGHEST>(input, words, scale);
+  internal::quantize_words<LOWEST, HIGHEST>(input, words, scale);
   const uint32_t bits =
       __builtin_bit_cast(uint16_t, static_cast<__fp16>(scale));
 #pragma unroll
