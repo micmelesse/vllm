@@ -253,6 +253,145 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&encoded)[1][K][2]);
 
 namespace internal {
 
+template <int LOWEST, int HIGHEST, typename U, int P>
+DINLINE void dequantize_word(uint32_t word, float scale, U (&output)[P]) {
+  static_assert(P == 8, "a word is 8 values");
+  static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
+                "fp32 terms or a 16-bit dtype");
+  const float scale16 = scale * 0.0625f;
+  // (q - lowest) * scale from the word's 1024 + q (and, the high nibbles,
+  // 64 + q / 16): the lowest level's bias in each.
+  const float bias = scale * -(1024.0f - LOWEST);
+  const float bias16 = scale * -(64.0f - LOWEST);
+  float term[P];
+  uint32_t p0, p1, p2, p3;
+  asm volatile(
+      "v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
+      "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
+      "v_lshrrev_b32 %[p2], 8, %[w]\n\t"
+      "v_and_or_b32 %[p3], %[p2], %[m1], %[magic]\n\t"
+      "v_and_or_b32 %[p2], %[p2], %[m0], %[magic]\n\t"
+      "v_fma_mix_f32 %[t0], %[p0], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t1], %[p0], %[s], %[b] op_sel:[1,0,0] "
+      "op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t2], %[p1], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t3], %[p1], %[s16], %[b16] op_sel:[1,0,0] "
+      "op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t4], %[p2], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t5], %[p2], %[s], %[b] op_sel:[1,0,0] "
+      "op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t6], %[p3], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t7], %[p3], %[s16], %[b16] op_sel:[1,0,0] "
+      "op_sel_hi:[1,0,0]"
+      : [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2), [p3] "=&v"(p3),
+        [t0] "=&v"(term[0]), [t1] "=&v"(term[1]), [t2] "=&v"(term[2]),
+        [t3] "=&v"(term[3]), [t4] "=&v"(term[4]), [t5] "=&v"(term[5]),
+        [t6] "=&v"(term[6]), [t7] "=&v"(term[7])
+      : [w] "v"(word), [m0] "s"(0x000F000Fu), [m1] "s"(0x00F000F0u),
+        [magic] "v"(0x64006400u), [s] "v"(scale), [b] "v"(bias),
+        [s16] "v"(scale16), [b16] "v"(bias16));
+  if constexpr (std::is_same_v<U, float>) {
+#pragma unroll
+    for (int j = 0; j < P; ++j) output[j] = term[j];
+  } else {
+    u32x4 packed;
+#pragma unroll
+    for (int w = 0; w < P / 2; ++w) {
+      const float a = term[2 * w], b = term[2 * w + 1];
+      if constexpr (kBf16<U>)
+        packed[w] = __builtin_bit_cast(
+            uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
+      else
+        packed[w] = static_cast<uint32_t>(
+                        __builtin_bit_cast(uint16_t, static_cast<U>(a))) |
+                    static_cast<uint32_t>(
+                        __builtin_bit_cast(uint16_t, static_cast<U>(b)))
+                        << 16;
+    }
+    __builtin_memcpy(output, &packed, sizeof(packed));
+  }
+}
+
+// AN ENCODED PACK'S SCALE: its fp16 bits, a float. A DEBUG BUILD TRAPS ON ONE
+// THAT IS NOT a finite fp16's bits: whatever else sits there (a word, another
+// field, memory nobody wrote) is caught where it is read, not as wrong sums.
+DINLINE float encoded_scale(uint32_t bits) {
+  const float scale = static_cast<float>(
+      __builtin_bit_cast(__fp16, static_cast<uint16_t>(bits)));
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      ((bits >> 16) != 0 || !__builtin_isfinite(scale)))
+    __builtin_trap();
+  return scale;
+}
+
+template <int LOWEST, int HIGHEST, int THREAD_PACKS, typename T, int P>
+DINLINE void quantize_words(const T (&input)[THREAD_PACKS][P],
+                            uint32_t (&words)[THREAD_PACKS], float& scale) {
+  static_assert(P * 4 == 32, "a pack is one word of 8 values");
+  static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
+                "a pack a thread (its quad's group) or a group a thread");
+  // THE GROUP'S SIGNED EXTREME as one key, its magnitude's bits above its sign
+  // bit: the unsigned max of two keys is the larger magnitude (a tie, the
+  // negative one), so the quad's reduction is the same two DPP max steps.
+  float x[THREAD_PACKS][P];
+  uint32_t key = 0;
+#pragma unroll
+  for (int k = 0; k < THREAD_PACKS; ++k)
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+      x[k][j] = static_cast<float>(input[k][j]);
+      const uint32_t bits = __builtin_bit_cast(uint32_t, x[k][j]);
+      key = max(key, (bits << 1) | (bits >> 31));
+    }
+  if constexpr (THREAD_PACKS == 1) {
+    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(key), 0xb1, 0xf, 0xf, false)));
+    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(key), 0x4e, 0xf, 0xf, false)));
+  }
+  const float extreme = __builtin_bit_cast(float, (key >> 1) | (key << 31));
+  // THE SCALE: the extreme over the lowest level (so the extreme is lowest
+  // times it), to fp16, clamped to its range; it carries the extreme's sign.
+  scale = static_cast<float>(static_cast<__fp16>(
+      fminf(fmaxf(extreme * (1.0f / LOWEST), -65504.0f), 65504.0f)));
+  const float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
+  // A PACK'S WORD from its 8 values at the inverse.
+  const auto word = [](const float (&v)[P], float inverse) {
+    constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q - lowest = 0
+    constexpr float kBias = -LOWEST;
+    constexpr float kLevels = HIGHEST - LOWEST;
+    uint32_t q[P];
+#pragma unroll
+    for (int p = 0; p < P / 2; ++p) {
+#pragma clang fp contract(off)
+      const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
+                      f32x2{kLowest + kBias, kLowest + kBias};
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+        q[2 * p + e] = __builtin_bit_cast(
+            uint32_t,
+            __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + kLevels));
+    }
+    // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2
+    // (QUANTIZE_INT4's layout)
+    const auto nibbles = [](uint32_t high, uint32_t low) {
+      uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift
+                      // and an or)
+      asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
+      return byte;
+    };
+    const uint32_t even_low = nibbles(q[2], q[0]),
+                   even_high = nibbles(q[6], q[4]);
+    const uint32_t odd_low = nibbles(q[3], q[1]),
+                   odd_high = nibbles(q[7], q[5]);
+    return __builtin_amdgcn_perm(
+        __builtin_amdgcn_perm(odd_high, odd_low, 0x0c0c0400u),
+        __builtin_amdgcn_perm(even_high, even_low, 0x0c0c0400u), 0x05040100u);
+  };
+#pragma unroll
+  for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
+}
+
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size`
 // entries: a region's addresses, a launch's inputs), `r` THE SAME ACROSS THE
 // WAVE (a constant, or a per-wave rank: read from the first lane, the compiler
@@ -1782,80 +1921,6 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where
 // each element's own conversion was one with a zero half, then a shift and an
 // or (12 instructions a pack, not 4; ISA 2026-10-16T02-01-12Z).
-namespace internal {
-
-template <int LOWEST, int HIGHEST, typename U, int P>
-DINLINE void dequantize_word(uint32_t word, float scale, U (&output)[P]) {
-  static_assert(P == 8, "a word is 8 values");
-  static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
-                "fp32 terms or a 16-bit dtype");
-  const float scale16 = scale * 0.0625f;
-  // (q - lowest) * scale from the word's 1024 + q (and, the high nibbles,
-  // 64 + q / 16): the lowest level's bias in each.
-  const float bias = scale * -(1024.0f - LOWEST);
-  const float bias16 = scale * -(64.0f - LOWEST);
-  float term[P];
-  uint32_t p0, p1, p2, p3;
-  asm volatile(
-      "v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
-      "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
-      "v_lshrrev_b32 %[p2], 8, %[w]\n\t"
-      "v_and_or_b32 %[p3], %[p2], %[m1], %[magic]\n\t"
-      "v_and_or_b32 %[p2], %[p2], %[m0], %[magic]\n\t"
-      "v_fma_mix_f32 %[t0], %[p0], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t1], %[p0], %[s], %[b] op_sel:[1,0,0] "
-      "op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t2], %[p1], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t3], %[p1], %[s16], %[b16] op_sel:[1,0,0] "
-      "op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t4], %[p2], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t5], %[p2], %[s], %[b] op_sel:[1,0,0] "
-      "op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t6], %[p3], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t7], %[p3], %[s16], %[b16] op_sel:[1,0,0] "
-      "op_sel_hi:[1,0,0]"
-      : [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2), [p3] "=&v"(p3),
-        [t0] "=&v"(term[0]), [t1] "=&v"(term[1]), [t2] "=&v"(term[2]),
-        [t3] "=&v"(term[3]), [t4] "=&v"(term[4]), [t5] "=&v"(term[5]),
-        [t6] "=&v"(term[6]), [t7] "=&v"(term[7])
-      : [w] "v"(word), [m0] "s"(0x000F000Fu), [m1] "s"(0x00F000F0u),
-        [magic] "v"(0x64006400u), [s] "v"(scale), [b] "v"(bias),
-        [s16] "v"(scale16), [b16] "v"(bias16));
-  if constexpr (std::is_same_v<U, float>) {
-#pragma unroll
-    for (int j = 0; j < P; ++j) output[j] = term[j];
-  } else {
-    u32x4 packed;
-#pragma unroll
-    for (int w = 0; w < P / 2; ++w) {
-      const float a = term[2 * w], b = term[2 * w + 1];
-      if constexpr (kBf16<U>)
-        packed[w] = __builtin_bit_cast(
-            uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
-      else
-        packed[w] = static_cast<uint32_t>(
-                        __builtin_bit_cast(uint16_t, static_cast<U>(a))) |
-                    static_cast<uint32_t>(
-                        __builtin_bit_cast(uint16_t, static_cast<U>(b)))
-                        << 16;
-    }
-    __builtin_memcpy(output, &packed, sizeof(packed));
-  }
-}
-
-// AN ENCODED PACK'S SCALE: its fp16 bits, a float. A DEBUG BUILD TRAPS ON ONE
-// THAT IS NOT a finite fp16's bits: whatever else sits there (a word, another
-// field, memory nobody wrote) is caught where it is read, not as wrong sums.
-DINLINE float encoded_scale(uint32_t bits) {
-  const float scale = static_cast<float>(
-      __builtin_bit_cast(__fp16, static_cast<uint16_t>(bits)));
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      ((bits >> 16) != 0 || !__builtin_isfinite(scale)))
-    __builtin_trap();
-  return scale;
-}
-
-}  // namespace internal
 
 // DEQUANTIZE: an encoded pack's 8 values (fp32, or rounded once to a 16-bit
 // dtype).
@@ -1888,7 +1953,7 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
     if constexpr (K == kInt4GroupPacks)
       return internal::encoded_scale(words[w][0][0][1]);
     else
-      return encoded_scale(
+      return internal::encoded_scale(
           words[w][0][k / kInt4GroupPacks * kInt4GroupPacks][1]);
   };
 #pragma unroll
@@ -1955,77 +2020,6 @@ DINLINE void dequantize(const uint32_t (&encoded)[SLOTS][1][K][2],
 // element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word,
 // and two v_perm_b32 gather the even elements' bytes and the odd ones' (7
 // instructions a word, where a shift and an OR an element was 16).
-namespace internal {
-
-template <int LOWEST, int HIGHEST, int THREAD_PACKS, typename T, int P>
-DINLINE void quantize_words(const T (&input)[THREAD_PACKS][P],
-                            uint32_t (&words)[THREAD_PACKS], float& scale) {
-  static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
-                "a pack a thread (its quad's group) or a group a thread");
-  // THE GROUP'S SIGNED EXTREME as one key, its magnitude's bits above its sign
-  // bit: the unsigned max of two keys is the larger magnitude (a tie, the
-  // negative one), so the quad's reduction is the same two DPP max steps.
-  float x[THREAD_PACKS][P];
-  uint32_t key = 0;
-#pragma unroll
-  for (int k = 0; k < THREAD_PACKS; ++k)
-#pragma unroll
-    for (int j = 0; j < P; ++j) {
-      x[k][j] = static_cast<float>(input[k][j]);
-      const uint32_t bits = __builtin_bit_cast(uint32_t, x[k][j]);
-      key = max(key, (bits << 1) | (bits >> 31));
-    }
-  if constexpr (THREAD_PACKS == 1) {
-    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(key), 0xb1, 0xf, 0xf, false)));
-    key = max(key, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(key), 0x4e, 0xf, 0xf, false)));
-  }
-  const float extreme = __builtin_bit_cast(float, (key >> 1) | (key << 31));
-  // THE SCALE: the extreme over the lowest level (so the extreme is lowest
-  // times it), to fp16, clamped to its range; it carries the extreme's sign.
-  scale = static_cast<float>(static_cast<__fp16>(
-      fminf(fmaxf(extreme * (1.0f / LOWEST), -65504.0f), 65504.0f)));
-  const float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
-  // A PACK'S WORD from its 8 values at the inverse.
-  const auto word = [](const float (&v)[P], float inverse) {
-    constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q - lowest = 0
-    constexpr float kBias = -LOWEST;
-    constexpr float kLevels = HIGHEST - LOWEST;
-    uint32_t q[P];
-#pragma unroll
-    for (int p = 0; p < P / 2; ++p) {
-#pragma clang fp contract(off)
-      const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
-                      f32x2{kLowest + kBias, kLowest + kBias};
-#pragma unroll
-      for (int e = 0; e < 2; ++e)
-        q[2 * p + e] = __builtin_bit_cast(
-            uint32_t,
-            __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + kLevels));
-    }
-    // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2
-    // (QUANTIZE_INT4's layout)
-    const auto nibbles = [](uint32_t high, uint32_t low) {
-      uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift
-                      // and an or)
-      asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
-      return byte;
-    };
-    const uint32_t even_low = nibbles(q[2], q[0]),
-                   even_high = nibbles(q[6], q[4]);
-    const uint32_t odd_low = nibbles(q[3], q[1]),
-                   odd_high = nibbles(q[7], q[5]);
-    return __builtin_amdgcn_perm(
-        __builtin_amdgcn_perm(odd_high, odd_low, 0x0c0c0400u),
-        __builtin_amdgcn_perm(even_high, even_low, 0x0c0c0400u), 0x05040100u);
-  };
-#pragma unroll
-  for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
-}
-
-}  // namespace internal
 
 // QUANTIZE: a pack a thread (its quad's group, PACKS 1) or a group a thread
 // (PACKS kInt4GroupPacks), encoded: each pack's word and its group's scale's
