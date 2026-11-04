@@ -599,8 +599,12 @@ DINLINE void read_buffer(
             output[c][i][k][0] = got[c][i][k][0][0];
             output[c][i][k][1] = got[c][i][k][0][2];
           } else if constexpr (QUANTIZE_INT4) {
-            dequantize(got[c][i][k][0][0],
-                       __builtin_bit_cast(float, got[c][i][k][0][2]),
+            // THE LINE'S TWO DATA WORDS copied out whole, as the exact payload's
+            // are: the scale taken as an element of the loaded vector was the
+            // word's bits in a pushed one-shot's build.
+            uint32_t words[4];
+            __builtin_memcpy(words, &got[c][i][k][0], sizeof(words));
+            dequantize(words[0], __builtin_bit_cast(float, words[2]),
                        output[c][i][k]);
           } else {
             uint32_t words[2 * kLines];
