@@ -709,6 +709,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         prefix_delta: torch.Tensor | None = None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
@@ -717,7 +718,7 @@ class KimiDecoderLayer(nn.Module):
         if self.use_attn_residuals:
             assert residual is not None
             return self.forward_attn_residual(
-                positions, hidden_states, residual, prefix_delta
+                positions, hidden_states, residual, prefix_delta, aux_hidden_states
             )
 
         assert prefix_delta is None
@@ -741,6 +742,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
         prefix_delta: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
         attention_quant_key = (
@@ -761,7 +763,10 @@ class KimiDecoderLayer(nn.Module):
                 self.prev_valid_blocks,
                 self.block_write_idx if self.is_block_write_layer else -1,
             )
+            if aux_hidden_states is not None:
+                aux_hidden_states.append(prefix_sum)
         else:
+            assert aux_hidden_states is None
             hidden_states = _apply_attn_res(
                 prefix_sum,
                 block_residual,
@@ -825,9 +830,6 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum, block_residual, hidden_states
 
 
-_AUX_HIDDEN_STATE_METHODS = ("eagle3", "extract_hidden_states", "dflash", "dspark")
-
-
 def _fused_communicator(
     config: KimiLinearConfig, vllm_config: VllmConfig
 ) -> HipCustomCommunicator | None:
@@ -842,7 +844,6 @@ def _fused_communicator(
 
     kda_config = config.linear_attn_config
     parallel = vllm_config.parallel_config
-    speculative = vllm_config.speculative_config
     tp_size = get_tensor_model_parallel_world_size()
     latent_width = getattr(config, "routed_expert_hidden_size", None)
     latent = latent_width is not None
@@ -873,32 +874,45 @@ def _fused_communicator(
         )
         for rows in (1, communicator.arguments.max_rows)
     )
-    why = (
-        "the model has no AttnRes"
-        if config.attn_res_block_size is None
-        else "Kimi-Linear's delta attention reduces its own output"
-        if kda_config is not None and not kda_config.get("use_full_rank_gate", False)
-        else "a pipeline split passes the reduced sum"
-        if get_pp_group().world_size != 1
-        else "the speculative method captures hidden states, which must be whole"
-        if speculative is not None and speculative.method in _AUX_HIDDEN_STATE_METHODS
-        else "the specialized decode's layers take and return a reduced delta"
-        if decode_backend(vllm_config) == SPECIALIZED
-        else "expert parallelism reduces the MoE's output itself"
-        if parallel.enable_expert_parallel or parallel.use_sequence_parallel_moe
-        else "the latent MoE reduces its output early (its up-projection unsharded)"
-        if latent
-        and (
-            config.num_shared_experts is None
-            or config.routed_scaling_factor != 1.0
-            or config.hidden_size % tp_size != 0
+    reasons = [
+        why
+        for unfused, why in (
+            (config.attn_res_block_size is None, "the model has no AttnRes"),
+            (
+                kda_config is not None
+                and not kda_config.get("use_full_rank_gate", False),
+                "Kimi-Linear's delta attention reduces its own output",
+            ),
+            (
+                get_pp_group().world_size != 1,
+                "a pipeline split passes the reduced sum",
+            ),
+            (
+                decode_backend(vllm_config) == SPECIALIZED,
+                "the specialized decode's layers take and return a reduced delta",
+            ),
+            (
+                parallel.enable_expert_parallel or parallel.use_sequence_parallel_moe,
+                "expert parallelism reduces the MoE's output itself",
+            ),
+            (
+                latent
+                and (
+                    config.num_shared_experts is None
+                    or config.routed_scaling_factor != 1.0
+                    or config.hidden_size % tp_size != 0
+                ),
+                "the latent MoE reduces its output early (its up-projection unsharded)",
+            ),
+            (
+                not admitted,
+                f"the communicator does not run every fused call at {dtype}",
+            ),
         )
-        else f"the communicator does not run every fused call at {dtype}"
-        if not admitted
-        else None
-    )
-    if why is not None:
-        logger.info("Kimi-K3 keeps its all-reduces unfused: %s", why)
+        if unfused
+    ]
+    if reasons:
+        logger.info("Kimi-K3 keeps its all-reduces unfused: %s", "; ".join(reasons))
         return None
     return communicator
 
@@ -922,6 +936,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         fused_communicator = _fused_communicator(config, vllm_config)
+        self.fused = fused_communicator is not None
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(
@@ -1066,10 +1081,23 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             start=self.start_layer,
         ):
             kernel = step.layer(layer_idx) if step is not None else None
-            hidden_states, residual, prefix_delta = (kernel or layer)(
-                positions, hidden_states, residual, prefix_delta
+            # Fused, the MoE output is reduced only inside the next layer, so
+            # that layer captures the hidden state at its input.
+            in_layer = (
+                self.fused
+                and layer_idx != self.start_layer
+                and layer_idx in self.aux_hidden_state_layers
             )
-            if (layer_idx + 1) in self.aux_hidden_state_layers:
+            hidden_states, residual, prefix_delta = (kernel or layer)(
+                positions,
+                hidden_states,
+                residual,
+                prefix_delta,
+                **({"aux_hidden_states": aux_hidden_states} if in_layer else {}),
+            )
+            if (layer_idx + 1) in self.aux_hidden_state_layers and (
+                not self.fused or layer_idx + 1 == self.end_layer
+            ):
                 self._maybe_add_hidden_state(
                     aux_hidden_states,
                     layer_idx + 1,
