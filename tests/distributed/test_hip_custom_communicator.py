@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 HIDDEN = 7168
-NUM_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 512, 2048]
+NUM_TOKENS = [1, 2, 4, 6, 8, 16, 24, 32, 48, 64, 128, 512, 2048]
 MAX_TOKENS = 2048
 DTYPES = [torch.bfloat16, torch.float16]
 EPS = 1e-5
@@ -333,6 +333,75 @@ def test_all_reduce_add_attn_res_rms_norm_correctness(
                     _compare(got_out, want_out, used, where)
                     _compare(got_prefix, want_prefix, used, where)
                     _compare(got_blocks, want_blocks, used, where)
+
+        if comm.arguments.quantization != "exact":
+            return
+        for rows in [1, 24, 2048]:
+            g = torch.Generator(device=device).manual_seed(rank)
+            deltas = [
+                torch.randint(-8, 8, (rows, HIDDEN), generator=g, device=device).to(
+                    dtype
+                )
+                for _ in range(8)
+            ]
+            g.manual_seed(0)
+            prefix = torch.randint(-8, 8, (rows, HIDDEN), generator=g, device=device)
+            prefix = prefix.to(dtype)
+            blocks = torch.randint(
+                -8, 8, (rows, 10, HIDDEN), generator=g, device=device
+            ).to(dtype)
+            norm_weight = torch.empty(HIDDEN, dtype=dtype, device=device)
+            norm_weight.normal_(mean=1.0, std=0.1, generator=g)
+            qk_weight = torch.empty(HIDDEN, dtype=dtype, device=device)
+            qk_weight.normal_(mean=0.0, std=0.1, generator=g)
+            out_weight = torch.empty(HIDDEN, dtype=dtype, device=device)
+            out_weight.normal_(mean=1.0, std=0.1, generator=g)
+
+            want_prefix, want_blocks = prefix.clone(), blocks.clone()
+            got_prefix, got_blocks = prefix.clone(), blocks.clone()
+            valid = 2
+            for layer, delta in enumerate(deltas):
+                write_index = valid if layer % 3 == 2 else -1
+                summed = delta.clone()
+                dist.all_reduce(summed, group=group.device_group)
+                if want_prefix is None:
+                    want_prefix, want_delta = summed.clone(), None
+                else:
+                    want_delta = summed
+                want_out = attn_res(
+                    want_prefix,
+                    want_delta,
+                    want_blocks,
+                    norm_weight,
+                    qk_weight,
+                    out_weight,
+                    valid,
+                    write_index,
+                    ATTN_RES_EPS,
+                    EPS,
+                )
+                got_prefix, got_out = comm.all_reduce_add_attn_res_rms_norm(
+                    delta,
+                    got_prefix,
+                    got_blocks,
+                    norm_weight,
+                    qk_weight,
+                    out_weight,
+                    valid,
+                    write_index,
+                    ATTN_RES_EPS,
+                    EPS,
+                )
+                used = comm.tuned(
+                    "all_reduce_add_attn_res_rms_norm", rows, HIDDEN, None
+                )
+                where = ("chain", rows, layer)
+                _compare(got_out, want_out, used, where)
+                _compare(got_prefix, want_prefix, used, where)
+                _compare(got_blocks, want_blocks, used, where)
+                if write_index >= 0:
+                    want_prefix = got_prefix = None
+                    valid += 1
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 
@@ -648,17 +717,39 @@ def test_hip_custom_communicator_refusal(monkeypatch):
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("quantization", QUANTIZATIONS)
 def test_hip_custom_communicator_routing(monkeypatch, tp_size, quantization):
-    """The tuned table picks a config for every op at both ends of the arena."""
+    """Every row count up to max_rows is admitted and has a tuned config."""
 
     def body(comm, group, device, rank):
-        for op, residual in [
-            ("all_reduce", None),
-            ("all_reduce_add_rms_norm", False),
-            ("all_reduce_add_rms_norm", True),
-            ("all_reduce_add_attn_res_rms_norm", None),
-        ]:
-            for rows in [1, MAX_TOKENS]:
-                assert comm.tuned(op, rows, HIDDEN, residual) is not None, (op, rows)
+        dtype = torch.bfloat16
+        x = torch.zeros(MAX_TOKENS, HIDDEN, dtype=dtype, device=device)
+        residual = torch.zeros(MAX_TOKENS, HIDDEN, dtype=dtype, device=device)
+        prefix = torch.zeros(MAX_TOKENS, HIDDEN, dtype=dtype, device=device)
+        blocks = torch.zeros(MAX_TOKENS, 10, HIDDEN, dtype=dtype, device=device)
+        weight = torch.ones(HIDDEN, dtype=dtype, device=device)
+        for rows in range(1, MAX_TOKENS + 1):
+            assert comm.should_allreduce(x[:rows]), rows
+            assert comm.should_allreduce_add_rms_norm(x[:rows], weight), rows
+            assert comm.should_allreduce_add_rms_norm(
+                x[:rows], weight, residual[:rows]
+            ), rows
+            assert comm.should_allreduce_add_attn_res_rms_norm(
+                x[:rows],
+                prefix[:rows],
+                blocks[:rows],
+                weight,
+                weight,
+                weight,
+                NUM_BLOCKS,
+                -1,
+            ), rows
+            for op, with_residual in [
+                ("all_reduce", None),
+                ("all_reduce_add_rms_norm", False),
+                ("all_reduce_add_rms_norm", True),
+                ("all_reduce_add_attn_res_rms_norm", None),
+            ]:
+                config = comm.tuned(op, rows, HIDDEN, with_residual)
+                assert config is not None, (op, rows)
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 

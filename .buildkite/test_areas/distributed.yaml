@@ -912,6 +912,11 @@ steps:
   - vllm/distributed/device_communicators/cuda_communicator.py
   - vllm/distributed/parallel_state.py
   - vllm/platforms/rocm.py
+  - vllm/models/kimi_k3/amd/linear.py
   - tests/distributed/test_hip_custom_communicator.py
+  - tests/models/kimi_k3/test_amd_fused_all_reduce.py
   commands:
-  - pytest -v -s tests/distributed/test_hip_custom_communicator.py
+  - >-
+    pytest -v -s
+    tests/distributed/test_hip_custom_communicator.py
+    tests/models/kimi_k3/test_amd_fused_all_reduce.py
