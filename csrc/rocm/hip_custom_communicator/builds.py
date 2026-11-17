@@ -9,6 +9,7 @@ from pathlib import Path
 
 FIELDS = (
     "algorithm",
+    "protocol",
     "block_x",
     "block_y",
     "block_z",
@@ -27,6 +28,7 @@ WEIGHT_DTYPE = "f32"
 CPP_TYPES = {"f16": "c10::Half", "bf16": "c10::BFloat16", "f32": "float"}
 SCALAR_TYPES = {"f16": "Half", "bf16": "BFloat16", "f32": "Float"}
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
+PROTOCOLS = {"simple": "Protocol::simple", "ll": "Protocol::ll"}
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormKernelAlgorithm",
@@ -39,8 +41,8 @@ SPLIT_ROWS = {
     "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
 }
 TEMPLATE_ARGS = {
-    "all_reduce": "algorithm quantize_int4 T world tile_m tile_n block_x wave_size "
-    "pack_bytes waves_per_eu contiguous tail",
+    "all_reduce": "algorithm protocol quantize_int4 T world tile_m tile_n block_x "
+    "wave_size pack_bytes waves_per_eu contiguous tail",
     "all_reduce_add_rms_norm": "algorithm residual quantize_int4 T W world tile_m "
     "tile_n block_x wave_size pack_bytes waves_per_eu chunked tail",
     "all_reduce_add_attn_res_rms_norm": "algorithm quantize_int4 T world tile_m "
@@ -69,6 +71,7 @@ class Command:
 class Build:
     kernel: str
     algorithm: str
+    protocol: str
     block_x: int
     block_y: int
     block_z: int
@@ -81,7 +84,8 @@ class Build:
 
     def file_name(self) -> str:
         return (
-            f"hip_custom_communicator_{self.kernel}_{self.algorithm}__{self.block_x}x"
+            f"hip_custom_communicator_{self.kernel}_{self.algorithm}_{self.protocol}__"
+            f"{self.block_x}x"
             f"{self.block_y}x{self.block_z}_w{self.waves_per_eu}_t{self.tile_m}x"
             f"{self.tile_n}x{self.tile_k}_{self.quantization}_p{self.pack_bytes}.hip"
         )
@@ -104,6 +108,7 @@ class Instance:
         b = self.build
         value = {
             "algorithm": f"{ALGORITHM_ENUMS[b.kernel]}::{b.algorithm}",
+            "protocol": PROTOCOLS[b.protocol],
             "quantize_int4": str(self.quantize_int4).lower(),
             "T": CPP_TYPES[self.dtype],
             "W": CPP_TYPES[self.weight_dtype],
@@ -149,14 +154,19 @@ def config_builds(config: dict) -> list[Build]:
     fields = {
         f: config.get(f"{second}_{f}", 1)
         for f in FIELDS
-        if f not in ("algorithm", "quantization")
+        if f not in ("algorithm", "protocol", "quantization")
     }
     return [
         Build("all_reduce", *(body[f] for f in FIELDS)),
         Build(
             second,
             *(
-                {**fields, "algorithm": "rows", "quantization": "exact"}[f]
+                {
+                    **fields,
+                    "algorithm": "rows",
+                    "protocol": "simple",
+                    "quantization": "exact",
+                }[f]
                 for f in FIELDS
             ),
         ),
@@ -254,6 +264,7 @@ def emit(generated: list[Generated], out: Path) -> None:
             b = i.build
             tables.append(
                 f"    {{.algorithm = {ALGORITHM_ENUMS[kernel]}::{b.algorithm}, "
+                f".protocol = {PROTOCOLS[b.protocol]}, "
                 f".block_x = {b.block_x}, .block_y = {b.block_y}, "
                 f".block_z = {b.block_z}, .waves_per_eu = {b.waves_per_eu}, "
                 f".tile_m = {b.tile_m}, .tile_n = {b.tile_n}, .tile_k = {b.tile_k}, "

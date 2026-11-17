@@ -148,8 +148,8 @@ def test_all_reduce_correctness(monkeypatch, tp_size, quantization):
 
                 q = comm.arguments.quantization
                 forced = [
-                    comm.kernel_config("all_reduce", a, rows, HIDDEN, q)
-                    for a in AllReduceConfig.algorithms
+                    comm.kernel_config("all_reduce", a, p, rows, HIDDEN, q)
+                    for a, p in AllReduceConfig.algorithm_protocols
                 ]
                 for config in [None, *(c for c in forced if c is not None)]:
                     try:
@@ -203,9 +203,9 @@ def test_all_reduce_add_rms_norm_correctness(monkeypatch, tp_size, quantization)
                     q = comm.arguments.quantization
                     forced = [
                         comm.kernel_config(
-                            "all_reduce_add_rms_norm", a, rows, HIDDEN, q
+                            "all_reduce_add_rms_norm", a, p, rows, HIDDEN, q
                         )
-                        for a in AllReduceAddRmsNormConfig.algorithms
+                        for a, p in AllReduceAddRmsNormConfig.algorithm_protocols
                     ]
                     for config in [None, *(c for c in forced if c is not None)]:
                         got = comm.all_reduce_add_rms_norm(
@@ -287,9 +287,9 @@ def test_all_reduce_add_attn_res_rms_norm_correctness(
                 q = comm.arguments.quantization
                 forced = [
                     comm.kernel_config(
-                        "all_reduce_add_attn_res_rms_norm", a, rows, HIDDEN, q
+                        "all_reduce_add_attn_res_rms_norm", a, p, rows, HIDDEN, q
                     )
-                    for a in AllReduceAddAttnResRmsNormConfig.algorithms
+                    for a, p in AllReduceAddAttnResRmsNormConfig.algorithm_protocols
                 ]
                 for config in [None, *(c for c in forced if c is not None)]:
                     got_blocks = blocks.clone()
@@ -509,31 +509,32 @@ def test_hip_custom_communicator_independence(monkeypatch, tp_size, quantization
                 qk_weight.normal_(mean=0.0, std=0.1, generator=g)
 
                 for variant, op, algorithms in [
-                    ("all_reduce", "all_reduce", AllReduceConfig.algorithms),
+                    ("all_reduce", "all_reduce", AllReduceConfig.algorithm_protocols),
                     (
                         "rms_norm",
                         "all_reduce_add_rms_norm",
-                        AllReduceAddRmsNormConfig.algorithms,
+                        AllReduceAddRmsNormConfig.algorithm_protocols,
                     ),
                     (
                         "add_rms_norm",
                         "all_reduce_add_rms_norm",
-                        AllReduceAddRmsNormConfig.algorithms,
+                        AllReduceAddRmsNormConfig.algorithm_protocols,
                     ),
                     (
                         "attn_res",
                         "all_reduce_add_attn_res_rms_norm",
-                        AllReduceAddAttnResRmsNormConfig.algorithms,
+                        AllReduceAddAttnResRmsNormConfig.algorithm_protocols,
                     ),
                     (
                         "attn_res_block_write",
                         "all_reduce_add_attn_res_rms_norm",
-                        AllReduceAddAttnResRmsNormConfig.algorithms,
+                        AllReduceAddAttnResRmsNormConfig.algorithm_protocols,
                     ),
                 ]:
                     q = comm.arguments.quantization
                     forced = [
-                        comm.kernel_config(op, a, rows, cols, q) for a in algorithms
+                        comm.kernel_config(op, a, p, rows, cols, q)
+                        for a, p in algorithms
                     ]
                     for config in [None, *(c for c in forced if c is not None)]:
                         answers = []

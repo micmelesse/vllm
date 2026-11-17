@@ -268,7 +268,7 @@ def main() -> None:
                     print(
                         f"{op:<34} {residual!s:>8} {tokens:>6} {ours_p50:>9.2f} "
                         f"{base_p50:>9.2f} {ours_p50 / base_p50:>6.3f}  "
-                        f"{config.algorithm} {config.quantization}"
+                        f"{config.algorithm} {config.protocol} {config.quantization}"
                     )
         finally:
             comm.close()

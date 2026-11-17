@@ -147,7 +147,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                &hip_custom_communicator_close);
   rocm_ops.def(
       "hip_custom_communicator_all_reduce(int state, Tensor input, Tensor! "
-      "output, str algorithm, int grid_x, int grid_y, int grid_z, int block_x, "
+      "output, str algorithm, str protocol, int grid_x, int grid_y, int "
+      "grid_z, int block_x, "
       "int block_y, int block_z, int waves_per_eu, int tile_m, int tile_n, str "
       "quantization, int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA,
@@ -155,7 +156,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "hip_custom_communicator_all_reduce_add_rms_norm(int state,"
       " Tensor input, Tensor? residual, Tensor weight, Tensor! output,"
-      " Tensor!? residual_output, float eps, str algorithm, int grid_x,"
+      " Tensor!? residual_output, float eps, str algorithm, str protocol, int "
+      "grid_x,"
       " int grid_y, int grid_z, int block_x, int block_y, int block_z,"
       " int waves_per_eu, int tile_m, int tile_n, str quantization,"
       " int pack_bytes, int? add_rms_norm_grid_x=None,"
@@ -171,7 +173,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       " Tensor input, Tensor? prefix, Tensor blocks, Tensor norm_weight,"
       " Tensor qk_weight, Tensor? output_norm_weight, Tensor! prefix_output,"
       " Tensor! output, Tensor!? block_output, int num_blocks, float eps,"
-      " float output_eps, str algorithm, int grid_x, int grid_y, int grid_z,"
+      " float output_eps, str algorithm, str protocol, int grid_x, int grid_y, "
+      "int grid_z,"
       " int block_x, int block_y, int block_z, int waves_per_eu, int tile_m,"
       " int tile_n, int tile_k, str quantization, int pack_bytes,"
       " int? add_attn_res_rms_norm_grid_x=None,"

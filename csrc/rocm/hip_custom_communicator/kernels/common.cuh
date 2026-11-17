@@ -101,6 +101,10 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 
 enum class Layout { tile, run, flat, group_run, group_flat, line };
 
+// How a receiver knows a peer's data has arrived. Simple: the data, then a
+// barrier. LL: a flag in every line, half the line payload.
+enum class Protocol { simple, ll };
+
 template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest, typename U,
           int P>
 // An encoded INT4 pack is a word of 8 values and its group's fp16 scale.

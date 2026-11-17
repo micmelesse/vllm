@@ -79,6 +79,8 @@ enum class Error : int {
   exchange_failed = 39,
   peer_not_accessible = 40,
   peers_not_opened = 41,
+  no_such_protocol = 42,
+  protocol_not_supported = 43,
 };
 
 enum class AllReduceAddRmsNormAlgorithm : int {
@@ -88,7 +90,6 @@ enum class AllReduceAddRmsNormAlgorithm : int {
   two_shot_push,
   one_shot_pull_split,
   one_shot_push_split,
-  one_shot_push_staged_split,
   two_shot_pull_split,
   two_shot_push_split,
 };
@@ -99,6 +100,7 @@ enum class AddAttnResRmsNormAlgorithm : int { rows };
 template <typename ALGORITHM>
 struct Instance {
   ALGORITHM algorithm;
+  Protocol protocol;
   int block_x, block_y, block_z, waves_per_eu, tile_m, tile_n, tile_k;
   int quantization, pack_bytes;
   int world, wave_size;
@@ -109,8 +111,8 @@ struct Instance {
 
 template <typename T, typename W>
 using AllReduceKernel =
-    decltype(&all_reduce<AllReduceAlgorithm{}, false, T, 2, 1, 1, 64, 64, 16, 1,
-                         false, false>);
+    decltype(&all_reduce<AllReduceAlgorithm{}, Protocol{}, false, T, 2, 1, 1,
+                         64, 64, 16, 1, false, false>);
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},

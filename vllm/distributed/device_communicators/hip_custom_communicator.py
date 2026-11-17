@@ -43,12 +43,26 @@ Quantization = Literal["exact", "int4"]
 
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
 
+Protocol = Literal["simple", "ll"]
+
+_LL_ALGORITHMS = ("one_shot_push", "one_shot_push_split")
+
+
+def _protocols(algorithm: str) -> tuple[Protocol, ...]:
+    return ("simple", "ll") if algorithm in _LL_ALGORITHMS else ("simple",)
+
+
+def _algorithm_protocols(
+    algorithms: tuple[str, ...],
+) -> tuple[tuple[str, Protocol], ...]:
+    return tuple((a, p) for a in algorithms for p in _protocols(a))
+
+
 AllReduceAlgorithm = Literal[
     "one_shot_pull",
     "one_shot_push",
     "two_shot_pull",
     "two_shot_push",
-    "one_shot_push_staged",
 ]
 
 AllReduceAddRmsNormAlgorithm = Literal[
@@ -58,7 +72,6 @@ AllReduceAddRmsNormAlgorithm = Literal[
     "two_shot_push",
     "one_shot_pull_split",
     "one_shot_push_split",
-    "one_shot_push_staged_split",
     "two_shot_pull_split",
     "two_shot_push_split",
 ]
@@ -70,7 +83,6 @@ AllReduceAddAttnResRmsNormAlgorithm = Literal[
     "two_shot_push",
     "one_shot_pull_split",
     "one_shot_push_split",
-    "one_shot_push_staged_split",
     "two_shot_pull_split",
     "two_shot_push_split",
 ]
@@ -82,10 +94,8 @@ Algorithm = Literal[
     "two_shot_pull_rows",
     "two_shot_pull_columns",
     "two_shot_push",
-    "one_shot_push_staged",
     "one_shot_pull_split",
     "one_shot_push_split",
-    "one_shot_push_staged_split",
     "two_shot_pull_split",
     "two_shot_push_split",
 ]
@@ -123,6 +133,7 @@ _DTYPE_BYTES: Mapping[str, int] = {"bf16": 2, "f16": 2, "fp16": 2, "f32": 4}
 _CONFIG_KEYS = (
     "kernel",
     "algorithm",
+    "protocol",
     "grid_x",
     "grid_y",
     "grid_z",
@@ -208,6 +219,8 @@ class Error(IntEnum):
     exchange_failed = 39
     peer_not_accessible = 40
     peers_not_opened = 41
+    no_such_protocol = 42
+    protocol_not_supported = 43
 
     no_problem_size = 100
     no_tuned_table = 101
@@ -226,6 +239,7 @@ class Error(IntEnum):
 @dataclass(frozen=True)
 class Build:
     algorithm: str
+    protocol: Protocol
     block_x: int
     block_y: int
     block_z: int
@@ -240,6 +254,7 @@ class Build:
     def of(cls, config: "Config") -> "Build":
         return cls(
             algorithm=config.algorithm,
+            protocol=config.protocol,
             block_x=config.block_x,
             block_y=config.block_y,
             block_z=config.block_z,
@@ -256,8 +271,12 @@ class Build:
 class AllReduceConfig:
     kernel: ClassVar[str] = "all_reduce"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAlgorithm)
+    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
+        _algorithm_protocols(get_args(AllReduceAlgorithm))
+    )
     tile_k: ClassVar[int] = 1
     algorithm: AllReduceAlgorithm
+    protocol: Protocol
     grid_x: int
     grid_y: int
     grid_z: int
@@ -275,8 +294,12 @@ class AllReduceConfig:
 class AllReduceAddRmsNormConfig:
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
+    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
+        _algorithm_protocols(get_args(AllReduceAddRmsNormAlgorithm))
+    )
     tile_k: ClassVar[int] = 1
     algorithm: AllReduceAddRmsNormAlgorithm
+    protocol: Protocol
     grid_x: int
     grid_y: int
     grid_z: int
@@ -310,7 +333,11 @@ class AllReduceAddAttnResRmsNormConfig:
     algorithms: ClassVar[tuple[str, ...]] = get_args(
         AllReduceAddAttnResRmsNormAlgorithm
     )
+    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
+        _algorithm_protocols(get_args(AllReduceAddAttnResRmsNormAlgorithm))
+    )
     algorithm: AllReduceAddAttnResRmsNormAlgorithm
+    protocol: Protocol
     grid_x: int
     grid_y: int
     grid_z: int
@@ -416,6 +443,7 @@ class TunedTable:
         self,
         kernel: str,
         algorithm: Algorithm,
+        protocol: Protocol,
         rows: int,
         cols: int,
         quantization: Quantization,
@@ -428,6 +456,7 @@ class TunedTable:
             return (
                 c.kernel == kernel
                 and c.algorithm == algorithm
+                and c.protocol == protocol
                 and c.quantization == moving
                 and replace(Build.of(c), quantization=quantization) in builds
             )
@@ -569,6 +598,15 @@ def _table_of(tables: Any, path: Path, arch: str) -> TunedTable | Error:
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
                 f"{where}: {c['kernel']} has no algorithm {c['algorithm']}",
+            )
+            return Error.tuned_table_unsound
+        if (c["protocol"] not in get_args(Protocol)) or (
+            c["protocol"] not in _protocols(c["algorithm"])
+        ):
+            logger.error(
+                "HipCustomCommunicator open: %s: %s",
+                Error.tuned_table_unsound.name,
+                f"{where}: {c['algorithm']} does not run {c['protocol']}",
             )
             return Error.tuned_table_unsound
         for k in ("algorithm", "tile_k"):
@@ -958,6 +996,7 @@ class HipCustomCommunicator:
             input=input,
             output=output,
             algorithm=config.algorithm,
+            protocol=config.protocol,
             grid_x=config.grid_x,
             grid_y=config.grid_y,
             grid_z=config.grid_z,
@@ -1073,6 +1112,7 @@ class HipCustomCommunicator:
             residual_output=residual_output,
             eps=eps,
             algorithm=config.algorithm,
+            protocol=config.protocol,
             grid_x=config.grid_x,
             grid_y=config.grid_y,
             grid_z=config.grid_z,
@@ -1238,6 +1278,7 @@ class HipCustomCommunicator:
             eps=eps,
             output_eps=output_eps,
             algorithm=config.algorithm,
+            protocol=config.protocol,
             grid_x=config.grid_x,
             grid_y=config.grid_y,
             grid_z=config.grid_z,
@@ -1326,13 +1367,20 @@ class HipCustomCommunicator:
         self,
         kernel: str,
         algorithm: Algorithm,
+        protocol: Protocol,
         rows: int,
         cols: int,
         quantization: Quantization = "exact",
     ) -> Config | None:
         assert self.state is not None, "an open communicator has its state"
         return self.state.tuned_table.kernel_config(
-            kernel, algorithm, rows, cols, quantization, self.arguments.world
+            kernel,
+            algorithm,
+            protocol,
+            rows,
+            cols,
+            quantization,
+            self.arguments.world,
         )
 
     @final

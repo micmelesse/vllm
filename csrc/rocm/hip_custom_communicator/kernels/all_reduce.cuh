@@ -13,7 +13,6 @@ enum class AllReduceAlgorithm {
   one_shot_push,
   two_shot_pull,
   two_shot_push,
-  one_shot_push_staged,
 };
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
@@ -158,7 +157,7 @@ DINLINE void all_reduce_two_shot_pull(
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
           bool TAIL>
-DINLINE void all_reduce_one_shot_push(
+DINLINE void all_reduce_one_shot_push_ll(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
@@ -270,7 +269,7 @@ DINLINE void all_reduce_one_shot_push(
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
           bool TAIL>
-DINLINE void all_reduce_one_shot_push_staged(
+DINLINE void all_reduce_one_shot_push_simple(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
@@ -396,10 +395,10 @@ DINLINE void all_reduce_two_shot_push(
       rank);
 }
 
-template <AllReduceAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
-          int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
-          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CONTIGUOUS,
-          bool TAIL>
+template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
+          typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int WAVES_PER_EU, bool CONTIGUOUS, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -424,6 +423,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
     int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks) {
+  static_assert(PROTOCOL == Protocol::simple ||
+                    ALGORITHM == AllReduceAlgorithm::one_shot_push,
+                "only the one-shot push runs LL");
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
     all_reduce_one_shot_pull<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                              THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
@@ -451,10 +453,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
-  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
-    all_reduce_one_shot_push<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
-                             THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push &&
+                     PROTOCOL == Protocol::ll)
+    all_reduce_one_shot_push_ll<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
+                                THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+                                CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
         unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
@@ -463,8 +466,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         unfenced_epochs_stride_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, status_ptr, status_stride_field,
         status_size_field, rank, timeout_ticks);
-  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push_staged)
-    all_reduce_one_shot_push_staged<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
+    all_reduce_one_shot_push_simple<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                                     THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
                                     CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,

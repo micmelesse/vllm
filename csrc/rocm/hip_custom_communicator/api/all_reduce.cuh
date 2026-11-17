@@ -9,10 +9,10 @@
 
 ErrorCode hip_custom_communicator_all_reduce(
     int64_t state, torch::Tensor& input, torch::Tensor& output,
-    const std::string& algorithm_name, int64_t grid_x, int64_t grid_y,
-    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
-    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
-    const std::string& quantization_name, int64_t pack_bytes) {
+    const std::string& algorithm_name, const std::string& protocol_name,
+    int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_x,
+    int64_t block_y, int64_t block_z, int64_t waves_per_eu, int64_t tile_m,
+    int64_t tile_n, const std::string& quantization_name, int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   using namespace hip_custom_communicator::internal;
 
@@ -55,14 +55,22 @@ ErrorCode hip_custom_communicator_all_reduce(
     algorithm = AllReduceAlgorithm::one_shot_pull;
   else if (algorithm_name == "one_shot_push")
     algorithm = AllReduceAlgorithm::one_shot_push;
-  else if (algorithm_name == "one_shot_push_staged")
-    algorithm = AllReduceAlgorithm::one_shot_push_staged;
   else if (algorithm_name == "two_shot_pull")
     algorithm = AllReduceAlgorithm::two_shot_pull;
   else if (algorithm_name == "two_shot_push")
     algorithm = AllReduceAlgorithm::two_shot_push;
   else
     return error_code(Error::no_such_kernel);
+  Protocol protocol;
+  if (protocol_name == "simple")
+    protocol = Protocol::simple;
+  else if (protocol_name == "ll")
+    protocol = Protocol::ll;
+  else
+    return error_code(Error::no_such_protocol);
+  if (protocol == Protocol::ll &&
+      algorithm != AllReduceAlgorithm::one_shot_push)
+    return error_code(Error::protocol_not_supported);
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";
@@ -116,7 +124,7 @@ ErrorCode hip_custom_communicator_all_reduce(
   const bool tail = quantize_int4 &&
                     (two_shot ? m * n % kInt4Group != 0 : n % kInt4Group != 0);
 
-  if (algorithm == AllReduceAlgorithm::one_shot_push) {
+  if (protocol == Protocol::ll) {
     const int64_t line_pack = std::min<int64_t>(pack_bytes, kLinePayloadBytes);
     const int64_t row_lines =
         quantize_int4 ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
@@ -128,8 +136,8 @@ ErrorCode hip_custom_communicator_all_reduce(
   void* kernel = nullptr;
 
   for (const auto& i : kAllReduceInstances)
-    if (i.algorithm == algorithm && i.block_x == block_x &&
-        i.block_y == block_y && i.block_z == block_z &&
+    if (i.algorithm == algorithm && i.protocol == protocol &&
+        i.block_x == block_x && i.block_y == block_y && i.block_z == block_z &&
         i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
         i.tile_n == tile_n &&
         i.quantization ==
@@ -204,28 +212,29 @@ ErrorCode hip_custom_communicator_all_reduce(
       }
       break;
     case AllReduceAlgorithm::one_shot_push:
-
-      unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
-                             (s.symmetric.unfenced_slot_bytes / e);
-      unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-      unfenced_stride_n = 1;
-      unfenced_size_slot = s.world,
-      unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
-      unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-      break;
-    case AllReduceAlgorithm::one_shot_push_staged: {
-      const int64_t payload =
-          quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
-      const int64_t slot_bytes = quantize_int4
-                                     ? (payload + kInt4ScalesAlign - 1) /
-                                           kInt4ScalesAlign * kInt4ScalesAlign
-                                     : payload;
-      partials_stride_m = 0, partials_size_n = 0;
-      staging_stride_n = 1, staging_size_m = 1,
-      staging_size_n = (s.world * slot_bytes + e - 1) / e;
-      staging_need = s.world * slot_bytes;
-      break;
-    }
+      if (protocol == Protocol::ll) {
+        unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
+                               (s.symmetric.unfenced_slot_bytes / e);
+        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+        unfenced_stride_n = 1;
+        unfenced_size_slot = s.world,
+        unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
+        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
+        break;
+      }
+      {
+        const int64_t payload =
+            quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
+        const int64_t slot_bytes = quantize_int4
+                                       ? (payload + kInt4ScalesAlign - 1) /
+                                             kInt4ScalesAlign * kInt4ScalesAlign
+                                       : payload;
+        partials_stride_m = 0, partials_size_n = 0;
+        staging_stride_n = 1, staging_size_m = 1,
+        staging_size_n = (s.world * slot_bytes + e - 1) / e;
+        staging_need = s.world * slot_bytes;
+        break;
+      }
   }
 
   const int64_t staging_end =

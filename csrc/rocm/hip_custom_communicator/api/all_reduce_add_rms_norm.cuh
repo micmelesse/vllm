@@ -13,9 +13,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t state, torch::Tensor& input,
     const std::optional<torch::Tensor>& residual, torch::Tensor& weight,
     torch::Tensor& output, const std::optional<torch::Tensor>& residual_output,
-    double eps, const std::string& algorithm_name, int64_t grid_x,
-    int64_t grid_y, int64_t grid_z, int64_t block_x, int64_t block_y,
-    int64_t block_z, int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
+    double eps, const std::string& algorithm_name,
+    const std::string& protocol_name, int64_t grid_x, int64_t grid_y,
+    int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
+    int64_t waves_per_eu, int64_t tile_m, int64_t tile_n,
     const std::string& quantization_name, int64_t pack_bytes,
     std::optional<int64_t> add_rms_norm_grid_x,
     std::optional<int64_t> add_rms_norm_grid_y,
@@ -59,6 +60,14 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         v > std::numeric_limits<int>::max())
       return error_code(Error::field_out_of_range);
 
+  Protocol protocol;
+  if (protocol_name == "simple")
+    protocol = Protocol::simple;
+  else if (protocol_name == "ll")
+    protocol = Protocol::ll;
+  else
+    return error_code(Error::no_such_protocol);
+
   AllReduceAddRmsNormAlgorithm op_algorithm;
   if (algorithm_name == "one_shot_pull")
     op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull;
@@ -72,8 +81,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_pull_split;
   else if (algorithm_name == "one_shot_push_split")
     op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_push_split;
-  else if (algorithm_name == "one_shot_push_staged_split")
-    op_algorithm = AllReduceAddRmsNormAlgorithm::one_shot_push_staged_split;
   else if (algorithm_name == "two_shot_pull_split")
     op_algorithm = AllReduceAddRmsNormAlgorithm::two_shot_pull_split;
   else if (algorithm_name == "two_shot_push_split")
@@ -103,10 +110,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     case AllReduceAddRmsNormAlgorithm::one_shot_push_split:
       split = true, all_reduce_algorithm = AllReduceAlgorithm::one_shot_push;
       break;
-    case AllReduceAddRmsNormAlgorithm::one_shot_push_staged_split:
-      split = true,
-      all_reduce_algorithm = AllReduceAlgorithm::one_shot_push_staged;
-      break;
     case AllReduceAddRmsNormAlgorithm::two_shot_pull_split:
       split = true, all_reduce_algorithm = AllReduceAlgorithm::two_shot_pull;
       break;
@@ -114,6 +117,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       split = true, all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
       break;
   }
+  if (protocol == Protocol::ll &&
+      !(split && all_reduce_algorithm == AllReduceAlgorithm::one_shot_push))
+    return error_code(Error::protocol_not_supported);
   for (const std::optional<int64_t>& field :
        {add_rms_norm_grid_x, add_rms_norm_grid_y, add_rms_norm_grid_z,
         add_rms_norm_block_x, add_rms_norm_block_y, add_rms_norm_block_z,
@@ -266,7 +272,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     const bool tail = quantize_int4 && (two_shot ? m * n % kInt4Group != 0
                                                  : n % kInt4Group != 0);
 
-    if (all_reduce_algorithm == AllReduceAlgorithm::one_shot_push) {
+    if (protocol == Protocol::ll) {
       const int64_t line_pack =
           std::min<int64_t>(pack_bytes, kLinePayloadBytes);
       const int64_t row_lines =
@@ -279,10 +285,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     }
 
     for (const auto& i : kAllReduceInstances)
-      if (i.algorithm == all_reduce_algorithm && i.block_x == block_x &&
-          i.block_y == block_y && i.block_z == block_z &&
-          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
-          i.tile_n == tile_n &&
+      if (i.algorithm == all_reduce_algorithm && i.protocol == protocol &&
+          i.block_x == block_x && i.block_y == block_y &&
+          i.block_z == block_z && i.waves_per_eu == waves_per_eu &&
+          i.tile_m == tile_m && i.tile_n == tile_n &&
           i.quantization ==
               (int4_config ? Quantization::int4 : Quantization::exact) &&
           i.pack_bytes == pack_bytes && i.world == s.world &&
@@ -353,28 +359,29 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         }
         break;
       case AllReduceAlgorithm::one_shot_push:
-
-        unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
-                               (s.symmetric.unfenced_slot_bytes / e);
-        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-        unfenced_stride_n = 1;
-        unfenced_size_slot = s.world,
-        unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
-        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-        break;
-      case AllReduceAlgorithm::one_shot_push_staged: {
-        const int64_t payload =
-            quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
-        const int64_t slot_bytes = quantize_int4
-                                       ? (payload + kInt4ScalesAlign - 1) /
-                                             kInt4ScalesAlign * kInt4ScalesAlign
-                                       : payload;
-        partials_stride_m = 0, partials_size_n = 0;
-        staging_stride_n = 1, staging_size_m = 1,
-        staging_size_n = (s.world * slot_bytes + e - 1) / e;
-        staging_need = s.world * slot_bytes;
-        break;
-      }
+        if (protocol == Protocol::ll) {
+          unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
+                                 (s.symmetric.unfenced_slot_bytes / e);
+          unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+          unfenced_stride_n = 1;
+          unfenced_size_slot = s.world,
+          unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
+          unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
+          break;
+        }
+        {
+          const int64_t payload =
+              quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
+          const int64_t slot_bytes =
+              quantize_int4 ? (payload + kInt4ScalesAlign - 1) /
+                                  kInt4ScalesAlign * kInt4ScalesAlign
+                            : payload;
+          partials_stride_m = 0, partials_size_n = 0;
+          staging_stride_n = 1, staging_size_m = 1,
+          staging_size_n = (s.world * slot_bytes + e - 1) / e;
+          staging_need = s.world * slot_bytes;
+          break;
+        }
     }
     rms_norm_grid = dim3(static_cast<unsigned>(*add_rms_norm_grid_x),
                          static_cast<unsigned>(*add_rms_norm_grid_y),
