@@ -84,11 +84,14 @@ DINLINE void all_reduce_one_shot_pull(
         kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
-               WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
-        entries,
+               WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+               false, TAIL>(
+        entries, 0,
         QUANTIZE_INT4 ? int64_t{input_size_n} : input_ptr_array_stride_m,
         QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, input_size_m,
-        input_size_n, clip_n, offs_m, offs_n, copies);
+        input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, 0, clip_n, 0, nullptr,
+        0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0,
+        0, 0, 0, 0, nullptr, 0, 0, rank, 0);
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -149,11 +152,13 @@ DINLINE void all_reduce_two_shot_pull(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
   all_gather<AllGatherAlgorithm::flat, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
-             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
-             TAIL>(partials_ptr_array, partials_ptr_array_size,
-                   partials_stride_m, partials_stride_n, partials_size_m,
-                   partials_size_n, output_ptr, output_stride_m,
-                   output_stride_n, input_size_m, input_size_n, 0, 0, 0, rank);
+             TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+             CONTIGUOUS, TAIL>(
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, output_ptr,
+      output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
+      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
+      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
@@ -205,17 +210,19 @@ DINLINE void all_reduce_one_shot_push(
 
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile_push, PROTOCOL, QUANTIZE_INT4, DTYPE,
-               WORLD, TILE_M, kTileN, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
-        mine, staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        unfenced_epochs_ptr, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,
-        signals_stride_parity, signals_stride_block, signals_stride_writer,
-        signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
-        input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, copies);
+               WORLD, TILE_M, kTileN, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+               CONTIGUOUS, TAIL>(
+        mine, 0, 0, 0, input_size_m, input_size_n, copies, 0, 0, 0, 0, offs_m,
+        offs_n, clip_m, clip_n, 0, staging_ptr_array, staging_ptr_array_size,
+        unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot,
+        unfenced_stride_m, unfenced_stride_n, unfenced_size_slot,
+        unfenced_size_m, unfenced_size_n, unfenced_epochs_ptr,
+        unfenced_epochs_stride_block, unfenced_epochs_stride_n,
+        unfenced_epochs_size_block, unfenced_epochs_size_n, signals_ptr_array,
+        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks);
 
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
@@ -269,11 +276,13 @@ DINLINE void all_reduce_two_shot_push(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
   all_gather<AllGatherAlgorithm::flat, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
-             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
-             TAIL>(partials_ptr_array, partials_ptr_array_size,
-                   partials_stride_m, partials_stride_n, partials_size_m,
-                   partials_size_n, output_ptr, output_stride_m,
-                   output_stride_n, input_size_m, input_size_n, 0, 0, 0, rank);
+             TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+             CONTIGUOUS, TAIL>(
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, output_ptr,
+      output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
+      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
+      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,

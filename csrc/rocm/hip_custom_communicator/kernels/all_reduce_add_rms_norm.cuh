@@ -258,10 +258,13 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::tile_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
-          entries, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
-          QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, n, row,
-          c, copies);
+                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                 PACK_BYTES, false, TAIL>(
+          entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
+          QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
+          0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0,
+          rank, 0);
       DTYPE sum[TILE_M][kPacks][kPackElems];
 #pragma unroll
       for (int i = 0; i < TILE_M; ++i)
@@ -359,11 +362,13 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::rows, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                 true, TAIL>(partials_ptr_array, partials_ptr_array_size,
-                             partials_stride_m, partials_stride_n,
-                             partials_size_m, partials_size_n, sum, 0, 0, m, n,
-                             row, c, slice, rank);
+                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
+          partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+          partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
+          row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0,
+          rank, 0);
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
@@ -442,11 +447,13 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::columns, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                 true, TAIL>(partials_ptr_array, partials_ptr_array_size,
-                             partials_stride_m, partials_stride_n,
-                             partials_size_m, partials_size_n, sum, 0, 0, m, n,
-                             row, c, slice, rank);
+                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
+          partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+          partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
+          row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0,
+          rank, 0);
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
