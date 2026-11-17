@@ -517,8 +517,8 @@ DINLINE void read_buffer(
         for (int k = 0; k < kPacks; ++k)
           __builtin_memcpy(output[c][i][k], &got[c][i][k], sizeof(V));
 
-    // Re-arm what was read, before this rank's next sends: a peer writes this
-    // bank again only after it has those.
+    // Re-arm what was read, landed before this rank sends again: a peer writes
+    // this bank again only after it has those sends.
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
@@ -532,7 +532,7 @@ DINLINE void read_buffer(
                 cleared,
                 (__attribute__((address_space(1)))
                  W*)(first + static_cast<uint32_t>(c) * slot_bytes + at[i][k]));
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     static_assert(!QUANTIZE_INT4 && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
@@ -1014,7 +1014,6 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     using W = raw_t<sizeof(V)>;
     constexpr int kHalves = sizeof(V) / 2;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
-
     const int bank_rows = output_size_m / 2;
     char* const slot =
         reinterpret_cast<char*>(output) +
