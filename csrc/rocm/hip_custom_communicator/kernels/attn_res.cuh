@@ -37,10 +37,10 @@ DINLINE void attn_res(
   DTYPE new_prefix[ROWS][K][P];
   if (prefix_ptr != nullptr) {
     DTYPE old_prefix[ROWS][K][P];
-    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        &prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1,
-        input_size_m, input_size_n, input_size_m, input_size_n, old_prefix,
-        offs_m, offs_n, 1);
+    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+         TAIL>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1,
+               input_size_m, input_size_n, input_size_m, input_size_n,
+               old_prefix, offs_m, offs_n, 1);
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -58,15 +58,16 @@ DINLINE void attn_res(
 #pragma unroll
         for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
   }
-  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-      new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m,
-      prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m,
-      input_size_n, offs_m, offs_n, 1);
+  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+        TAIL>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0,
+              prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m,
+              input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   if (block_output_ptr != nullptr)
-    store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m,
-        block_output_stride_n, 1, input_size_m, input_size_n, input_size_m,
-        input_size_n, offs_m, offs_n, 1);
+    store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+          LAYOUT, TAIL>(new_prefix, &block_output_ptr, 1, 0, 0, 0,
+                        block_output_stride_m, block_output_stride_n, 1,
+                        input_size_m, input_size_n, input_size_m, input_size_n,
+                        offs_m, offs_n, 1);
 
   float acc[ROWS][K][P];
 #pragma unroll
@@ -78,12 +79,12 @@ DINLINE void attn_res(
         acc[i][k][j] = static_cast<float>(new_prefix[i][k][j]);
   if (num_blocks != 0) {
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        &norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1,
-        input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        &qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n,
-        1, input_size_n, qk_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+         TAIL>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1,
+               input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+         TAIL>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1,
+               input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
     float w[1][K][P];
 #pragma unroll
     for (int k = 0; k < K; ++k)
@@ -116,12 +117,13 @@ DINLINE void attn_res(
 
         const bool block = !decltype(last)::value || src < num_blocks;
         const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-        load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-            &source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0,
-            block ? blocks_stride_m : prefix_output_stride_m,
-            block ? blocks_stride_n : prefix_output_stride_n,
-            block ? num_blocks : 1, input_size_m, input_size_n, input_size_m,
-            input_size_n, v[s], offs_m, offs_n, 1);
+        load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+             LAYOUT, TAIL>(&source_ptr, 1, 0, block ? src : 0,
+                           block ? blocks_stride_r : 0,
+                           block ? blocks_stride_m : prefix_output_stride_m,
+                           block ? blocks_stride_n : prefix_output_stride_n,
+                           block ? num_blocks : 1, input_size_m, input_size_n,
+                           input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
 
         float ss[ROWS], dw[ROWS];
 #pragma unroll
@@ -229,9 +231,10 @@ DINLINE void attn_res(
   DTYPE result[ROWS][K][P];
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        &output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1,
-        1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+         TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0,
+               output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n,
+               output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
     rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(
         acc, scale, output_norm_weight, result, output_eps, inv_hidden,
@@ -245,10 +248,10 @@ DINLINE void attn_res(
         for (int j = 0; j < P; ++j)
           result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
   }
-  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-      result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-      input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n,
-      1);
+  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+        TAIL>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n,
+              1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m,
+              offs_n, 1);
 }
 
 template <int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, Layout LAYOUT,
@@ -282,15 +285,17 @@ DINLINE void attn_res(
 
     for (int c = 0; c < n_all; c += tile_n) {
       DTYPE d[ROWS][K][P];
-      load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-          &sum_ptr, 1, 0, 0, 0, sum_stride_m, sum_stride_n, 1, input_size_m,
-          n_all, input_size_m, n_all, d, offs_m, c, 1);
+      load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+           LAYOUT, TAIL>(&sum_ptr, 1, 0, 0, 0, sum_stride_m, sum_stride_n, 1,
+                         input_size_m, n_all, input_size_m, n_all, d, offs_m, c,
+                         1);
       DTYPE new_prefix[ROWS][K][P];
       if (prefix_ptr != nullptr) {
         DTYPE old_prefix[ROWS][K][P];
-        load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-            &prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1,
-            input_size_m, n_all, input_size_m, n_all, old_prefix, offs_m, c, 1);
+        load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+             LAYOUT, TAIL>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m,
+                           prefix_stride_n, 1, input_size_m, n_all,
+                           input_size_m, n_all, old_prefix, offs_m, c, 1);
 #pragma unroll
         for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -308,26 +313,29 @@ DINLINE void attn_res(
 #pragma unroll
             for (int j = 0; j < P; ++j) new_prefix[i][k][j] = d[i][k][j];
       }
-      store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-          new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m,
-          prefix_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all,
-          offs_m, c, 1);
+      store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+            LAYOUT, TAIL>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0,
+                          prefix_output_stride_m, prefix_output_stride_n, 1,
+                          input_size_m, n_all, input_size_m, n_all, offs_m, c,
+                          1);
       if (block_output_ptr != nullptr)
-        store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-            new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m,
-            block_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all,
-            offs_m, c, 1);
+        store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+              LAYOUT, TAIL>(new_prefix, &block_output_ptr, 1, 0, 0, 0,
+                            block_output_stride_m, block_output_stride_n, 1,
+                            input_size_m, n_all, input_size_m, n_all, offs_m, c,
+                            1);
     }
 
     const auto source = [&](int src, int c, DTYPE(&v)[ROWS][K][P]) {
       const bool block = src < num_blocks;
       const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-      load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-          &source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0,
-          block ? blocks_stride_m : prefix_output_stride_m,
-          block ? blocks_stride_n : prefix_output_stride_n,
-          block ? num_blocks : 1, input_size_m, n_all, input_size_m, n_all, v,
-          offs_m, c, 1);
+      load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+           LAYOUT, TAIL>(&source_ptr, 1, 0, block ? src : 0,
+                         block ? blocks_stride_r : 0,
+                         block ? blocks_stride_m : prefix_output_stride_m,
+                         block ? blocks_stride_n : prefix_output_stride_n,
+                         block ? num_blocks : 1, input_size_m, n_all,
+                         input_size_m, n_all, v, offs_m, c, 1);
     };
     extern __shared__ float wide_logits[];
     const int sources = num_blocks + 1;
@@ -344,12 +352,13 @@ DINLINE void attn_res(
         for (int q = 0; q < ROWS * 2 * TILE_K; ++q) sums[0][q] = 0.0f;
         for (int c = 0; c < n_all; c += tile_n) {
           DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-          load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-              &norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1,
-              n_all, 1, n_all, norm_weight, 0, c, 1);
-          load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-              &qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, n_all, 1,
-              n_all, qk_weight, 0, c, 1);
+          load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+               LAYOUT, TAIL>(&norm_weight_ptr, 1, 0, 0, 0, 0,
+                             norm_weight_stride_n, 1, 1, n_all, 1, n_all,
+                             norm_weight, 0, c, 1);
+          load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+               LAYOUT, TAIL>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n,
+                             1, 1, n_all, 1, n_all, qk_weight, 0, c, 1);
 #pragma unroll
           for (int s = 0; s < TILE_K; ++s) {
             const int src = src0 + s < sources ? src0 + s : num_blocks;
@@ -451,9 +460,10 @@ DINLINE void attn_res(
       DTYPE result[ROWS][K][P];
       if (output_norm_weight_ptr != nullptr) {
         DTYPE output_norm_weight[1][K][P];
-        load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-            &output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n,
-            1, 1, n_all, 1, n_all, output_norm_weight, 0, c, 1);
+        load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+             LAYOUT, TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0,
+                           output_norm_weight_stride_n, 1, 1, n_all, 1, n_all,
+                           output_norm_weight, 0, c, 1);
         rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(
             acc, scale, output_norm_weight, result, output_eps, inv_hidden,
             n_all, c, NormPart::apply, false, LAYOUT);
@@ -466,17 +476,19 @@ DINLINE void attn_res(
             for (int j = 0; j < P; ++j)
               result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
       }
-      store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-          result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-          input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+      store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+            LAYOUT, TAIL>(result, &output_ptr, 1, 0, 0, 0, output_stride_m,
+                          output_stride_n, 1, input_size_m, n_all, input_size_m,
+                          n_all, offs_m, c, 1);
     }
     __syncthreads();
 
   } else {
     DTYPE sum[ROWS][K][P];
-    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, LAYOUT, TAIL>(
-        &sum_ptr, 1, 0, 0, 0, sum_stride_m, sum_stride_n, 1, input_size_m,
-        input_size_n, input_size_m, input_size_n, sum, offs_m, offs_n, 1);
+    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple, LAYOUT,
+         TAIL>(&sum_ptr, 1, 0, 0, 0, sum_stride_m, sum_stride_n, 1,
+               input_size_m, input_size_n, input_size_m, input_size_n, sum,
+               offs_m, offs_n, 1);
     attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, LAYOUT, TAIL>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
