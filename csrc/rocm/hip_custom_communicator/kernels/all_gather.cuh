@@ -25,9 +25,9 @@ constexpr int kTilePushPackElems =
 namespace internal {
 
 // Every rank's summed slice of the whole tensor, a flat run of elements.
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL, typename OUTPUT>
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL, typename OUTPUT>
 DINLINE void all_gather_flat(char* const* partials_ptr_array,
                              int partials_ptr_array_size,
                              int64_t partials_stride_m,
@@ -36,6 +36,8 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
                              int64_t output_stride_m, int64_t output_stride_n,
                              int output_size_m, int output_size_n, int offs_m,
                              int offs_n, int, int rank) {
+  static_assert(PROTOCOL == Protocol::simple,
+                "a pull reads what its owner wrote plainly, so it runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   DTYPE* const output_ptr = output;
@@ -65,8 +67,8 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
                          : min(g_end, share_len(r) / kInt4Group) * kInt4Group;
     for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
       uint32_t words[1][kInt4GroupPacks][2];
-      recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::group_run, TAIL>(
+      recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+           Layout::group_run, TAIL>(
           partials_ptr_array, partials_ptr_array_size, r, 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
           partials_size_n, 1, slice, words, 0, g0 * kInt4Group, 1);
@@ -75,7 +77,7 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k)
         dequantize(words[0][k], x[0][k]);
-      store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+      store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
             kOutput, TAIL>(x, &output_ptr, 1, 0, r, slice, output_stride_m,
                            output_stride_n, WORLD, output_size_m, output_size_n,
                            1, end, 0, g0 * kInt4Group, 1);
@@ -101,14 +103,14 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       DTYPE got[1][kPacks][kPackElems];
 
-      recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+      recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
            Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0,
                          0, 1, 1, 1, slice, 1,
                          kWhole ? slice : min(slice, chunk * kChunkN + kChunkN),
                          got, 0, chunk * kChunkN, 0);
 
-      store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-            kOutput, TAIL>(
+      store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL, kOutput,
+            TAIL>(
           got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
           WORLD, output_size_m, output_size_n, 1,
           kWhole ? share_len(r) : min(share_len(r), chunk * kChunkN + kChunkN),
@@ -118,9 +120,9 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
 }
 
 // Every rank's summed slice of a tile's rows.
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL, typename OUTPUT>
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL, typename OUTPUT>
 DINLINE void all_gather_rows(char* const* partials_ptr_array,
                              int partials_ptr_array_size,
                              int64_t partials_stride_m,
@@ -129,6 +131,8 @@ DINLINE void all_gather_rows(char* const* partials_ptr_array,
                              int64_t output_stride_m, int64_t output_stride_n,
                              int output_size_m, int output_size_n, int offs_m,
                              int offs_n, int slice, int rank) {
+  static_assert(PROTOCOL == Protocol::simple,
+                "a pull reads what its owner wrote plainly, so it runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   using Tile = std::remove_reference_t<OUTPUT>;
@@ -146,8 +150,8 @@ DINLINE void all_gather_rows(char* const* partials_ptr_array,
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         DTYPE pack[1][1][kPackElems];
-        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-             Protocol::simple, Layout::tile, TAIL>(
+        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+             Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, output_size_m, output_size_n, pack, offs_m + i,
@@ -159,8 +163,8 @@ DINLINE void all_gather_rows(char* const* partials_ptr_array,
       uint32_t raw[kPacks][1][1][2];
 #pragma unroll
       for (int k = 0; k < kPacks; ++k)
-        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-             Protocol::simple, Layout::tile, TAIL>(
+        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+             Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, output_size_m, output_size_n, raw[k], offs_m + i,
@@ -172,15 +176,17 @@ DINLINE void all_gather_rows(char* const* partials_ptr_array,
 }
 
 // Every rank's summed slice of a tile's columns.
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL, typename OUTPUT>
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL, typename OUTPUT>
 DINLINE void all_gather_columns(
     char* const* partials_ptr_array, int partials_ptr_array_size,
     int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
     int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
     int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
     int offs_n, int slice, int rank) {
+  static_assert(PROTOCOL == Protocol::simple,
+                "a pull reads what its owner wrote plainly, so it runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   using Tile = std::remove_reference_t<OUTPUT>;
@@ -203,8 +209,8 @@ DINLINE void all_gather_columns(
 #pragma unroll
     for (int k = 0; k < kPacks; ++k) {
       DTYPE pack[kRows][1][kPackElems];
-      recv<WORLD, kRows, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::tile, TAIL>(
+      recv<WORLD, kRows, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+           Layout::tile, TAIL>(
           partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
           partials_size_n, output_size_m, output_size_n, pack, offs_m,
@@ -218,8 +224,8 @@ DINLINE void all_gather_columns(
     uint32_t raw[kPacks][kRows][1][2];
 #pragma unroll
     for (int k = 0; k < kPacks; ++k)
-      recv<WORLD, kRows, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::tile, TAIL>(
+      recv<WORLD, kRows, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+           Layout::tile, TAIL>(
           partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
           partials_size_n, output_size_m, output_size_n, raw[k], offs_m,
@@ -232,19 +238,21 @@ DINLINE void all_gather_columns(
 }
 
 // Every rank's copy of one tile, read from where each rank published it.
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, bool TAIL, typename ENTRY,
-          int ROWS, int PACKS, int ELEMS>
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, bool TAIL,
+          typename ENTRY, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
                                   int64_t stride_n, int size_m, int size_n,
                                   int clip_n, int offs_m, int offs_n,
                                   DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+  static_assert(PROTOCOL == Protocol::simple,
+                "a pull reads what its owner wrote plainly, so it runs simple");
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
-    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-         Protocol::simple, Layout::tile, TAIL>(
-        &entries[r], 1, 0, 0, 0, stride_m, stride_n, 1, size_m, size_n, size_m,
-        clip_n, copies[r], offs_m, offs_n, 1);
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile, TAIL>(&entries[r], 1, 0, 0, 0, stride_m, stride_n, 1,
+                             size_m, size_n, size_m, clip_n, copies[r], offs_m,
+                             offs_n, 1);
 }
 
 // One tile, pushed into every rank's inbox, then every rank's copy of it read
@@ -285,22 +293,22 @@ DINLINE void all_gather_tile_push(
                              : int64_t{input_size_m} * input_size_n;
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::tile, TAIL>(
-          mine, staging_ptr_array, staging_ptr_array_size, r, rank, slot,
-          input_size_n, 1, WORLD, input_size_m, input_size_n, input_size_m,
-          clip_n, offs_m, offs_n, 1);
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
+                               r, rank, slot, input_size_n, 1, WORLD,
+                               input_size_m, input_size_n, input_size_m, clip_n,
+                               offs_m, offs_n, 1);
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
                    signals_stride_writer, signals_size_parity,
                    signals_size_block, signals_size_writer, status_ptr,
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::launched, 0);
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-         Protocol::simple, Layout::tile, TAIL>(
-        staging_ptr_array, staging_ptr_array_size, rank, 0, slot, input_size_n,
-        1, WORLD, input_size_m, input_size_n, input_size_m, clip_n, copies,
-        offs_m, offs_n, 1);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, rank, 0,
+                             slot, input_size_n, 1, WORLD, input_size_m,
+                             input_size_n, input_size_m, clip_n, copies, offs_m,
+                             offs_n, 1);
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
                    signals_stride_writer, signals_size_parity,
@@ -314,6 +322,7 @@ DINLINE void all_gather_tile_push(
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
       __builtin_trap();
+    // The epochs buffer is this rank's own, read and written plainly.
     int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
          Layout::tile>(&unfenced_epochs_ptr, 1, 0, 0, 0,
@@ -413,11 +422,8 @@ DINLINE void all_gather(
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
-  static_assert(PROTOCOL == Protocol::simple ||
-                    ALGORITHM == AllGatherAlgorithm::tile_push,
-                "only the tile push runs a protocol other than simple");
   if constexpr (ALGORITHM == AllGatherAlgorithm::flat)
-    internal::all_gather_flat<QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
+    internal::all_gather_flat<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
                               THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
                               CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
@@ -425,7 +431,7 @@ DINLINE void all_gather(
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,
         offs_n, slice, rank);
   else if constexpr (ALGORITHM == AllGatherAlgorithm::rows)
-    internal::all_gather_rows<QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
+    internal::all_gather_rows<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
                               THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
                               CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
@@ -433,7 +439,7 @@ DINLINE void all_gather(
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,
         offs_n, slice, rank);
   else if constexpr (ALGORITHM == AllGatherAlgorithm::columns)
-    internal::all_gather_columns<QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
+    internal::all_gather_columns<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
                                  THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
                                  CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
@@ -441,8 +447,8 @@ DINLINE void all_gather(
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,
         offs_n, slice, rank);
   else if constexpr (ALGORITHM == AllGatherAlgorithm::tile_pull)
-    internal::all_gather_tile_pull<QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                                   THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
+    internal::all_gather_tile_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
+                                   TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
         input, input_stride_m, input_stride_n, input_size_m, input_size_n,
         clip_n, offs_m, offs_n, output);
   else if constexpr (ALGORITHM == AllGatherAlgorithm::tile_push)
