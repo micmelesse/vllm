@@ -81,10 +81,9 @@ DINLINE void all_gather_flat_pull(
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k)
         dequantize(words[0][k], x[0][k]);
-      store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-            kOutput, TAIL>(x, &output_ptr, 1, 0, r, slice, output_stride_m,
-                           output_stride_n, WORLD, output_size_m, output_size_n,
-                           1, end, 0, g0 * kInt4Group, 1);
+      store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kOutput, TAIL>(
+          x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
+          WORLD, output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
     }
   } else {
     constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;
@@ -113,8 +112,7 @@ DINLINE void all_gather_flat_pull(
                          kWhole ? slice : min(slice, chunk * kChunkN + kChunkN),
                          got, 0, chunk * kChunkN, 0);
 
-      store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL, kOutput,
-            TAIL>(
+      store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kOutput, TAIL>(
           got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
           WORLD, output_size_m, output_size_n, 1,
           kWhole ? share_len(r) : min(share_len(r), chunk * kChunkN + kChunkN),
@@ -290,10 +288,9 @@ DINLINE void all_gather_tile_push(
     DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   if constexpr (PROTOCOL == Protocol::simple) {
     DTYPE mine[ROWS][PACKS][ELEMS];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-         Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
-                       1, input_size_m, input_size_n, input_size_m, clip_n,
-                       mine, offs_m, offs_n, 1);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
+        input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
     const int64_t slot = QUANTIZE_INT4
                              ? (int4_payload_bytes(input_size_m, input_size_n) +
                                 kInt4ScalesAlign - 1) /
@@ -312,7 +309,7 @@ DINLINE void all_gather_tile_push(
                    signals_size_block, signals_size_writer, status_ptr,
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::launched, 0);
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, rank, 0,
                              slot, input_size_n, 1, WORLD, input_size_m,
                              input_size_n, input_size_m, clip_n, copies, offs_m,
@@ -330,20 +327,17 @@ DINLINE void all_gather_tile_push(
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
       __builtin_trap();
-    // The epochs buffer is this rank's own, read and written plainly.
-    int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-         Layout::tile>(&unfenced_epochs_ptr, 1, 0, 0, 0,
-                       unfenced_epochs_stride_block, unfenced_epochs_stride_n,
-                       1, unfenced_epochs_size_block, unfenced_epochs_size_n,
-                       unfenced_epochs_size_block, unfenced_epochs_size_n, last,
-                       first_row, 0, 1);
     // The epochs first, so they arrive while the tile does.
+    int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, last, first_row, 0, 1);
     DTYPE mine[ROWS][PACKS][ELEMS];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-         Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
-                       1, input_size_m, input_size_n, input_size_m, clip_n,
-                       mine, offs_m, offs_n, 1);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
+        input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
     uint32_t epochs[ROWS];
 #pragma unroll
     for (int i = 0; i < ROWS; ++i) {
@@ -386,7 +380,7 @@ DINLINE void all_gather_tile_push(
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
                            first_row, 0, 1, epochs);
     }
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
          Protocol::ll, Layout::tile>(
         unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
@@ -397,12 +391,11 @@ DINLINE void all_gather_tile_push(
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
       next[i][0][0] = static_cast<int32_t>(epochs[i]);
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-          Layout::tile>(next, &unfenced_epochs_ptr, 1, 0, 0, 0,
-                        unfenced_epochs_stride_block, unfenced_epochs_stride_n,
-                        1, unfenced_epochs_size_block, unfenced_epochs_size_n,
-                        unfenced_epochs_size_block, unfenced_epochs_size_n,
-                        first_row, 0, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, first_row, 0, 1);
     __syncthreads();
   }
 }

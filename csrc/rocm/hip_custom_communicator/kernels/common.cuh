@@ -1490,8 +1490,8 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&encoded)[1][K][2]) {
 }
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
-          bool TAIL = false, typename PTR, typename OUTPUT>
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL = false, typename PTR,
+          typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
                   int input_rank, int input_slot, int64_t input_stride_slot,
                   int64_t input_stride_m, int64_t input_stride_n,
@@ -1515,7 +1515,74 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
 #pragma unroll
     for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
       Group group;
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
+           TAIL>(input_ptr_array, input_ptr_array_size, input_rank, input_slot,
+                 input_stride_slot, input_stride_m, input_stride_n,
+                 input_size_slot, input_size_m, input_size_n, clip_m, clip_n,
+                 group, offs_m,
+                 offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
+                 row_step, flags, status_ptr, status_stride_field,
+                 status_size_field, timeout_ticks);
+#pragma unroll
+      for (int c = 0; c < kCopies; ++c)
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+          for (int j = 0; j < kPackElems; ++j) {
+            if constexpr (kSlots)
+              output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
+            else
+              output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
+          }
+    }
+  } else {
+    const auto* const entries =
+        (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    const void* const input =
+        __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
+            ? entries[0]
+            : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
+                          QUANTIZE_INT4, Protocol::simple, LAYOUT, TAIL>(
+        input, input_slot, input_stride_slot, input_stride_m, input_stride_n,
+        input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
+        offs_m, offs_n, row_step, input_rank, flags, status_ptr,
+        status_stride_field, status_size_field, timeout_ticks);
+  }
+}
+
+template <typename T>
+DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
+  return internal::ptr_array_at(x_ptr_array, x_ptr_array_size, x_rank);
+}
+
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
+          bool TAIL = false, typename PTR, typename OUTPUT>
+DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
+                  int input_rank, int input_slot, int64_t input_stride_slot,
+                  int64_t input_stride_m, int64_t input_stride_n,
+                  int input_size_slot, int input_size_m, int input_size_n,
+                  int clip_m, int clip_n, OUTPUT& output, int offs_m,
+                  int offs_n, int row_step, const uint32_t* flags = nullptr,
+                  uint32_t* status_ptr = nullptr,
+                  int64_t status_stride_field = 0, int status_size_field = 0,
+                  uint64_t timeout_ticks = 0) {
+  constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
+  constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
+  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
+                kPacks != kInt4GroupPacks) {
+    static_assert(kPacks % kInt4GroupPacks == 0, "a thread holds whole groups");
+    constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
+    constexpr int kPackElems = std::extent_v < OUTPUT, kSlots ? 3 : 2 > ;
+    using U = std::remove_all_extents_t<OUTPUT>;
+    using Group =
+        std::conditional_t<kSlots, U[kCopies][1][kInt4GroupPacks][kPackElems],
+                           U[1][kInt4GroupPacks][kPackElems]>;
+#pragma unroll
+    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
+      Group group;
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            LAYOUT, TAIL>(
           input_ptr_array, input_ptr_array_size, input_rank, input_slot,
           input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
@@ -1538,82 +1605,22 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
   } else {
     const auto* const entries =
         (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-    const void* const input =
-        __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
-            ? entries[0]
-            : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                          QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
-        input, input_slot, input_stride_slot, input_stride_m, input_stride_n,
-        input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
-        offs_m, offs_n, row_step, input_rank, flags, status_ptr,
-        status_stride_field, status_size_field, timeout_ticks);
-  }
-}
-
-template <typename T>
-DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
-  return internal::ptr_array_at(x_ptr_array, x_ptr_array_size, x_rank);
-}
-
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
-          bool TAIL = false, typename PTR, typename OUTPUT>
-DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
-                  int input_rank, int input_slot, int64_t input_stride_slot,
-                  int64_t input_stride_m, int64_t input_stride_n,
-                  int input_size_slot, int input_size_m, int input_size_n,
-                  int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                  int offs_n, int row_step) {
-  constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
-  constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
-  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
-                kPacks != kInt4GroupPacks) {
-    static_assert(kPacks % kInt4GroupPacks == 0, "a thread holds whole groups");
-    constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
-    constexpr int kPackElems = std::extent_v < OUTPUT, kSlots ? 3 : 2 > ;
-    using U = std::remove_all_extents_t<OUTPUT>;
-    using Group =
-        std::conditional_t<kSlots, U[kCopies][1][kInt4GroupPacks][kPackElems],
-                           U[1][kInt4GroupPacks][kPackElems]>;
-#pragma unroll
-    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
-      Group group;
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-           LAYOUT, TAIL>(
-          input_ptr_array, input_ptr_array_size, input_rank, input_slot,
-          input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
-          input_size_m, input_size_n, clip_m, clip_n, group, offs_m,
-          offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group, row_step);
-#pragma unroll
-      for (int c = 0; c < kCopies; ++c)
-#pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k)
-#pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            if constexpr (kSlots)
-              output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
-            else
-              output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
-          }
-    }
-  } else {
-    const auto* const entries =
-        (decltype(+input_ptr_array[0]) const*)input_ptr_array;
     const int first = __builtin_amdgcn_readfirstlane(input_rank);
     if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
                             QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
           entries[0], input_slot, input_stride_slot, input_stride_m,
           input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
-          clip_n, output, offs_m, offs_n, row_step);
+          clip_n, output, offs_m, offs_n, row_step, input_rank, flags,
+          status_ptr, status_stride_field, status_size_field, timeout_ticks);
     else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
                             QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
           internal::ptr_array_at(entries, input_ptr_array_size, first),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,
           input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
-          offs_m, offs_n, row_step);
+          offs_m, offs_n, row_step, input_rank, flags, status_ptr,
+          status_stride_field, status_size_field, timeout_ticks);
     else
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
                             QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
@@ -1621,13 +1628,14 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
               entries, input_ptr_array_size, input_rank),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,
           input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
-          offs_m, offs_n, row_step);
+          offs_m, offs_n, row_step, input_rank, flags, status_ptr,
+          status_stride_field, status_size_field, timeout_ticks);
   }
 }
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
-          bool TAIL = false, typename INPUT, typename PTR>
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL = false, typename INPUT,
+          typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array,
                    int output_ptr_array_size, int output_rank, int output_slot,
                    int64_t output_stride_slot, int64_t output_stride_m,
@@ -1649,13 +1657,13 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array,
 #pragma unroll
         for (int j = 0; j < kPackElems; ++j)
           group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-            PROTOCOL, LAYOUT, TAIL>(
-          group, output_ptr_array, output_ptr_array_size, output_rank,
-          output_slot, output_stride_slot, output_stride_m, output_stride_n,
-          output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
-          offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
-          row_step);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
+            TAIL>(group, output_ptr_array, output_ptr_array_size, output_rank,
+                  output_slot, output_stride_slot, output_stride_m,
+                  output_stride_n, output_size_slot, output_size_m,
+                  output_size_n, clip_m, clip_n, offs_m,
+                  offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
+                  row_step);
     }
   } else {
     const auto* const entries =
@@ -1666,7 +1674,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array,
                              : internal::ptr_array_at(
                                    entries, output_ptr_array_size, output_rank);
     internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                           QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
+                           QUANTIZE_INT4, Protocol::simple, LAYOUT, TAIL>(
         input, output, output_slot, output_stride_slot, output_stride_m,
         output_stride_n, output_size_slot, output_size_m, output_size_n, clip_m,
         clip_n, offs_m, offs_n, row_step);

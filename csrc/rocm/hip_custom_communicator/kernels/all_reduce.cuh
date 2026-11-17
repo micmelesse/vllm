@@ -50,15 +50,14 @@ DINLINE void all_reduce_one_shot_pull(
       const int clip_n =
           kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
       DTYPE mine[kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-           Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
-                         1, input_size_m, input_size_n, input_size_m, clip_n,
-                         mine, offs_m, offs_n, 1);
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Protocol::simple,
-            Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
-                                rank, 0, 0, input_size_n, 1, 1, input_size_m,
-                                input_size_n, input_size_m, clip_n, offs_m,
-                                offs_n, 1);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+          &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+          input_size_m, input_size_n, input_size_m, clip_n, mine, offs_m,
+          offs_n, 1);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile,
+            TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
+                  input_size_n, 1, 1, input_size_m, input_size_n, input_size_m,
+                  clip_n, offs_m, offs_n, 1);
     }
   }
 
@@ -105,10 +104,9 @@ DINLINE void all_reduce_one_shot_pull(
             acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-          Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m,
-                        output_stride_n, 1, input_size_m, input_size_n,
-                        input_size_m, clip_n, offs_m, offs_n, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+        input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
 
   barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
@@ -232,10 +230,9 @@ DINLINE void all_reduce_one_shot_push(
             acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-          Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m,
-                        output_stride_n, 1, input_size_m, input_size_n,
-                        input_size_m, clip_n, offs_m, offs_n, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
+        input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
 }
 
