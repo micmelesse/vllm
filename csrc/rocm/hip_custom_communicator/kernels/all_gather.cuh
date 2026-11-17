@@ -10,14 +10,7 @@
 
 namespace hip_custom_communicator {
 
-enum class AllGatherAlgorithm {
-  flat,
-  rows,
-  columns,
-  tile_pull,
-  tile_push,
-  tile_staged
-};
+enum class AllGatherAlgorithm { flat, rows, columns, tile_pull, tile_push };
 
 template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
           int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
@@ -214,65 +207,148 @@ DINLINE void all_gather(ENTRY (&entries)[WORLD], int64_t stride_m,
                              offs_n, 1);
 }
 
-template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
-          int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int ROWS,
-          int PACKS, int ELEMS>
-DINLINE void all_gather(const DTYPE (&mine)[ROWS][PACKS][ELEMS],
-                        const uint32_t (&epochs)[ROWS],
-                        char* const* inbox_ptr_array, int inbox_ptr_array_size,
-                        int64_t inbox_stride_slot, int64_t inbox_stride_m,
-                        int64_t inbox_stride_n, int inbox_size_slot,
-                        int inbox_size_m, int inbox_size_n, int clip_m,
-                        int clip_n, int offs_m, int rank, uint32_t* status_ptr,
-                        int64_t status_stride_field, int status_size_field,
-                        uint64_t timeout_ticks,
-                        DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
-  static_assert(ALGORITHM == AllGatherAlgorithm::tile_push,
-                "a tile sent and polled as lines");
+// The elements a thread packs per access in a tile push. An LL line is half
+// data, so exact LL packs no wider than a line's payload.
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int PACK_BYTES>
+constexpr int kTilePushPackElems =
+    QUANTIZE_INT4 || PROTOCOL == Protocol::simple
+        ? traits<DTYPE, PACK_BYTES>::N
+        : (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) /
+              static_cast<int>(sizeof(DTYPE));
 
-  if constexpr (QUANTIZE_INT4) {
-    uint32_t payload[ROWS][PACKS][2];
+// One tile, pushed into every rank's inbox, then every rank's copy of it read
+// out of this rank's. The protocol is how the inbox is written and how a
+// reader knows a copy arrived.
+//   simple: plain stores into every rank's staging buffer, which holds every
+//     rank's whole input; a barrier says every copy is in, a second that every
+//     rank has read it.
+//   ll: lines of half data, half the row's epoch, into an inbox row for each
+//     row the block owns; a reader polls each line until it carries the
+//     epoch, so the data is its own signal. Each row's epoch is kept in this
+//     rank's epochs buffer from tile to tile and launch to launch, and the
+//     next tile reuses the inbox rows.
+template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
+          typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, bool TAIL, int ROWS, int PACKS,
+          int ELEMS>
+DINLINE void all_gather(
+    const DTYPE (&mine)[ROWS][PACKS][ELEMS], char* const* staging_ptr_array,
+    int staging_ptr_array_size, char* const* unfenced_ptr_array,
+    int unfenced_ptr_array_size, int64_t unfenced_stride_slot,
+    int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+    int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+    int32_t* unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block,
+    int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
+    int unfenced_epochs_size_n, uint32_t* const* signals_ptr_array,
+    int signals_ptr_array_size, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
+    int rank, uint64_t timeout_ticks, int input_size_m, int input_size_n,
+    int offs_m, int offs_n, int clip_m, int clip_n,
+    DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+  static_assert(ALGORITHM == AllGatherAlgorithm::tile_push,
+                "a tile pushed into every rank's inbox");
+  if constexpr (PROTOCOL == Protocol::simple) {
+    const int64_t slot = QUANTIZE_INT4
+                             ? (int4_payload_bytes(input_size_m, input_size_n) +
+                                kInt4ScalesAlign - 1) /
+                                   kInt4ScalesAlign * kInt4ScalesAlign
+                             : int64_t{input_size_m} * input_size_n;
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r)
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
+                               r, rank, slot, input_size_n, 1, WORLD,
+                               input_size_m, input_size_n, input_size_m, clip_n,
+                               offs_m, offs_n, 1);
+    barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
+                   signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, signals_size_parity,
+                   signals_size_block, signals_size_writer, status_ptr,
+                   status_stride_field, status_size_field, rank, timeout_ticks,
+                   Until::launched, 0);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+         Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, rank, 0,
+                             slot, input_size_n, 1, WORLD, input_size_m,
+                             input_size_n, input_size_m, clip_n, copies, offs_m,
+                             offs_n, 1);
+    barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
+                   signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, signals_size_parity,
+                   signals_size_block, signals_size_writer, status_ptr,
+                   status_stride_field, status_size_field, rank, timeout_ticks,
+                   Until::read, 1);
+  } else if constexpr (PROTOCOL == Protocol::ll) {
+    constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
+    constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
+    const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
+      __builtin_trap();
+    int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, last, first_row, 0, 1);
+    uint32_t epochs[ROWS];
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+      const uint32_t before = kThreadsM == 1
+                                  ? __builtin_amdgcn_readfirstlane(
+                                        static_cast<uint32_t>(last[i][0][0]))
+                                  : static_cast<uint32_t>(last[i][0][0]);
+      const bool written =
+          (kThreadsM == 1 ? i
+                          : static_cast<int>(threadIdx.x) / kThreadsN +
+                                i * kThreadsM) < clip_m;
+      epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
+    }
+    const int lines_m = first_row + clip_m;
+    const int lines_n = min(TILE_N, input_size_n - offs_n);
+    if constexpr (QUANTIZE_INT4) {
+      uint32_t payload[ROWS][PACKS][2];
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < PACKS; ++k)
+          quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
+                   reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::line>(
+            payload, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+            lines_n, first_row, 0, 1, epochs);
+    } else {
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(
+            mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+            lines_n, first_row, 0, 1, epochs);
+    }
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+         Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+                       unfenced_stride_slot, unfenced_stride_m,
+                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
+                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
+                       1, epochs, status_ptr, status_stride_field,
+                       status_size_field, timeout_ticks);
+    int32_t next[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-      for (int k = 0; k < PACKS; ++k)
-        quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
-                 reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::line>(
-          payload, inbox_ptr_array, inbox_ptr_array_size, r, rank,
-          inbox_stride_slot, inbox_stride_m, inbox_stride_n, inbox_size_slot,
-          inbox_size_m, inbox_size_n, clip_m, clip_n, offs_m, 0, 1, epochs);
-  } else {
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::line>(
-          mine, inbox_ptr_array, inbox_ptr_array_size, r, rank,
-          inbox_stride_slot, inbox_stride_m, inbox_stride_n, inbox_size_slot,
-          inbox_size_m, inbox_size_n, clip_m, clip_n, offs_m, 0, 1, epochs);
+      next[i][0][0] = static_cast<int32_t>(epochs[i]);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, first_row, 0, 1);
+    __syncthreads();
   }
-  load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-       Layout::line>(inbox_ptr_array, inbox_ptr_array_size, rank, 0,
-                     inbox_stride_slot, inbox_stride_m, inbox_stride_n,
-                     inbox_size_slot, inbox_size_m, inbox_size_n, clip_m,
-                     clip_n, copies, offs_m, 0, 1, epochs, status_ptr,
-                     status_stride_field, status_size_field, timeout_ticks);
-}
-
-template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
-          int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool TAIL, int ROWS, int PACKS, int ELEMS>
-DINLINE void all_gather(char* const* inbox_ptr_array, int inbox_ptr_array_size,
-                        int64_t inbox_stride_slot, int size_m, int size_n,
-                        int clip_n, int offs_m, int offs_n, int rank,
-                        DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
-  static_assert(ALGORITHM == AllGatherAlgorithm::tile_staged,
-                "a tile out of the staged inbox");
-  load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, Layout::tile,
-       TAIL>(inbox_ptr_array, inbox_ptr_array_size, rank, 0, inbox_stride_slot,
-             size_n, 1, WORLD, size_m, size_n, size_m, clip_n, copies, offs_m,
-             offs_n, 1);
 }
 
 }  // namespace hip_custom_communicator

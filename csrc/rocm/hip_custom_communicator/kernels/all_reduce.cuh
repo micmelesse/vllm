@@ -154,126 +154,20 @@ DINLINE void all_reduce_two_shot_pull(
       rank);
 }
 
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL>
-DINLINE void all_reduce_one_shot_push_ll(
+template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
+          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
+          int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
+DINLINE void all_reduce_one_shot_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size,
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
     int unfenced_size_n, int32_t* unfenced_epochs_ptr,
     int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n,
     int unfenced_epochs_size_block, int unfenced_epochs_size_n,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks) {
-  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
-  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
-  constexpr int kRows = TILE_M / kThreadsM;
-
-  constexpr int kPackElems =
-      QUANTIZE_INT4
-          ? traits<DTYPE, PACK_BYTES>::N
-          : (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) /
-                static_cast<int>(sizeof(DTYPE));
-
-  constexpr int kUnit = QUANTIZE_INT4 ? kInt4Group : kPackElems;
-  constexpr int kTileN = (TILE_N + kUnit - 1) / kUnit * kUnit;
-  constexpr int kPacks =
-      (kTileN + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
-  constexpr bool kWhole = kPacks * kPackElems * kThreadsN == kTileN;
-  const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-
-  const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
-    __builtin_trap();
-
-  int32_t last[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
-  load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-      &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
-      unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
-      unfenced_epochs_size_n, unfenced_epochs_size_block,
-      unfenced_epochs_size_n, last, first_row, 0, 1);
-  uint32_t epochs[kRows] = {};
-  bool ran = false;
-
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-    const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
-
-    const int clip_m = min(TILE_M, input_size_m - offs_m);
-    const int clip_n =
-        kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
-    DTYPE mine[kRows][kPacks][kPackElems];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
-        input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-
-#pragma unroll
-    for (int i = 0; i < kRows; ++i) {
-      const uint32_t before = ran ? epochs[i]
-                              : kThreadsM == 1
-                                  ? __builtin_amdgcn_readfirstlane(
-                                        static_cast<uint32_t>(last[i][0][0]))
-                                  : static_cast<uint32_t>(last[i][0][0]);
-      const bool written =
-          (kThreadsM == 1 ? i
-                          : static_cast<int>(threadIdx.x) / kThreadsN +
-                                i * kThreadsM) < clip_m;
-      epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
-    }
-    ran = true;
-    DTYPE copies[WORLD][kRows][kPacks][kPackElems];
-    all_gather<AllGatherAlgorithm::tile_push, QUANTIZE_INT4, DTYPE, WORLD,
-               TILE_M, THREADS_PER_BLOCK, WAVE_SIZE>(
-        mine, epochs, unfenced_ptr_array, unfenced_ptr_array_size,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        first_row + clip_m, min(kTileN, input_size_n - offs_n), first_row, rank,
-        status_ptr, status_stride_field, status_size_field, timeout_ticks,
-        copies);
-    DTYPE rounded[kRows][kPacks][kPackElems];
-#pragma unroll
-    for (int i = 0; i < kRows; ++i)
-#pragma unroll
-      for (int k = 0; k < kPacks; ++k)
-#pragma unroll
-        for (int j = 0; j < kPackElems; ++j) {
-          float acc = static_cast<float>(copies[0][i][k][j]);
-#pragma unroll
-          for (int r = 1; r < WORLD; ++r)
-            acc += static_cast<float>(copies[r][i][k][j]);
-          rounded[i][k][j] = static_cast<DTYPE>(acc);
-        }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-        input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
-
-    __syncthreads();
-  }
-
-  int32_t next[kRows][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
-#pragma unroll
-  for (int i = 0; i < kRows; ++i)
-    next[i][0][0] = ran ? static_cast<int32_t>(epochs[i]) : last[i][0][0];
-  store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-      next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
-      unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
-      unfenced_epochs_size_n, unfenced_epochs_size_block,
-      unfenced_epochs_size_n, first_row, 0, 1);
-}
-
-template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL>
-DINLINE void all_reduce_one_shot_push_simple(
-    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, DTYPE* output_ptr,
-    int64_t output_stride_m, int64_t output_stride_n,
-    char* const* staging_ptr_array, int staging_ptr_array_size,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -283,7 +177,9 @@ DINLINE void all_reduce_one_shot_push_simple(
   constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
   constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
-  constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
+
+  constexpr int kPackElems =
+      kTilePushPackElems<PROTOCOL, QUANTIZE_INT4, DTYPE, PACK_BYTES>;
 
   constexpr int kUnit = QUANTIZE_INT4 ? kInt4Group : kPackElems;
   constexpr int kTileN = (TILE_N + kUnit - 1) / kUnit * kUnit;
@@ -293,44 +189,31 @@ DINLINE void all_reduce_one_shot_push_simple(
   const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
 
-  const int64_t slot = QUANTIZE_INT4
-                           ? (int4_payload_bytes(input_size_m, input_size_n) +
-                              kInt4ScalesAlign - 1) /
-                                 kInt4ScalesAlign * kInt4ScalesAlign
-                           : int64_t{input_size_m} * input_size_n;
-
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
+    const int clip_m = min(TILE_M, input_size_m - offs_m);
     const int clip_n =
         kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
+
     DTYPE mine[kRows][kPacks][kPackElems];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
         &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
         input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
-                               r, rank, slot, input_size_n, 1, WORLD,
-                               input_size_m, input_size_n, input_size_m, clip_n,
-                               offs_m, offs_n, 1);
-  }
 
-  barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                 signals_stride_parity, signals_stride_block,
-                 signals_stride_writer, signals_size_parity, signals_size_block,
-                 signals_size_writer, status_ptr, status_stride_field,
-                 status_size_field, rank, timeout_ticks, Until::launched, 0);
-
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-    const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
-    const int clip_n =
-        kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
-    all_gather<AllGatherAlgorithm::tile_staged, QUANTIZE_INT4, DTYPE, WORLD,
-               TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
-        staging_ptr_array, staging_ptr_array_size, slot, input_size_m,
-        input_size_n, clip_n, offs_m, offs_n, rank, copies);
+    all_gather<AllGatherAlgorithm::tile_push, PROTOCOL, QUANTIZE_INT4, DTYPE,
+               WORLD, TILE_M, kTileN, THREADS_PER_BLOCK, WAVE_SIZE, TAIL>(
+        mine, staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
+        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
+        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        unfenced_epochs_ptr, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,
+        signals_stride_parity, signals_stride_block, signals_stride_writer,
+        signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
+        input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, copies);
+
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -348,12 +231,6 @@ DINLINE void all_reduce_one_shot_push_simple(
         rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
-
-  barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                 signals_stride_parity, signals_stride_block,
-                 signals_stride_writer, signals_size_parity, signals_size_block,
-                 signals_size_writer, status_ptr, status_stride_field,
-                 status_size_field, rank, timeout_ticks, Until::read, 1);
 }
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
@@ -453,26 +330,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
-  else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push &&
-                     PROTOCOL == Protocol::ll)
-    all_reduce_one_shot_push_ll<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
-                                THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                CONTIGUOUS, TAIL>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        unfenced_epochs_ptr, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, status_ptr, status_stride_field,
-        status_size_field, rank, timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
-    all_reduce_one_shot_push_simple<QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
-                                    THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                    CONTIGUOUS, TAIL>(
+    all_reduce_one_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
+                             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+                             CONTIGUOUS, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, staging_ptr_array,
-        staging_ptr_array_size, signals_ptr_array, signals_ptr_array_size,
+        staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
+        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        unfenced_epochs_ptr, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,
         signals_stride_parity, signals_stride_block, signals_stride_writer,
         signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank,
