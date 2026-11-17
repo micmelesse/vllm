@@ -12,9 +12,10 @@ namespace hip_custom_communicator {
 
 enum class AllGatherAlgorithm { flat, rows, columns, tile_pull, tile_push };
 
-template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
-          int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename OUTPUT>
+template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
+          typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK,
+          int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS, bool TAIL,
+          typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array,
                         int partials_ptr_array_size, int64_t partials_stride_m,
                         int64_t partials_stride_n, int partials_size_m,
@@ -22,6 +23,7 @@ DINLINE void all_gather(char* const* partials_ptr_array,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int slice, int rank) {
+  static_assert(PROTOCOL == Protocol::simple, "this all-gather runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   if constexpr (ALGORITHM == AllGatherAlgorithm::flat) {
@@ -190,13 +192,15 @@ DINLINE void all_gather(char* const* partials_ptr_array,
   }
 }
 
-template <AllGatherAlgorithm ALGORITHM, bool QUANTIZE_INT4, typename DTYPE,
-          int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool TAIL, typename ENTRY, int ROWS, int PACKS, int ELEMS>
+template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
+          typename DTYPE, int WORLD, int TILE_M, int THREADS_PER_BLOCK,
+          int WAVE_SIZE, bool TAIL, typename ENTRY, int ROWS, int PACKS,
+          int ELEMS>
 DINLINE void all_gather(ENTRY (&entries)[WORLD], int64_t stride_m,
                         int64_t stride_n, int size_m, int size_n, int clip_n,
                         int offs_m, int offs_n,
                         DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+  static_assert(PROTOCOL == Protocol::simple, "this all-gather runs simple");
   static_assert(ALGORITHM == AllGatherAlgorithm::tile_pull,
                 "a tile from where each rank published it");
 #pragma unroll

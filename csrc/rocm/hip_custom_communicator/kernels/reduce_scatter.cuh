@@ -704,9 +704,10 @@ DINLINE void reduce_scatter_columns_push(
 
 }  // namespace internal
 
-template <ReduceScatterAlgorithm ALGORITHM, bool QUANTIZE_INT4, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL, typename DTYPE>
+template <ReduceScatterAlgorithm ALGORITHM, Protocol PROTOCOL,
+          bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
+          bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -722,6 +723,7 @@ DINLINE void reduce_scatter(
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks) {
+  static_assert(PROTOCOL == Protocol::simple, "a reduce-scatter runs simple");
   if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_pull)
     internal::reduce_scatter_flat_pull<QUANTIZE_INT4, WORLD, TILE_M, TILE_N,
                                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
