@@ -257,9 +257,9 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
                              offs_n, 1);
 }
 
-// One tile, pushed into every rank's inbox, then every rank's copy of it read
-// out of this rank's. The protocol is how the inbox is written and how a
-// reader knows a copy arrived.
+// This rank's tile of the input, pushed into every rank's inbox, then every
+// rank's copy of it read out of this rank's. The protocol is how the inbox is
+// written and how a reader knows a copy arrived.
 //   simple: plain stores into every rank's staging buffer, which holds every
 //     rank's whole input; a barrier says every copy is in, a second that every
 //     rank has read it.
@@ -272,22 +272,28 @@ template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile_push(
-    const DTYPE (&mine)[ROWS][PACKS][ELEMS], char* const* staging_ptr_array,
-    int staging_ptr_array_size, char* const* unfenced_ptr_array,
-    int unfenced_ptr_array_size, int64_t unfenced_stride_slot,
-    int64_t unfenced_stride_m, int64_t unfenced_stride_n,
-    int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
-    int32_t* unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block,
-    int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
-    int unfenced_epochs_size_n, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks, int input_size_m, int input_size_n,
-    int offs_m, int offs_n, int clip_m, int clip_n,
+    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size,
+    char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
+    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
+    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
+    int unfenced_size_n, int32_t* unfenced_epochs_ptr,
+    int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n,
+    int unfenced_epochs_size_block, int unfenced_epochs_size_n,
+    uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
+    int64_t signals_stride_parity, int64_t signals_stride_block,
+    int64_t signals_stride_writer, int signals_size_parity,
+    int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
+    int64_t status_stride_field, int status_size_field, int rank,
+    uint64_t timeout_ticks, int input_size_m, int input_size_n, int offs_m,
+    int offs_n, int clip_m, int clip_n,
     DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   if constexpr (PROTOCOL == Protocol::simple) {
+    DTYPE mine[ROWS][PACKS][ELEMS];
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+         Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
+                       1, input_size_m, input_size_n, input_size_m, clip_n,
+                       mine, offs_m, offs_n, 1);
     const int64_t slot = QUANTIZE_INT4
                              ? (int4_payload_bytes(input_size_m, input_size_n) +
                                 kInt4ScalesAlign - 1) /
@@ -332,6 +338,12 @@ DINLINE void all_gather_tile_push(
                        1, unfenced_epochs_size_block, unfenced_epochs_size_n,
                        unfenced_epochs_size_block, unfenced_epochs_size_n, last,
                        first_row, 0, 1);
+    // The epochs first, so they arrive while the tile does.
+    DTYPE mine[ROWS][PACKS][ELEMS];
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
+         Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
+                       1, input_size_m, input_size_n, input_size_m, clip_n,
+                       mine, offs_m, offs_n, 1);
     uint32_t epochs[ROWS];
 #pragma unroll
     for (int i = 0; i < ROWS; ++i) {
@@ -401,7 +413,7 @@ DINLINE void all_gather_tile_push(
 // flat_pull, rows_pull and columns_pull gather each rank's summed slice into
 // the output; tile_pull and tile_push gather each rank's copy of one tile into
 // output[WORLD], for the caller to sum. input is what the algorithm reads
-// from: the partials, each rank's published tile, or this rank's tile.
+// from: the partials, each rank's published input, or this rank's input.
 template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
           typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
@@ -457,9 +469,10 @@ DINLINE void all_gather(
     internal::all_gather_tile_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
                                    TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
                                    TAIL>(
-        input, staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        input, input_stride_m, input_stride_n, staging_ptr_array,
+        staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
+        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n,
         unfenced_epochs_ptr, unfenced_epochs_stride_block,
         unfenced_epochs_stride_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,

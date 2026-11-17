@@ -202,27 +202,22 @@ DINLINE void all_reduce_one_shot_push(
     const int clip_n =
         kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
 
-    DTYPE mine[kRows][kPacks][kPackElems];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::simple,
-         Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n,
-                       1, input_size_m, input_size_n, input_size_m, clip_n,
-                       mine, offs_m, offs_n, 1);
-
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile_push, PROTOCOL, QUANTIZE_INT4, DTYPE,
                WORLD, TILE_M, kTileN, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
                CONTIGUOUS, TAIL>(
-        mine, 0, 0, 0, input_size_m, input_size_n, copies, 0, 0, 0, 0, offs_m,
-        offs_n, clip_m, clip_n, 0, staging_ptr_array, staging_ptr_array_size,
-        unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot,
-        unfenced_stride_m, unfenced_stride_n, unfenced_size_slot,
-        unfenced_size_m, unfenced_size_n, unfenced_epochs_ptr,
-        unfenced_epochs_stride_block, unfenced_epochs_stride_n,
-        unfenced_epochs_size_block, unfenced_epochs_size_n, signals_ptr_array,
-        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        input_ptr, 0, input_stride_m, input_stride_n, input_size_m,
+        input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
+        staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
+        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
+        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        unfenced_epochs_ptr, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,
+        signals_stride_parity, signals_stride_block, signals_stride_writer,
+        signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks);
 
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
