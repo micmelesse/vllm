@@ -144,7 +144,8 @@ struct InputTables {
 };
 
 struct SymmetricMemory {
-  int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0;
+  int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0,
+          lamport_blocks = 0;
 
   int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
           scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0;
@@ -154,8 +155,8 @@ struct SymmetricMemory {
   char* partials = nullptr;
   float* scales = nullptr;
   char* unfenced = nullptr;
-  // Lamport's inbox, unfenced_blocks rows a bank like LL's, all data; its
-  // every position is the sentinel until its data arrives.
+  // Lamport's inbox, LL's rows but lamport_blocks of them a bank, all data;
+  // its every position is the sentinel until its data arrives.
   char* lamport = nullptr;
 
   uint32_t* const* signals_ptr_array = nullptr;

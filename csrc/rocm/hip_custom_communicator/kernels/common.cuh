@@ -517,8 +517,9 @@ DINLINE void read_buffer(
         for (int k = 0; k < kPacks; ++k)
           __builtin_memcpy(output[c][i][k], &got[c][i][k], sizeof(V));
 
-    // Re-arm what was read, landed before this rank sends again: a peer writes
-    // this bank again only after it has those sends.
+    // Re-arm what was read. A peer writes this bank again only after this
+    // rank's next sends, and a Lamport tile push waits for these stores
+    // before sending.
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
@@ -532,7 +533,6 @@ DINLINE void read_buffer(
                 cleared,
                 (__attribute__((address_space(1)))
                  W*)(first + static_cast<uint32_t>(c) * slot_bytes + at[i][k]));
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     static_assert(!QUANTIZE_INT4 && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");

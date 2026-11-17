@@ -477,7 +477,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   if (protocol == Protocol::lamport &&
       ((tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
            s.symmetric.unfenced_slot_bytes ||
-       grid_x * tile_m > s.symmetric.unfenced_blocks))
+       grid_x * tile_m > s.symmetric.lamport_blocks))
     return error_code(Error::unfenced_too_small);
 
   for (const auto& i : kAllReduceInstances)
@@ -553,12 +553,14 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       // LL's and Lamport's inboxes have the same rows; LL's lines are twice
       // as wide, half data.
       if (protocol != Protocol::simple) {
-        unfenced_stride_slot = 2 * s.symmetric.unfenced_blocks *
-                               (s.symmetric.unfenced_slot_bytes / e);
+        const int64_t blocks = protocol == Protocol::lamport
+                                   ? s.symmetric.lamport_blocks
+                                   : s.symmetric.unfenced_blocks;
+        unfenced_stride_slot =
+            2 * blocks * (s.symmetric.unfenced_slot_bytes / e);
         unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
         unfenced_stride_n = 1;
-        unfenced_size_slot = s.world,
-        unfenced_size_m = 2 * s.symmetric.unfenced_blocks,
+        unfenced_size_slot = s.world, unfenced_size_m = 2 * blocks,
         unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
         break;
       }
@@ -697,6 +699,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
                                            : s.symmetric.unfenced_ptr_array;
   int32_t* const inbox_epochs =
       protocol == Protocol::lamport ? s.lamport_epochs : s.unfenced_epochs;
+  const int inbox_blocks = static_cast<int>(protocol == Protocol::lamport
+                                                ? s.symmetric.lamport_blocks
+                                                : s.symmetric.unfenced_blocks);
   const auto launch_all_reduce = [&]<typename T, typename W>() {
     const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
     typed<<<grid, block, 0, stream>>>(
@@ -714,9 +719,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
         static_cast<int>(unfenced_size_n), inbox_epochs, s.unfenced_epoch_words,
-        int64_t{1}, static_cast<int>(s.symmetric.unfenced_blocks),
-        static_cast<int>(s.unfenced_epoch_words), s.symmetric.signals_ptr_array,
-        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        int64_t{1}, inbox_blocks, static_cast<int>(s.unfenced_epoch_words),
+        s.symmetric.signals_ptr_array, s.world,
+        s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
         int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
         int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
   };

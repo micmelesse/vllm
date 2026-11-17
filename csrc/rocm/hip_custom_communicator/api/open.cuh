@@ -102,8 +102,11 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
                                  unfenced_slot_bytes *
                                  (kLineBytes / kLinePayloadBytes);
+  // Lamport's lines are all data, so its inbox affords more rows: a block row
+  // each for a grid that covers 64 tokens of 7168 at a tile of 1024.
+  const int64_t lamport_blocks = 1024;
   const int64_t lamport_bytes =
-      2 * unfenced_blocks * world * unfenced_slot_bytes;
+      2 * lamport_blocks * world * unfenced_slot_bytes;
 
   const int64_t input_table_slots = int64_t{1} << 18;
 
@@ -130,6 +133,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.max_blocks = max_blocks;
   symmetric.unfenced_blocks = unfenced_blocks;
   symmetric.unfenced_slot_bytes = unfenced_slot_bytes;
+  symmetric.lamport_blocks = lamport_blocks;
   symmetric.signals_bytes = signals_bytes;
   symmetric.staging_bytes = staging_bytes;
   symmetric.partials_bytes = partials_bytes;
@@ -170,7 +174,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
            unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
            false);
   allocate(s->lamport_epochs,
-           unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
+           lamport_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
