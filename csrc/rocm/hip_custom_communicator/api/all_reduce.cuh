@@ -68,9 +68,6 @@ ErrorCode hip_custom_communicator_all_reduce(
     protocol = Protocol::ll;
   else
     return error_code(Error::no_such_protocol);
-  if (protocol == Protocol::ll &&
-      algorithm != AllReduceAlgorithm::one_shot_push)
-    return error_code(Error::protocol_not_supported);
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";

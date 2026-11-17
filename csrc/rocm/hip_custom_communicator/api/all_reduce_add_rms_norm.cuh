@@ -117,9 +117,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       split = true, all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
       break;
   }
-  if (protocol == Protocol::ll &&
-      !(split && all_reduce_algorithm == AllReduceAlgorithm::one_shot_push))
-    return error_code(Error::protocol_not_supported);
   for (const std::optional<int64_t>& field :
        {add_rms_norm_grid_x, add_rms_norm_grid_y, add_rms_norm_grid_z,
         add_rms_norm_block_x, add_rms_norm_block_y, add_rms_norm_block_z,

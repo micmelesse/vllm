@@ -201,8 +201,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
                    static_cast<unsigned>(block_z));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (!split) {
-    if (protocol == Protocol::ll)
-      return error_code(Error::protocol_not_supported);
     AllReduceAddAttnResRmsNormAlgorithm algorithm;
     if (algorithm_name == "one_shot_pull")
       algorithm = AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull;
@@ -409,9 +407,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     all_reduce_algorithm = AllReduceAlgorithm::two_shot_push;
   else
     return error_code(Error::no_such_kernel);
-  if (protocol == Protocol::ll &&
-      all_reduce_algorithm != AllReduceAlgorithm::one_shot_push)
-    return error_code(Error::protocol_not_supported);
   if (quantization_name != "exact" && quantization_name != "int4")
     return error_code(Error::no_such_quantization);
   const bool int4_config = quantization_name == "int4";

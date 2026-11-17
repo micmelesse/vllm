@@ -187,6 +187,13 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     and build.tile_k != 1
                 ):
                     raise SystemExit(f"{path}: {arch}: {build}: its kernel has no K")
+                if (
+                    "protocol" not in TEMPLATE_ARGS[build.kernel].split()
+                    and build.protocol != "simple"
+                ):
+                    raise SystemExit(
+                        f"{path}: {arch}: {build}: its kernel runs only simple"
+                    )
                 if build not in builds:
                     builds.append(build)
     return out

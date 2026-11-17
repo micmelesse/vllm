@@ -45,18 +45,6 @@ _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
 
 Protocol = Literal["simple", "ll"]
 
-_LL_ALGORITHMS = ("one_shot_push", "one_shot_push_split")
-
-
-def _protocols(algorithm: str) -> tuple[Protocol, ...]:
-    return ("simple", "ll") if algorithm in _LL_ALGORITHMS else ("simple",)
-
-
-def _algorithm_protocols(
-    algorithms: tuple[str, ...],
-) -> tuple[tuple[str, Protocol], ...]:
-    return tuple((a, p) for a in algorithms for p in _protocols(a))
-
 
 AllReduceAlgorithm = Literal[
     "one_shot_pull",
@@ -220,7 +208,6 @@ class Error(IntEnum):
     peer_not_accessible = 40
     peers_not_opened = 41
     no_such_protocol = 42
-    protocol_not_supported = 43
 
     no_problem_size = 100
     no_tuned_table = 101
@@ -271,9 +258,6 @@ class Build:
 class AllReduceConfig:
     kernel: ClassVar[str] = "all_reduce"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAlgorithm)
-    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
-        _algorithm_protocols(get_args(AllReduceAlgorithm))
-    )
     tile_k: ClassVar[int] = 1
     algorithm: AllReduceAlgorithm
     protocol: Protocol
@@ -294,9 +278,6 @@ class AllReduceConfig:
 class AllReduceAddRmsNormConfig:
     kernel: ClassVar[str] = "all_reduce_add_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(AllReduceAddRmsNormAlgorithm)
-    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
-        _algorithm_protocols(get_args(AllReduceAddRmsNormAlgorithm))
-    )
     tile_k: ClassVar[int] = 1
     algorithm: AllReduceAddRmsNormAlgorithm
     protocol: Protocol
@@ -332,9 +313,6 @@ class AllReduceAddAttnResRmsNormConfig:
     kernel: ClassVar[str] = "all_reduce_add_attn_res_rms_norm"
     algorithms: ClassVar[tuple[str, ...]] = get_args(
         AllReduceAddAttnResRmsNormAlgorithm
-    )
-    algorithm_protocols: ClassVar[tuple[tuple[str, Protocol], ...]] = (
-        _algorithm_protocols(get_args(AllReduceAddAttnResRmsNormAlgorithm))
     )
     algorithm: AllReduceAddAttnResRmsNormAlgorithm
     protocol: Protocol
@@ -600,13 +578,11 @@ def _table_of(tables: Any, path: Path, arch: str) -> TunedTable | Error:
                 f"{where}: {c['kernel']} has no algorithm {c['algorithm']}",
             )
             return Error.tuned_table_unsound
-        if (c["protocol"] not in get_args(Protocol)) or (
-            c["protocol"] not in _protocols(c["algorithm"])
-        ):
+        if c["protocol"] not in get_args(Protocol):
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
                 Error.tuned_table_unsound.name,
-                f"{where}: {c['algorithm']} does not run {c['protocol']}",
+                f"{where}: no protocol {c['protocol']}",
             )
             return Error.tuned_table_unsound
         for k in ("algorithm", "tile_k"):

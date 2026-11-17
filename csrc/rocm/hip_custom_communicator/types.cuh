@@ -80,7 +80,6 @@ enum class Error : int {
   peer_not_accessible = 40,
   peers_not_opened = 41,
   no_such_protocol = 42,
-  protocol_not_supported = 43,
 };
 
 enum class AllReduceAddRmsNormAlgorithm : int {
