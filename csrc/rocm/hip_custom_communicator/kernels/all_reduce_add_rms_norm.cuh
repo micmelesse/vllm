@@ -33,8 +33,8 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
   DTYPE res[ROWS][K][P];
   if constexpr (RESIDUAL)
     load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, m,
-        n, m, n, res, offs_m, 0, 1);
+        residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n, m, n,
+        res, offs_m, 0, 1);
   float s[ROWS][K][P];
   DTYPE added[ROWS][K][P];
 #pragma unroll
@@ -49,7 +49,7 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
       }
   if constexpr (RESIDUAL)
     store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
+        added, residual_output_ptr, 0, 0, residual_output_stride_m,
         residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
   float scale[ROWS];
   DTYPE normed[ROWS][K][P];
@@ -57,8 +57,8 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
                                               inv_hidden, n, 0, NormPart::row,
                                               true, Layout::tile);
   store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-      normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m,
-      n, m, n, offs_m, 0, 1);
+      normed, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n,
+      offs_m, 0, 1);
 }
 
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
@@ -86,12 +86,12 @@ DINLINE void add_rms_norm_rows(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
       load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
-          x, offs_m, c, 1);
+          input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
+          offs_m, c, 1);
       if constexpr (RESIDUAL)
         load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1,
-            m, n, m, n, res, offs_m, c, 1);
+            residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n,
+            m, n, res, offs_m, c, 1);
       float s[TILE_M][kPacks][kPackElems];
 #pragma unroll
       for (int i = 0; i < TILE_M; ++i)
@@ -113,12 +113,12 @@ DINLINE void add_rms_norm_rows(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
       load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
-          x, offs_m, c, 1);
+          input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
+          offs_m, c, 1);
       if constexpr (RESIDUAL)
         load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1,
-            m, n, m, n, res, offs_m, c, 1);
+            residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n,
+            m, n, res, offs_m, c, 1);
       float s[TILE_M][kPacks][kPackElems];
       DTYPE added[TILE_M][kPacks][kPackElems];
 #pragma unroll
@@ -134,28 +134,27 @@ DINLINE void add_rms_norm_rows(
           }
       if constexpr (RESIDUAL)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
+            added, residual_output_ptr, 0, 0, residual_output_stride_m,
             residual_output_stride_n, 1, m, n, m, n, offs_m, c, 1);
       WEIGHT_DTYPE w[1][kPacks][kPackElems];
       load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, c,
-          1);
+          weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, c, 1);
       DTYPE normed[TILE_M][kPacks][kPackElems];
       rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(
           s, scale, w, normed, eps, inv_hidden, n, c, NormPart::apply, true,
           Layout::tile);
       store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-          normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-          m, n, m, n, offs_m, c, 1);
+          normed, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n,
+          m, n, offs_m, c, 1);
     }
   } else {
     DTYPE x[TILE_M][kPacks][kPackElems];
     load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
-        x, offs_m, 0, 1);
+        input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
+        offs_m, 0, 1);
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
     add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
         offs_m, x, w, m, n, residual_ptr, residual_stride_m, residual_stride_n,
         output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -221,11 +220,12 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
       for (int c = 0; c < n; c += kSpan) {
         DTYPE mine[TILE_M][kPacks][kPackElems];
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m,
-            n, mine, t * TILE_M, c, 1);
-        store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile,
-              TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
-                    n, 1, 1, m, n, m, n, t * TILE_M, c, 1);
+            input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
+            mine, t * TILE_M, c, 1);
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true,
+             Protocol::simple, Layout::tile, TAIL>(
+            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
+            1, m, n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
@@ -246,7 +246,7 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
@@ -275,8 +275,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
@@ -349,7 +349,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
@@ -365,8 +365,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
@@ -433,7 +433,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
@@ -449,8 +449,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
@@ -515,7 +515,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
     load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
@@ -528,8 +528,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,

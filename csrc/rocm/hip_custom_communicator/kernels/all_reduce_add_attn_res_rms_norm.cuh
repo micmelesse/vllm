@@ -154,11 +154,12 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
       for (int c = 0; c < n; c += kSpan) {
         DTYPE mine[TILE_M][kPacks][kPackElems];
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m,
-            n, mine, t * TILE_M, c, 1);
-        store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile,
-              TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
-                    n, 1, 1, m, n, m, n, t * TILE_M, c, 1);
+            input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
+            mine, t * TILE_M, c, 1);
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true,
+             Protocol::simple, Layout::tile, TAIL>(
+            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
+            1, m, n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
@@ -203,8 +204,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -303,8 +304,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -397,8 +398,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -486,8 +487,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
 
       if constexpr (CHUNKED)
         store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-            sum, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1,
-            m, n, m, n, row, c, 1);
+            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
+            n, row, c, 1);
       else
         add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,

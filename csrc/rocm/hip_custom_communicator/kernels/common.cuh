@@ -1490,17 +1490,15 @@ DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&encoded)[1][K][2]) {
 }
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL = false, typename PTR,
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL = false, typename T,
           typename OUTPUT>
-DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
-                  int input_rank, int input_slot, int64_t input_stride_slot,
+DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
                   int64_t input_stride_m, int64_t input_stride_n,
                   int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                  int offs_n, int row_step, const uint32_t* flags = nullptr,
-                  uint32_t* status_ptr = nullptr,
-                  int64_t status_stride_field = 0, int status_size_field = 0,
-                  uint64_t timeout_ticks = 0) {
+                  int offs_n, int row_step) {
+  static_assert(!std::is_pointer_v<T>,
+                "a pointer array is other ranks' memory: send or recv it");
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
   constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
   if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
@@ -1516,13 +1514,11 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
     for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
       Group group;
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
-           TAIL>(input_ptr_array, input_ptr_array_size, input_rank, input_slot,
-                 input_stride_slot, input_stride_m, input_stride_n,
-                 input_size_slot, input_size_m, input_size_n, clip_m, clip_n,
-                 group, offs_m,
+           TAIL>(input, input_slot, input_stride_slot, input_stride_m,
+                 input_stride_n, input_size_slot, input_size_m, input_size_n,
+                 clip_m, clip_n, group, offs_m,
                  offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
-                 row_step, flags, status_ptr, status_stride_field,
-                 status_size_field, timeout_ticks);
+                 row_step);
 #pragma unroll
       for (int c = 0; c < kCopies; ++c)
 #pragma unroll
@@ -1536,18 +1532,11 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size,
           }
     }
   } else {
-    const auto* const entries =
-        (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-    const void* const input =
-        __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
-            ? entries[0]
-            : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
     internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
                           QUANTIZE_INT4, Protocol::simple, LAYOUT, TAIL>(
         input, input_slot, input_stride_slot, input_stride_m, input_stride_n,
         input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
-        offs_m, offs_n, row_step, input_rank, flags, status_ptr,
-        status_stride_field, status_size_field, timeout_ticks);
+        offs_m, offs_n, row_step);
   }
 }
 
@@ -1635,13 +1624,14 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL = false, typename INPUT,
-          typename PTR>
-DINLINE void store(const INPUT& input, PTR const* output_ptr_array,
-                   int output_ptr_array_size, int output_rank, int output_slot,
+          typename T>
+DINLINE void store(const INPUT& input, T* output, int output_slot,
                    int64_t output_stride_slot, int64_t output_stride_m,
                    int64_t output_stride_n, int output_size_slot,
                    int output_size_m, int output_size_n, int clip_m, int clip_n,
                    int offs_m, int offs_n, int row_step) {
+  static_assert(!std::is_pointer_v<T>,
+                "a pointer array is other ranks' memory: send or recv it");
   constexpr int kPacks = std::extent_v<INPUT, 1>;
   if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
                 kPacks != kInt4GroupPacks) {
@@ -1658,21 +1648,13 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array,
         for (int j = 0; j < kPackElems; ++j)
           group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
       store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
-            TAIL>(group, output_ptr_array, output_ptr_array_size, output_rank,
-                  output_slot, output_stride_slot, output_stride_m,
-                  output_stride_n, output_size_slot, output_size_m,
-                  output_size_n, clip_m, clip_n, offs_m,
+            TAIL>(group, output, output_slot, output_stride_slot,
+                  output_stride_m, output_stride_n, output_size_slot,
+                  output_size_m, output_size_n, clip_m, clip_n, offs_m,
                   offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
                   row_step);
     }
   } else {
-    const auto* const entries =
-        (decltype(+output_ptr_array[0]) const*)output_ptr_array;
-    void* const output = __builtin_constant_p(output_ptr_array_size) &&
-                                 output_ptr_array_size == 1
-                             ? entries[0]
-                             : internal::ptr_array_at(
-                                   entries, output_ptr_array_size, output_rank);
     internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
                            QUANTIZE_INT4, Protocol::simple, LAYOUT, TAIL>(
         input, output, output_slot, output_stride_slot, output_stride_m,

@@ -40,8 +40,7 @@ DINLINE void all_gather_flat_pull(
     int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
     int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
     int offs_n, int, int rank) {
-  static_assert(PROTOCOL == Protocol::simple,
-                "a pull reads what its owner wrote plainly, so it runs simple");
+  static_assert(PROTOCOL == Protocol::simple, "this pull has no LL branch yet");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   DTYPE* const output_ptr = output;
@@ -82,8 +81,8 @@ DINLINE void all_gather_flat_pull(
       for (int k = 0; k < kInt4GroupPacks; ++k)
         dequantize(words[0][k], x[0][k]);
       store<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kOutput, TAIL>(
-          x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
-          WORLD, output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
+          x, output_ptr, r, slice, output_stride_m, output_stride_n, WORLD,
+          output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
     }
   } else {
     constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;
@@ -113,8 +112,8 @@ DINLINE void all_gather_flat_pull(
                          got, 0, chunk * kChunkN, 0);
 
       store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kOutput, TAIL>(
-          got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n,
-          WORLD, output_size_m, output_size_n, 1,
+          got, output_ptr, r, slice, output_stride_m, output_stride_n, WORLD,
+          output_size_m, output_size_n, 1,
           kWhole ? share_len(r) : min(share_len(r), chunk * kChunkN + kChunkN),
           0, chunk * kChunkN, 1);
     }
@@ -131,8 +130,7 @@ DINLINE void all_gather_rows_pull(
     int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
     int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
     int offs_n, int slice, int rank) {
-  static_assert(PROTOCOL == Protocol::simple,
-                "a pull reads what its owner wrote plainly, so it runs simple");
+  static_assert(PROTOCOL == Protocol::simple, "this pull has no LL branch yet");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   using Tile = std::remove_reference_t<OUTPUT>;
@@ -185,8 +183,7 @@ DINLINE void all_gather_columns_pull(
     int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
     int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
     int offs_n, int slice, int rank) {
-  static_assert(PROTOCOL == Protocol::simple,
-                "a pull reads what its owner wrote plainly, so it runs simple");
+  static_assert(PROTOCOL == Protocol::simple, "this pull has no LL branch yet");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr bool kInt4 = QUANTIZE_INT4;
   using Tile = std::remove_reference_t<OUTPUT>;
@@ -245,8 +242,7 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
                                   int64_t stride_n, int size_m, int size_n,
                                   int clip_n, int offs_m, int offs_n,
                                   DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
-  static_assert(PROTOCOL == Protocol::simple,
-                "a pull reads what its owner wrote plainly, so it runs simple");
+  static_assert(PROTOCOL == Protocol::simple, "this pull has no LL branch yet");
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
     recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
@@ -289,7 +285,7 @@ DINLINE void all_gather_tile_push(
   if constexpr (PROTOCOL == Protocol::simple) {
     DTYPE mine[ROWS][PACKS][ELEMS];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
+        input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
         input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
     const int64_t slot = QUANTIZE_INT4
                              ? (int4_payload_bytes(input_size_m, input_size_n) +
@@ -330,13 +326,13 @@ DINLINE void all_gather_tile_push(
     // The epochs first, so they arrive while the tile does.
     int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
         unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
         unfenced_epochs_size_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, last, first_row, 0, 1);
     DTYPE mine[ROWS][PACKS][ELEMS];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
+        input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
         input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
     uint32_t epochs[ROWS];
 #pragma unroll
@@ -392,7 +388,7 @@ DINLINE void all_gather_tile_push(
     for (int i = 0; i < ROWS; ++i)
       next[i][0][0] = static_cast<int32_t>(epochs[i]);
     store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
-        next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+        next, unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
         unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
         unfenced_epochs_size_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, first_row, 0, 1);
