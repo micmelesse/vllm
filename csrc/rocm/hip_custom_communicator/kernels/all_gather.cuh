@@ -11,7 +11,13 @@
 
 namespace hip_custom_communicator {
 
-enum class AllGatherAlgorithm { flat, rows, columns, tile_pull, tile_push };
+enum class AllGatherAlgorithm {
+  flat_pull,
+  rows_pull,
+  columns_pull,
+  tile_pull,
+  tile_push
+};
 
 // The elements a thread packs per access in a tile push. An LL line is half
 // data, so exact LL packs no wider than a line's payload.
@@ -28,14 +34,12 @@ namespace internal {
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename OUTPUT>
-DINLINE void all_gather_flat(char* const* partials_ptr_array,
-                             int partials_ptr_array_size,
-                             int64_t partials_stride_m,
-                             int64_t partials_stride_n, int partials_size_m,
-                             int partials_size_n, OUTPUT&& output,
-                             int64_t output_stride_m, int64_t output_stride_n,
-                             int output_size_m, int output_size_n, int offs_m,
-                             int offs_n, int, int rank) {
+DINLINE void all_gather_flat_pull(
+    char* const* partials_ptr_array, int partials_ptr_array_size,
+    int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
+    int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
+    int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
+    int offs_n, int, int rank) {
   static_assert(PROTOCOL == Protocol::simple,
                 "a pull reads what its owner wrote plainly, so it runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -123,14 +127,12 @@ DINLINE void all_gather_flat(char* const* partials_ptr_array,
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename OUTPUT>
-DINLINE void all_gather_rows(char* const* partials_ptr_array,
-                             int partials_ptr_array_size,
-                             int64_t partials_stride_m,
-                             int64_t partials_stride_n, int partials_size_m,
-                             int partials_size_n, OUTPUT&& output,
-                             int64_t output_stride_m, int64_t output_stride_n,
-                             int output_size_m, int output_size_n, int offs_m,
-                             int offs_n, int slice, int rank) {
+DINLINE void all_gather_rows_pull(
+    char* const* partials_ptr_array, int partials_ptr_array_size,
+    int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
+    int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
+    int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
+    int offs_n, int slice, int rank) {
   static_assert(PROTOCOL == Protocol::simple,
                 "a pull reads what its owner wrote plainly, so it runs simple");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -179,7 +181,7 @@ DINLINE void all_gather_rows(char* const* partials_ptr_array,
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename OUTPUT>
-DINLINE void all_gather_columns(
+DINLINE void all_gather_columns_pull(
     char* const* partials_ptr_array, int partials_ptr_array_size,
     int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
     int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
@@ -396,8 +398,8 @@ DINLINE void all_gather_tile_push(
 }  // namespace internal
 
 // Every rank contributes a chunk; every rank ends with every rank's chunk.
-// flat, rows and columns gather each rank's summed slice into the output;
-// tile_pull and tile_push gather each rank's copy of one tile into
+// flat_pull, rows_pull and columns_pull gather each rank's summed slice into
+// the output; tile_pull and tile_push gather each rank's copy of one tile into
 // output[WORLD], for the caller to sum. input is what the algorithm reads
 // from: the partials, each rank's published tile, or this rank's tile.
 template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
@@ -422,26 +424,26 @@ DINLINE void all_gather(
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
-  if constexpr (ALGORITHM == AllGatherAlgorithm::flat)
-    internal::all_gather_flat<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
-                              THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                              CONTIGUOUS, TAIL>(
+  if constexpr (ALGORITHM == AllGatherAlgorithm::flat_pull)
+    internal::all_gather_flat_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
+                                   TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                                   PACK_BYTES, CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
         input_size_m, input_size_n, std::forward<OUTPUT>(output),
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,
         offs_n, slice, rank);
-  else if constexpr (ALGORITHM == AllGatherAlgorithm::rows)
-    internal::all_gather_rows<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
-                              THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                              CONTIGUOUS, TAIL>(
+  else if constexpr (ALGORITHM == AllGatherAlgorithm::rows_pull)
+    internal::all_gather_rows_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
+                                   TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                                   PACK_BYTES, CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
         input_size_m, input_size_n, std::forward<OUTPUT>(output),
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,
         offs_n, slice, rank);
-  else if constexpr (ALGORITHM == AllGatherAlgorithm::columns)
-    internal::all_gather_columns<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_N,
-                                 THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                 CONTIGUOUS, TAIL>(
+  else if constexpr (ALGORITHM == AllGatherAlgorithm::columns_pull)
+    internal::all_gather_columns_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
+                                      TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
+                                      PACK_BYTES, CONTIGUOUS, TAIL>(
         input, input_ptr_array_size, input_stride_m, input_stride_n,
         input_size_m, input_size_n, std::forward<OUTPUT>(output),
         output_stride_m, output_stride_n, output_size_m, output_size_n, offs_m,

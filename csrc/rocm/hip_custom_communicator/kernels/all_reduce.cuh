@@ -151,8 +151,8 @@ DINLINE void all_reduce_two_shot_pull(
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
-  all_gather<AllGatherAlgorithm::flat, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
-             TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+  all_gather<AllGatherAlgorithm::flat_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
+             WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
              CONTIGUOUS, TAIL>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,
@@ -275,8 +275,8 @@ DINLINE void all_reduce_two_shot_push(
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
-  all_gather<AllGatherAlgorithm::flat, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
-             TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+  all_gather<AllGatherAlgorithm::flat_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
+             WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
              CONTIGUOUS, TAIL>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,

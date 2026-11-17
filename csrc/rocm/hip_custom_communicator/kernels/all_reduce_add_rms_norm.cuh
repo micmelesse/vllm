@@ -361,7 +361,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      all_gather<AllGatherAlgorithm::rows, Protocol::simple, QUANTIZE_INT4,
+      all_gather<AllGatherAlgorithm::rows_pull, Protocol::simple, QUANTIZE_INT4,
                  DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
                  PACK_BYTES, true, TAIL>(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
@@ -446,9 +446,9 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      all_gather<AllGatherAlgorithm::columns, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, true, TAIL>(
+      all_gather<AllGatherAlgorithm::columns_pull, Protocol::simple,
+                 QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
+                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
