@@ -102,6 +102,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
                                  unfenced_slot_bytes *
                                  (kLineBytes / kLinePayloadBytes);
+  const int64_t lamport_bytes =
+      2 * unfenced_blocks * world * unfenced_slot_bytes;
 
   const int64_t input_table_slots = int64_t{1} << 18;
 
@@ -133,6 +135,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.partials_bytes = partials_bytes;
   symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
   symmetric.unfenced_bytes = unfenced_bytes;
+  symmetric.lamport_bytes = lamport_bytes;
   s->unfenced_epoch_words = unfenced_epoch_words;
   s->input_tables.slots = input_table_slots;
 
@@ -153,25 +156,35 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.partials, symmetric.partials_bytes, true);
   allocate(symmetric.scales, symmetric.scales_bytes, true);
   allocate(symmetric.unfenced, symmetric.unfenced_bytes, true);
+  allocate(symmetric.lamport, symmetric.lamport_bytes, true);
+  made = made &&
+         hipMemset(symmetric.lamport, kLamportEmpty & 0xff,
+                   static_cast<size_t>(symmetric.lamport_bytes)) == hipSuccess;
   allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.partials_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
   allocate(s->unfenced_epochs,
+           unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
+           false);
+  allocate(s->lamport_epochs,
            unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
            input_table_slots * world * int64_t{sizeof(void*)}, false);
 
-  constexpr int kRegions = 5;
+  constexpr int kRegions = 6;
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
   std::string mine(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
   char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
-                               symmetric.staging, symmetric.partials,
+                               symmetric.staging,
+                               symmetric.partials,
                                reinterpret_cast<char*>(symmetric.scales),
-                               symmetric.unfenced};
+                               symmetric.unfenced,
+                               symmetric.lamport};
   for (char* region : own) {
     hipIpcMemHandle_t h{};
     made = made && hipIpcGetMemHandle(&h, region) == hipSuccess;
@@ -206,9 +219,9 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         failed = Error::peer_not_accessible;
     }
   const void* const arrays[kRegions] = {
-      symmetric.signals_ptr_array, symmetric.staging_ptr_array,
+      symmetric.signals_ptr_array,  symmetric.staging_ptr_array,
       symmetric.partials_ptr_array, symmetric.scales_ptr_array,
-      symmetric.unfenced_ptr_array};
+      symmetric.unfenced_ptr_array, symmetric.lamport_ptr_array};
   for (int region = 0; region < kRegions && !failed; ++region) {
     std::vector<char*> addresses(world);
     for (int r = 0; r < world && !failed; ++r) {

@@ -25,6 +25,19 @@ struct traits {
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+
+// A pack's raw bytes, moved in one access.
+template <int BYTES>
+using raw_t = std::conditional_t<
+    BYTES == 16, u32x4,
+    std::conditional_t<BYTES == 8, u32x2,
+                       std::conditional_t<BYTES == 4, uint32_t, uint16_t>>>;
+
+// Lamport's sentinel: an inbox position holds it until its data arrives. It is
+// a NaN in bf16 and fp16, and a sent 0xffff becomes 0x7fff, also a NaN, so
+// data never carries it.
+constexpr uint16_t kLamportEmpty = 0xffff;
 
 typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 
@@ -103,7 +116,7 @@ enum class Layout { tile, run, flat, group_run, group_flat };
 
 // How a receiver knows a peer's data has arrived. Simple: the data, then a
 // barrier. LL: a flag in every line, half the line payload.
-enum class Protocol { simple, ll };
+enum class Protocol { simple, ll, lamport };
 
 template <int LOWEST = kInt4Lowest, int HIGHEST = kInt4Highest, typename U,
           int P>
@@ -401,6 +414,125 @@ DINLINE void read_buffer(
             __builtin_memcpy(output[c][i][k], words, sizeof(V));
           }
         }
+  } else if constexpr (PROTOCOL == Protocol::lamport) {
+    static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
+    static_assert(kSlots && kCopies == WORLD,
+                  "a Lamport read is every writer's copy");
+    static_assert(!QUANTIZE_INT4 && sizeof(U) == 2,
+                  "the sentinel is a 2-byte NaN");
+    using W = raw_t<sizeof(V)>;
+    constexpr int kHalves = sizeof(V) / 2;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (input_slot < 0 || input_slot + WORLD > input_size_slot ||
+         flags == nullptr))
+      __builtin_trap();
+
+    char* const first =
+        const_cast<char*>(reinterpret_cast<const char*>(input)) +
+        int64_t{input_slot} * input_stride_slot * int64_t{sizeof(U)};
+    const uint32_t slot_bytes =
+        static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
+    const uint32_t row_bytes =
+        static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+    const int bank_rows = input_size_m / 2;
+    uint32_t at[kRows][kPacks];
+    bool waits[kRows][kPacks];
+#pragma unroll
+    for (int i = 0; i < kRows; ++i)
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k) {
+        const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+            (row < 0 || row >= input_size_m || flags[i] == 0))
+          __builtin_trap();
+        at[i][k] = static_cast<uint32_t>(row) * row_bytes +
+                   static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+        waits[i][k] =
+            row_at(i) < clip_m &&
+            offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
+      }
+    const auto empty = [](const W& w) {
+      uint16_t h[kHalves];
+      __builtin_memcpy(h, &w, sizeof(h));
+      bool any = false;
+#pragma unroll
+      for (int j = 0; j < kHalves; ++j) any |= h[j] == kLamportEmpty;
+      return any;
+    };
+    W got[WORLD][kRows][kPacks];
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+#pragma unroll
+      for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k) {
+            uint32_t a = static_cast<uint32_t>(c) * slot_bytes + at[i][k];
+            asm volatile("" : "+v"(a));
+            got[c][i][k] = __builtin_nontemporal_load(
+                (const __attribute__((address_space(1))) W*)(first + a));
+          }
+      asm volatile("" ::: "memory");
+      bool missing = false;
+#pragma unroll
+      for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k)
+            missing |= waits[i][k] && empty(got[c][i][k]);
+
+      if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
+      if ((n & 255u) != 0) continue;
+
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(
+              status_ptr + static_cast<int64_t>(StatusField::abort) *
+                               status_stride_field,
+              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+        continue;
+      if (!aborted) {
+        uint32_t peer = 0;
+#pragma unroll
+        for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+          for (int i = 0; i < kRows; ++i)
+#pragma unroll
+            for (int k = 0; k < kPacks; ++k)
+              if (waits[i][k] && empty(got[c][i][k])) peer = c;
+        give_up(status_ptr, status_stride_field, status_size_field,
+                Where::start, rank, peer, kLamportEmpty, flags[0], waited);
+      }
+      __builtin_amdgcn_endpgm();
+    }
+
+#pragma unroll
+    for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+      for (int i = 0; i < kRows; ++i)
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k)
+          __builtin_memcpy(output[c][i][k], &got[c][i][k], sizeof(V));
+
+    // Re-arm what was read, before this rank's next sends: a peer writes this
+    // bank again only after it has those.
+    W cleared;
+    __builtin_memset(&cleared, 0xff, sizeof(cleared));
+#pragma unroll
+    for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+      for (int i = 0; i < kRows; ++i)
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k)
+          if (waits[i][k])
+            __builtin_nontemporal_store(
+                cleared,
+                (__attribute__((address_space(1)))
+                 W*)(first + static_cast<uint32_t>(c) * slot_bytes + at[i][k]));
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     static_assert(!QUANTIZE_INT4 && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
@@ -873,6 +1005,44 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
               // has the whole line.
               u32x4{words[2 * h], flags[i], words[2 * h + 1], flags[i]},
               (global_u32x4*)(slot + at + h * half));
+      }
+    }
+  } else if constexpr (PROTOCOL == Protocol::lamport) {
+    static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
+    static_assert(!QUANTIZE_INT4 && sizeof(U) == 2,
+                  "the sentinel is a 2-byte NaN");
+    using W = raw_t<sizeof(V)>;
+    constexpr int kHalves = sizeof(V) / 2;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
+
+    const int bank_rows = output_size_m / 2;
+    char* const slot =
+        reinterpret_cast<char*>(output) +
+        int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)};
+    const uint32_t row_bytes =
+        static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
+      const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+          (row >= output_size_m || flags[i] == 0))
+        __builtin_trap();
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k) {
+        if (col_at(k) >= clip_n / kPackElems) continue;
+        uint16_t h[kHalves];
+        __builtin_memcpy(h, input[i][k], sizeof(h));
+#pragma unroll
+        for (int j = 0; j < kHalves; ++j)
+          if (h[j] == kLamportEmpty) h[j] = 0x7fff;
+        W w;
+        __builtin_memcpy(&w, h, sizeof(w));
+        uint32_t at = static_cast<uint32_t>(row) * row_bytes +
+                      static_cast<uint32_t>(col_at(k)) * uint32_t{sizeof(V)};
+        asm volatile("" : "+v"(at));
+        __builtin_nontemporal_store(
+            w, (__attribute__((address_space(1))) W*)(slot + at));
       }
     }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {

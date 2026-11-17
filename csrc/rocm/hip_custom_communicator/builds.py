@@ -28,7 +28,11 @@ WEIGHT_DTYPE = "f32"
 CPP_TYPES = {"f16": "c10::Half", "bf16": "c10::BFloat16", "f32": "float"}
 SCALAR_TYPES = {"f16": "Half", "bf16": "BFloat16", "f32": "Float"}
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
-PROTOCOLS = {"simple": "Protocol::simple", "ll": "Protocol::ll"}
+PROTOCOLS = {
+    "simple": "Protocol::simple",
+    "ll": "Protocol::ll",
+    "lamport": "Protocol::lamport",
+}
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormKernelAlgorithm",

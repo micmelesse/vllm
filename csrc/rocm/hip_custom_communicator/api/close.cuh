@@ -32,12 +32,15 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
         static_cast<const void*>(s->symmetric.partials),
         static_cast<const void*>(s->symmetric.scales),
         static_cast<const void*>(s->symmetric.unfenced),
+        static_cast<const void*>(s->symmetric.lamport),
         static_cast<const void*>(s->symmetric.signals_ptr_array),
         static_cast<const void*>(s->symmetric.staging_ptr_array),
         static_cast<const void*>(s->symmetric.partials_ptr_array),
         static_cast<const void*>(s->symmetric.scales_ptr_array),
         static_cast<const void*>(s->symmetric.unfenced_ptr_array),
+        static_cast<const void*>(s->symmetric.lamport_ptr_array),
         static_cast<const void*>(s->unfenced_epochs),
+        static_cast<const void*>(s->lamport_epochs),
         static_cast<const void*>(s->status_device),
         static_cast<const void*>(s->input_tables.device)})
     if (p != nullptr && hipFree(const_cast<void*>(p)) != hipSuccess) {

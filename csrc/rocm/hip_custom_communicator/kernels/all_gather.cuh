@@ -20,10 +20,11 @@ enum class AllGatherAlgorithm {
 };
 
 // The elements a thread packs per access in a tile push. An LL line is half
-// data, so exact LL packs no wider than a line's payload.
+// data, so exact LL packs no wider than a line's payload; Lamport's is all
+// data.
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int PACK_BYTES>
 constexpr int kTilePushPackElems =
-    QUANTIZE_INT4 || PROTOCOL == Protocol::simple
+    QUANTIZE_INT4 || PROTOCOL != Protocol::ll
         ? traits<DTYPE, PACK_BYTES>::N
         : (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) /
               static_cast<int>(sizeof(DTYPE));
@@ -257,11 +258,13 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
 //   simple: plain stores into every rank's staging buffer, which holds every
 //     rank's whole input; a barrier says every copy is in, a second that every
 //     rank has read it.
-//   ll: lines of half data, half the row's epoch, into an inbox row for each
-//     row the block owns; a reader polls each line until it carries the
-//     epoch, so the data is its own signal. Each row's epoch is kept in this
-//     rank's epochs buffer from tile to tile and launch to launch, and the
-//     next tile reuses the inbox rows.
+//   ll, lamport: the data is its own signal, sent into an inbox row for each
+//     row the block owns, in one of two banks by the row's epoch. LL's lines
+//     are half data, half the epoch, and a reader polls each until it carries
+//     the epoch. Lamport's are all data, and a reader polls each until no
+//     element is the sentinel, then writes the sentinel back. Each row's epoch
+//     is kept in this rank's epochs buffer from tile to tile and launch to
+//     launch, and the next tile reuses the inbox rows.
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
@@ -316,7 +319,9 @@ DINLINE void all_gather_tile_push(
                    signals_size_block, signals_size_writer, status_ptr,
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::read, 1);
-  } else if constexpr (PROTOCOL == Protocol::ll) {
+  } else {
+    static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
+                  "a tile push is simple, LL or Lamport");
     constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
     constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
@@ -360,7 +365,7 @@ DINLINE void all_gather_tile_push(
                    reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Protocol::ll,
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
              Layout::tile>(payload, unfenced_ptr_array, unfenced_ptr_array_size,
                            r, rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
@@ -369,20 +374,20 @@ DINLINE void all_gather_tile_push(
     } else {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Protocol::ll,
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
              Layout::tile>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r,
                            rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
                            first_row, 0, 1, epochs);
     }
-    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-         Protocol::ll, Layout::tile>(
-        unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-        copies, first_row, 0, 1, epochs, status_ptr, status_stride_field,
-        status_size_field, timeout_ticks);
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+                       unfenced_stride_slot, unfenced_stride_m,
+                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
+                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
+                       1, epochs, status_ptr, status_stride_field,
+                       status_size_field, timeout_ticks);
     int32_t next[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)

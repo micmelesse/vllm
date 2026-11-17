@@ -43,7 +43,7 @@ Quantization = Literal["exact", "int4"]
 
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
 
-Protocol = Literal["simple", "ll"]
+Protocol = Literal["simple", "ll", "lamport"]
 
 
 AllReduceAlgorithm = Literal[

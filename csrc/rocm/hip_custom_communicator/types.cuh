@@ -147,19 +147,23 @@ struct SymmetricMemory {
   int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0;
 
   int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
-          scales_bytes = 0, unfenced_bytes = 0;
+          scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0;
 
   uint32_t* signals = nullptr;
   char* staging = nullptr;
   char* partials = nullptr;
   float* scales = nullptr;
   char* unfenced = nullptr;
+  // Lamport's inbox, unfenced_blocks rows a bank like LL's, all data; its
+  // every position is the sentinel until its data arrives.
+  char* lamport = nullptr;
 
   uint32_t* const* signals_ptr_array = nullptr;
   char* const* staging_ptr_array = nullptr;
   char* const* partials_ptr_array = nullptr;
   float* const* scales_ptr_array = nullptr;
   char* const* unfenced_ptr_array = nullptr;
+  char* const* lamport_ptr_array = nullptr;
 
   std::vector<char*> peers;
 };
@@ -184,6 +188,7 @@ struct CommsState {
   SymmetricMemory symmetric;
 
   int32_t* unfenced_epochs = nullptr;
+  int32_t* lamport_epochs = nullptr;
   int64_t unfenced_epoch_words = 0;
   uint32_t* status_device = nullptr;
   InputTables input_tables;
