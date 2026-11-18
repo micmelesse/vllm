@@ -95,6 +95,7 @@ hip_custom_communicator_open(const std::string& group, int64_t device,
                              double timeout_seconds);
 std::optional<int64_t> hip_custom_communicator_register_graph(int64_t state);
 std::optional<int64_t> hip_custom_communicator_close(int64_t state, bool alone);
+std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state);
 std::optional<int64_t> hip_custom_communicator_all_reduce(
     int64_t state, torch::Tensor& input, torch::Tensor& output,
     const std::string& algorithm, const std::string& protocol, int64_t grid_x,

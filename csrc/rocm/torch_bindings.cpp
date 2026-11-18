@@ -145,6 +145,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                &hip_custom_communicator_register_graph);
   rocm_ops.def("hip_custom_communicator_close(int state, bool alone) -> int?",
                &hip_custom_communicator_close);
+  rocm_ops.def("hip_custom_communicator_inspect(int state) -> Tensor[]",
+               &hip_custom_communicator_inspect);
   rocm_ops.def(
       "hip_custom_communicator_all_reduce(int state, Tensor input, Tensor! "
       "output, str algorithm, str protocol, int grid_x, int grid_y, int "

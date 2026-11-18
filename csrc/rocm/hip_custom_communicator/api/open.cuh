@@ -271,3 +271,25 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 
   return {std::nullopt, reinterpret_cast<int64_t>(s), s->device.arch};
 }
+
+// For the tests: views of the state LL and Lamport keep from launch to launch,
+// this rank's Lamport inbox (bytes) and the LL and Lamport epochs (a row of
+// words a block), so a test can check what every launch must leave: the inbox
+// all the sentinel, the epochs equal on every rank. No copy; the views live as
+// long as the communicator.
+std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
+  using namespace hip_custom_communicator;
+  using namespace hip_custom_communicator::internal;
+  TORCH_CHECK(state != 0, "hip_custom_communicator_inspect: not open");
+  CommsState& s = *reinterpret_cast<CommsState*>(state);
+  const auto on = torch::TensorOptions().device(torch::kCUDA, s.device.index);
+  const int64_t words = kPackBytes / int64_t{sizeof(int32_t)};
+  return {
+      torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
+                       on.dtype(torch::kUInt8)),
+      torch::from_blob(s.lamport_epochs, {s.symmetric.lamport_blocks, words},
+                       on.dtype(torch::kInt32)),
+      torch::from_blob(s.unfenced_epochs, {s.symmetric.unfenced_blocks, words},
+                       on.dtype(torch::kInt32)),
+  };
+}

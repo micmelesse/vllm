@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 from typing import get_args
 
 import pytest
@@ -168,6 +169,89 @@ def test_all_reduce_correctness(monkeypatch, tp_size, quantization):
                     else:
                         want = summed
                     _compare(got, want, used, (rows, dtype), exact=True)
+
+    _on_ranks(monkeypatch, tp_size, quantization, body)
+
+
+@pytest.mark.parametrize("tp_size", TP_SIZES)
+@pytest.mark.parametrize("quantization", QUANTIZATIONS)
+def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
+    """Every one-shot push the table builds on LL and Lamport, picked or not
+    (rows of threads too), at a grid where a block pushes several tiles and one
+    where it pushes one: right, the same bits as every other build at the shape,
+    and after each call the state LL and Lamport keep from launch to launch as
+    every launch must leave it: this rank's Lamport inbox all the sentinel
+    (whatever was written was read and re-armed), the epochs equal on every
+    rank."""
+
+    def body(comm, group, device, rank):
+        world = comm.arguments.world
+        q = comm.arguments.quantization
+        inbox, lamport_epochs, ll_epochs = (
+            torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
+        )
+        builds: dict[tuple, AllReduceConfig] = {}
+        for c in comm.state.tuned_table.configs:
+            if (
+                c.kernel == "all_reduce"
+                and c.algorithm == "one_shot_push"
+                and c.protocol in ("ll", "lamport")
+                and c.quantization == q
+            ):
+                builds.setdefault(
+                    (c.protocol, c.block_x, c.block_y, c.tile_n, c.pack_bytes), c
+                )
+        assert builds, "the table builds no LL or Lamport one-shot push"
+
+        def same_everywhere(t, where):
+            got = [torch.empty_like(t) for _ in range(world)]
+            dist.all_gather(got, t.contiguous(), group=group.device_group)
+            for r, other in enumerate(got):
+                assert torch.equal(other, got[0]), (where, "rank", r)
+
+        for rows in [1, 4, 13]:
+            for dtype in DTYPES:
+                xs = [
+                    torch.randint(
+                        -8,
+                        8,
+                        (rows, HIDDEN),
+                        generator=torch.Generator(device=device).manual_seed(r),
+                        device=device,
+                    ).to(dtype)
+                    for r in range(world)
+                ]
+                x = xs[rank]
+                summed = x.clone()
+                dist.all_reduce(summed, group=group.device_group)
+                first = None
+                for build, c in sorted(builds.items()):
+                    for grid in [8, 64]:
+                        config = dataclasses.replace(c, grid_x=grid)
+                        where = (rows, dtype, build, grid)
+                        try:
+                            got = comm.all_reduce(x, config=config)
+                        except RuntimeError as e:
+                            # A split block is built for the worlds it divides.
+                            if str(e).startswith(REFUSED_AT_SIZE) or (
+                                world % c.block_y != 0
+                                and str(e).startswith("not_built")
+                            ):
+                                continue
+                            raise
+                        if q == "int4":
+                            want = _int4_sum(xs, config).to(dtype)
+                        else:
+                            want = summed
+                        _compare(got, want, config, where, exact=True)
+                        if first is None:
+                            first = got
+                        assert torch.equal(got, first), (where, "bits differ")
+                        torch.accelerator.synchronize()
+                        dist.barrier(group=group.cpu_group)
+                        assert bool((inbox == 0xFF).all()), (where, "inbox armed")
+                        same_everywhere(lamport_epochs, (where, "lamport epochs"))
+                        same_everywhere(ll_epochs, (where, "ll epochs"))
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 
