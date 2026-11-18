@@ -352,10 +352,16 @@ DINLINE void all_gather_tile_push(
                                 i * kThreadsM) < clip_m;
       epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
     }
-    if constexpr (PROTOCOL == Protocol::lamport)
-      // The last tile's re-arm of this rank's inbox lands before these sends,
-      // which a peer must have before it writes that bank again.
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if constexpr (PROTOCOL == Protocol::lamport) {
+      // This rank's last re-arm of its inbox lands before these sends, which a
+      // peer must have before it writes that bank again. A launch's first tile
+      // has the kernel boundary for that, and waiting there would hold the
+      // tile's load behind the epochs'.
+      const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
+      if (offs_m / TILE_M * tiles_n + offs_n / TILE_N !=
+          static_cast<int>(blockIdx.x))
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
     const int lines_m = first_row + clip_m;
     const int lines_n = min(TILE_N, input_size_n - offs_n);
     // Quantized once, then sent to every rank.
