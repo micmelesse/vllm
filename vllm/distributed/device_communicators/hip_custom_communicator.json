@@ -1070,7 +1070,9 @@
    {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":24,"grid_y":1,"grid_z":1,"block_x":128,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16},
    {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":128,"grid_y":1,"grid_z":1,"block_x":128,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16},
    {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":16,"grid_y":1,"grid_z":1,"block_x":128,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":1024,"tile_k":1,"quantization":"exact","pack_bytes":16},
-   {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":16,"grid_y":1,"grid_z":1,"block_x":64,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16}
+   {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":16,"grid_y":1,"grid_z":1,"block_x":64,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16},
+   {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":96,"grid_y":1,"grid_z":1,"block_x":64,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16},
+   {"op":"hip_custom_communicator.all_reduce","kernel":"all_reduce","algorithm":"one_shot_push","protocol":"lamport","grid_x":64,"grid_y":1,"grid_z":1,"block_x":64,"block_y":1,"block_z":1,"waves_per_eu":1,"tile_m":1,"tile_n":512,"tile_k":1,"quantization":"exact","pack_bytes":16}
   ],
   "picks": [
    {"input":0,"config":0},
@@ -1083,8 +1085,8 @@
    {"input":7,"config":2},
    {"input":8,"config":3},
    {"input":9,"config":3},
-   {"input":10,"config":4},
-   {"input":11,"config":0},
+   {"input":10,"config":411},
+   {"input":11,"config":412},
    {"input":12,"config":5},
    {"input":13,"config":6},
    {"input":14,"config":7},
@@ -1097,8 +1099,8 @@
    {"input":21,"config":12},
    {"input":22,"config":12},
    {"input":23,"config":13},
-   {"input":24,"config":0},
-   {"input":25,"config":0},
+   {"input":24,"config":411},
+   {"input":25,"config":412},
    {"input":26,"config":5},
    {"input":27,"config":6},
    {"input":28,"config":8},
