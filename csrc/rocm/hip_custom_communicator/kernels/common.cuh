@@ -207,7 +207,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field,
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT, bool TAIL,
-          bool FROM_PEERS = false, typename OUTPUT>
+          typename OUTPUT>
 DINLINE void read_buffer(
     const void* input, int input_slot, int64_t input_stride_slot,
     int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
@@ -236,14 +236,6 @@ DINLINE void read_buffer(
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK,
                 "the layout is the block");
   using V = vec<U, kPackElems>;
-
-  // A recv (FROM_PEERS) of a copy a writer reads this rank's inbox, one slot a
-  // writer. Nothing sends to its own slot, so that copy is the caller's, from
-  // registers or its own memory, and is not read.
-  const int own = __builtin_amdgcn_readfirstlane(rank);
-  [[maybe_unused]] const auto read = [&](int c) {
-    return !FROM_PEERS || !kSlots || (input_slot + c) % WORLD != own;
-  };
 
   using E = std::conditional_t<!QUANTIZE_INT4, const U, const uint8_t>;
   const auto base = [&](int c) -> E* {
@@ -337,35 +329,33 @@ DINLINE void read_buffer(
     for (uint32_t n = 1;; ++n) {
 #pragma unroll
       for (int c = 0; c < WORLD; ++c)
-        if (read(c))
 #pragma unroll
-          for (int i = 0; i < kRows; ++i)
+        for (int i = 0; i < kRows; ++i)
 #pragma unroll
-            for (int k = 0; k < kPacks; ++k)
+          for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-              for (int h = 0; h < kLines; ++h) {
-                uint32_t at = static_cast<uint32_t>(c) * slot_bytes +
-                              line_at[i][k] + h * half;
-                asm volatile("" : "+v"(at));
-                got[c][i][k][h] = __builtin_nontemporal_load(
-                    (const global_u32x4*)(first + at));
-              }
+            for (int h = 0; h < kLines; ++h) {
+              uint32_t at = static_cast<uint32_t>(c) * slot_bytes +
+                            line_at[i][k] + h * half;
+              asm volatile("" : "+v"(at));
+              got[c][i][k][h] =
+                  __builtin_nontemporal_load((const global_u32x4*)(first + at));
+            }
 
       asm volatile("" ::: "memory");
       bool missing = false;
 #pragma unroll
       for (int c = 0; c < WORLD; ++c)
-        if (read(c))
 #pragma unroll
-          for (int i = 0; i < kRows; ++i)
+        for (int i = 0; i < kRows; ++i)
 #pragma unroll
-            for (int k = 0; k < kPacks; ++k)
+          for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-              for (int h = 0; h < kLines; ++h)
-                // & not &&: no branch, so each load is waited for here and not
-                // again after the loop, behind the stores that follow it.
-                missing |= waits[i][k] & (got[c][i][k][h][1] != flags[i] ||
-                                          got[c][i][k][h][3] != flags[i]);
+            for (int h = 0; h < kLines; ++h)
+              // & not &&: no branch, so each load is waited for here and not
+              // again after the loop, behind the stores that follow it.
+              missing |= waits[i][k] & (got[c][i][k][h][1] != flags[i] ||
+                                        got[c][i][k][h][3] != flags[i]);
 
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
       if ((n & 255u) != 0) continue;
@@ -382,19 +372,18 @@ DINLINE void read_buffer(
         uint32_t peer = 0, seen = flags[0], want = flags[0];
 #pragma unroll
         for (int c = 0; c < WORLD; ++c)
-          if (read(c))
 #pragma unroll
-            for (int i = 0; i < kRows; ++i)
+          for (int i = 0; i < kRows; ++i)
 #pragma unroll
-              for (int k = 0; k < kPacks; ++k)
+            for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-                for (int h = 0; h < kLines; ++h)
-                  if (waits[i][k] && (got[c][i][k][h][1] != flags[i] ||
-                                      got[c][i][k][h][3] != flags[i])) {
-                    peer = c;
-                    seen = got[c][i][k][h][1];
-                    want = flags[i];
-                  }
+              for (int h = 0; h < kLines; ++h)
+                if (waits[i][k] && (got[c][i][k][h][1] != flags[i] ||
+                                    got[c][i][k][h][3] != flags[i])) {
+                  peer = c;
+                  seen = got[c][i][k][h][1];
+                  want = flags[i];
+                }
         give_up(status_ptr, status_stride_field, status_size_field,
                 Where::start, rank, peer, seen, want, waited);
       }
@@ -403,31 +392,30 @@ DINLINE void read_buffer(
 
 #pragma unroll
     for (int c = 0; c < WORLD; ++c)
-      if (read(c))
 #pragma unroll
-        for (int i = 0; i < kRows; ++i)
+      for (int i = 0; i < kRows; ++i)
 #pragma unroll
-          for (int k = 0; k < kPacks; ++k) {
-            if constexpr (QUANTIZE_INT4 && kRaw) {
-              output[c][i][k][0] = got[c][i][k][0][0];
-              output[c][i][k][1] = got[c][i][k][0][2];
-            } else if constexpr (QUANTIZE_INT4) {
-              uint32_t line[4];
-              // Copy the payload out whole. Reading it as vector elements
-              // decoded the wrong word.
-              __builtin_memcpy(line, &got[c][i][k][0], sizeof(line));
-              const uint32_t encoded[2] = {line[0], line[2]};
-              dequantize(encoded, output[c][i][k]);
-            } else {
-              uint32_t words[2 * kLines];
+        for (int k = 0; k < kPacks; ++k) {
+          if constexpr (QUANTIZE_INT4 && kRaw) {
+            output[c][i][k][0] = got[c][i][k][0][0];
+            output[c][i][k][1] = got[c][i][k][0][2];
+          } else if constexpr (QUANTIZE_INT4) {
+            uint32_t line[4];
+            // Copy the payload out whole. Reading it as vector elements decoded
+            // the wrong word.
+            __builtin_memcpy(line, &got[c][i][k][0], sizeof(line));
+            const uint32_t encoded[2] = {line[0], line[2]};
+            dequantize(encoded, output[c][i][k]);
+          } else {
+            uint32_t words[2 * kLines];
 #pragma unroll
-              for (int h = 0; h < kLines; ++h) {
-                words[2 * h] = got[c][i][k][h][0];
-                words[2 * h + 1] = got[c][i][k][h][2];
-              }
-              __builtin_memcpy(output[c][i][k], words, sizeof(V));
+            for (int h = 0; h < kLines; ++h) {
+              words[2 * h] = got[c][i][k][h][0];
+              words[2 * h + 1] = got[c][i][k][h][2];
             }
+            __builtin_memcpy(output[c][i][k], words, sizeof(V));
           }
+        }
   } else if constexpr (PROTOCOL == Protocol::lamport) {
     static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
     static_assert(kSlots && kCopies == WORLD,
@@ -473,33 +461,30 @@ DINLINE void read_buffer(
       for (int j = 0; j < kHalves; ++j) any |= h[j] == kLamportEmpty;
       return any;
     };
-    // The caller's own slot is not re-armed either.
     W got[WORLD][kRows][kPacks];
     const uint64_t t0 = wall_clock64();
     for (uint32_t n = 1;; ++n) {
 #pragma unroll
       for (int c = 0; c < WORLD; ++c)
-        if (read(c))
 #pragma unroll
-          for (int i = 0; i < kRows; ++i)
+        for (int i = 0; i < kRows; ++i)
 #pragma unroll
-            for (int k = 0; k < kPacks; ++k) {
-              uint32_t a = static_cast<uint32_t>(c) * slot_bytes + at[i][k];
-              asm volatile("" : "+v"(a));
-              got[c][i][k] = __builtin_nontemporal_load(
-                  (const __attribute__((address_space(1))) W*)(first + a));
-            }
+          for (int k = 0; k < kPacks; ++k) {
+            uint32_t a = static_cast<uint32_t>(c) * slot_bytes + at[i][k];
+            asm volatile("" : "+v"(a));
+            got[c][i][k] = __builtin_nontemporal_load(
+                (const __attribute__((address_space(1))) W*)(first + a));
+          }
       asm volatile("" ::: "memory");
       bool missing = false;
 #pragma unroll
       for (int c = 0; c < WORLD; ++c)
-        if (read(c))
 #pragma unroll
-          for (int i = 0; i < kRows; ++i)
+        for (int i = 0; i < kRows; ++i)
 #pragma unroll
-            for (int k = 0; k < kPacks; ++k)
-              // & not &&, as LL's.
-              missing |= waits[i][k] & empty(got[c][i][k]);
+          for (int k = 0; k < kPacks; ++k)
+            // & not &&, as LL's.
+            missing |= waits[i][k] & empty(got[c][i][k]);
 
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
       if ((n & 255u) != 0) continue;
@@ -516,12 +501,11 @@ DINLINE void read_buffer(
         uint32_t peer = 0;
 #pragma unroll
         for (int c = 0; c < WORLD; ++c)
-          if (read(c))
 #pragma unroll
-            for (int i = 0; i < kRows; ++i)
+          for (int i = 0; i < kRows; ++i)
 #pragma unroll
-              for (int k = 0; k < kPacks; ++k)
-                if (waits[i][k] && empty(got[c][i][k])) peer = c;
+            for (int k = 0; k < kPacks; ++k)
+              if (waits[i][k] && empty(got[c][i][k])) peer = c;
         give_up(status_ptr, status_stride_field, status_size_field,
                 Where::start, rank, peer, kLamportEmpty, flags[0], waited);
       }
@@ -533,20 +517,8 @@ DINLINE void read_buffer(
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k) {
-          if (read(c)) {
-            __builtin_memcpy(output[c][i][k], &got[c][i][k], sizeof(V));
-          } else {
-            // The caller's own copy becomes what a send would have made of
-            // it, so every rank sums the same bits.
-            uint16_t h[kHalves];
-            __builtin_memcpy(h, output[c][i][k], sizeof(h));
-#pragma unroll
-            for (int j = 0; j < kHalves; ++j)
-              if (h[j] == kLamportEmpty) h[j] = 0x7fff;
-            __builtin_memcpy(output[c][i][k], h, sizeof(h));
-          }
-        }
+        for (int k = 0; k < kPacks; ++k)
+          __builtin_memcpy(output[c][i][k], &got[c][i][k], sizeof(V));
 
     // Re-arm what was read. A peer writes this bank again only after this
     // rank's next sends, and a Lamport tile push waits for these stores
@@ -555,16 +527,15 @@ DINLINE void read_buffer(
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
     for (int c = 0; c < WORLD; ++c)
-      if (read(c))
 #pragma unroll
-        for (int i = 0; i < kRows; ++i)
+      for (int i = 0; i < kRows; ++i)
 #pragma unroll
-          for (int k = 0; k < kPacks; ++k)
-            if (waits[i][k])
-              __builtin_nontemporal_store(
-                  cleared, (__attribute__((address_space(1)))
-                            W*)(first + static_cast<uint32_t>(c) * slot_bytes +
-                                at[i][k]));
+        for (int k = 0; k < kPacks; ++k)
+          if (waits[i][k])
+            __builtin_nontemporal_store(
+                cleared,
+                (__attribute__((address_space(1)))
+                 W*)(first + static_cast<uint32_t>(c) * slot_bytes + at[i][k]));
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     static_assert(!QUANTIZE_INT4 && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
@@ -745,7 +716,6 @@ DINLINE void read_buffer(
       asm volatile("" : "+v"(scale_at));
 #pragma unroll
       for (int c = 0; c < kCopies; ++c) {
-        if (!read(c)) continue;
         const u32x4 words = *(const global_u32x4*)(values[c] + value_at);
 
         const uint32_t scale = __builtin_bit_cast(
@@ -835,7 +805,6 @@ DINLINE void read_buffer(
         asm volatile("" : "+v"(at));
 #pragma unroll
         for (int c = 0; c < kCopies; ++c) {
-          if (!read(c)) continue;
           const V* p = reinterpret_cast<const V*>(at_copy[c]) + at;
           V v;
           if constexpr (sizeof(V) == 16) {
@@ -883,7 +852,6 @@ DINLINE void read_buffer(
         asm volatile("" : "+v"(scale_at));
 #pragma unroll
         for (int c = 0; c < kCopies; ++c) {
-          if (!read(c)) continue;
           words[c][i][k] = *(const global_u32*)(values[c] + value_at);
           group_scales[c][i][k] = __builtin_bit_cast(
               uint16_t, *(const global_f16*)(scales[c] + scale_at));
@@ -894,25 +862,24 @@ DINLINE void read_buffer(
     __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
     for (int c = 0; c < kCopies; ++c)
-      if (read(c))
 #pragma unroll
-        for (int i = 0; i < kRows; ++i)
+      for (int i = 0; i < kRows; ++i)
 #pragma unroll
-          for (int k = 0; k < kPacks; ++k) {
-            auto& out = [&]() -> U(&)[kPackElems] {
-              if constexpr (kSlots)
-                return output[c][i][k];
-              else
-                return output[i][k];
-            }();
-            const uint32_t encoded[2] = {words[c][i][k], group_scales[c][i][k]};
-            if constexpr (kRaw) {
-              out[0] = encoded[0];
-              out[1] = encoded[1];
-            } else {
-              dequantize(encoded, out);
-            }
+        for (int k = 0; k < kPacks; ++k) {
+          auto& out = [&]() -> U(&)[kPackElems] {
+            if constexpr (kSlots)
+              return output[c][i][k];
+            else
+              return output[i][k];
+          }();
+          const uint32_t encoded[2] = {words[c][i][k], group_scales[c][i][k]};
+          if constexpr (kRaw) {
+            out[0] = encoded[0];
+            out[1] = encoded[1];
+          } else {
+            dequantize(encoded, out);
           }
+        }
   }
 }
 
@@ -1786,18 +1753,15 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
           timeout_ticks);
 #pragma unroll
       for (int c = 0; c < kCopies; ++c)
-        // Not this rank's own copy: the caller holds it.
-        if (!kSlots || (input_slot + c) % WORLD !=
-                           __builtin_amdgcn_readfirstlane(input_rank))
 #pragma unroll
-          for (int k = 0; k < kInt4GroupPacks; ++k)
+        for (int k = 0; k < kInt4GroupPacks; ++k)
 #pragma unroll
-            for (int j = 0; j < kPackElems; ++j) {
-              if constexpr (kSlots)
-                output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
-              else
-                output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
-            }
+          for (int j = 0; j < kPackElems; ++j) {
+            if constexpr (kSlots)
+              output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
+            else
+              output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
+          }
     }
   } else {
     const auto* const entries =
@@ -1805,14 +1769,14 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
     const int first = __builtin_amdgcn_readfirstlane(input_rank);
     if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
           entries[0], input_slot, input_stride_slot, input_stride_m,
           input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, output, offs_m, offs_n, row_step, input_rank, flags,
           status_ptr, status_stride_field, status_size_field, timeout_ticks);
     else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
           internal::ptr_array_at(entries, input_ptr_array_size, first),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,
           input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
@@ -1820,7 +1784,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
           status_stride_field, status_size_field, timeout_ticks);
     else
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL>(
           internal::lane_ptr_array_at<void, WORLD>(
               entries, input_ptr_array_size, input_rank),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,

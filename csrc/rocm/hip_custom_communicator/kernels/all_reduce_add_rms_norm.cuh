@@ -222,10 +222,10 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
         load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
             input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
             mine, t * TILE_M, c, 1);
-        // Published into this rank's own staging, for its peers to pull.
-        store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile,
-              TAIL>(mine, load(staging_ptr_array, staging_ptr_array_size, rank),
-                    0, 0, n, 1, 1, m, n, m, n, t * TILE_M, c, 1);
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true,
+             Protocol::simple, Layout::tile, TAIL>(
+            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
+            1, m, n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
@@ -520,10 +520,9 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      // Every rank's slice of the sum was pushed here: this rank's own memory.
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Layout::tile, TAIL>(
-          load(partials_ptr_array, partials_ptr_array_size, rank), 0, 0,
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
+           Protocol::simple, Layout::tile, TAIL>(
+          partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
           partials_size_n, m, n, sum, row, c, 1);
 

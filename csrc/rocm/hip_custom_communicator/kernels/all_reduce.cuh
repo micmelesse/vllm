@@ -53,11 +53,11 @@ DINLINE void all_reduce_one_shot_pull(
       load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
           input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
           input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-      // Published into this rank's own staging, for its peers to pull.
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, Layout::tile,
-            TAIL>(mine, load(staging_ptr_array, staging_ptr_array_size, rank),
-                  0, 0, input_size_n, 1, 1, input_size_m, input_size_n,
-                  input_size_m, clip_n, offs_m, offs_n, 1);
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
+           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
+                               rank, 0, 0, input_size_n, 1, 1, input_size_m,
+                               input_size_n, input_size_m, clip_n, offs_m,
+                               offs_n, 1);
     }
   }
 
