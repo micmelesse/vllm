@@ -352,8 +352,10 @@ DINLINE void read_buffer(
           for (int k = 0; k < kPacks; ++k)
 #pragma unroll
             for (int h = 0; h < kLines; ++h)
-              missing |= waits[i][k] && (got[c][i][k][h][1] != flags[i] ||
-                                         got[c][i][k][h][3] != flags[i]);
+              // & not &&: no branch, so each load is waited for here and not
+              // again after the loop, behind the stores that follow it.
+              missing |= waits[i][k] & (got[c][i][k][h][1] != flags[i] ||
+                                        got[c][i][k][h][3] != flags[i]);
 
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
       if ((n & 255u) != 0) continue;
@@ -481,7 +483,8 @@ DINLINE void read_buffer(
         for (int i = 0; i < kRows; ++i)
 #pragma unroll
           for (int k = 0; k < kPacks; ++k)
-            missing |= waits[i][k] && empty(got[c][i][k]);
+            // & not &&, as LL's.
+            missing |= waits[i][k] & empty(got[c][i][k]);
 
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
       if ((n & 255u) != 0) continue;

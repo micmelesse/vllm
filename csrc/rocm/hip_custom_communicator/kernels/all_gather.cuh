@@ -391,13 +391,8 @@ DINLINE void all_gather_tile_push(
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
                            first_row, 0, 1, epochs);
     }
-    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
-                       unfenced_stride_slot, unfenced_stride_m,
-                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
-                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
-                       1, epochs, status_ptr, status_stride_field,
-                       status_size_field, timeout_ticks);
+    // The epochs are saved now, not after the recv: there they would wait for
+    // the recv's stores.
     int32_t next[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
@@ -407,6 +402,13 @@ DINLINE void all_gather_tile_push(
         unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
         unfenced_epochs_size_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, first_row, 0, 1);
+    recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+                       unfenced_stride_slot, unfenced_stride_m,
+                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
+                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
+                       1, epochs, status_ptr, status_stride_field,
+                       status_size_field, timeout_ticks);
     __syncthreads();
   }
 }
