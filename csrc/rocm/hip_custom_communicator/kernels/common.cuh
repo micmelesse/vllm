@@ -207,7 +207,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field,
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT, bool TAIL,
-          bool PEERS_ONLY = false, typename OUTPUT>
+          bool FROM_PEERS = false, typename OUTPUT>
 DINLINE void read_buffer(
     const void* input, int input_slot, int64_t input_stride_slot,
     int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
@@ -236,6 +236,14 @@ DINLINE void read_buffer(
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK,
                 "the layout is the block");
   using V = vec<U, kPackElems>;
+
+  // A recv (FROM_PEERS) of a copy a writer reads this rank's inbox, one slot a
+  // writer. Nothing sends to its own slot, so that copy is the caller's, from
+  // registers or its own memory, and is not read.
+  const int own = __builtin_amdgcn_readfirstlane(rank);
+  [[maybe_unused]] const auto read = [&](int c) {
+    return !FROM_PEERS || !kSlots || (input_slot + c) % WORLD != own;
+  };
 
   using E = std::conditional_t<!QUANTIZE_INT4, const U, const uint8_t>;
   const auto base = [&](int c) -> E* {
@@ -324,10 +332,6 @@ DINLINE void read_buffer(
             row_at(i) < clip_m &&
             offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
       }
-    // PEERS_ONLY reads every rank but this one: the caller holds its own copy
-    // in output[rank], so nothing was sent to this rank's own slot.
-    const int own = __builtin_amdgcn_readfirstlane(rank);
-    const auto read = [&](int c) { return !PEERS_ONLY || c != own; };
     u32x4 got[WORLD][kRows][kPacks][kLines];
     const uint64_t t0 = wall_clock64();
     for (uint32_t n = 1;; ++n) {
@@ -469,11 +473,7 @@ DINLINE void read_buffer(
       for (int j = 0; j < kHalves; ++j) any |= h[j] == kLamportEmpty;
       return any;
     };
-    // PEERS_ONLY reads every rank but this one: the caller holds its own copy
-    // in output[rank], so nothing was sent to this rank's own slot, and it is
-    // neither read nor re-armed.
-    const int own = __builtin_amdgcn_readfirstlane(rank);
-    const auto read = [&](int c) { return !PEERS_ONLY || c != own; };
+    // The caller's own slot is not re-armed either.
     W got[WORLD][kRows][kPacks];
     const uint64_t t0 = wall_clock64();
     for (uint32_t n = 1;; ++n) {
@@ -745,6 +745,7 @@ DINLINE void read_buffer(
       asm volatile("" : "+v"(scale_at));
 #pragma unroll
       for (int c = 0; c < kCopies; ++c) {
+        if (!read(c)) continue;
         const u32x4 words = *(const global_u32x4*)(values[c] + value_at);
 
         const uint32_t scale = __builtin_bit_cast(
@@ -834,6 +835,7 @@ DINLINE void read_buffer(
         asm volatile("" : "+v"(at));
 #pragma unroll
         for (int c = 0; c < kCopies; ++c) {
+          if (!read(c)) continue;
           const V* p = reinterpret_cast<const V*>(at_copy[c]) + at;
           V v;
           if constexpr (sizeof(V) == 16) {
@@ -881,6 +883,7 @@ DINLINE void read_buffer(
         asm volatile("" : "+v"(scale_at));
 #pragma unroll
         for (int c = 0; c < kCopies; ++c) {
+          if (!read(c)) continue;
           words[c][i][k] = *(const global_u32*)(values[c] + value_at);
           group_scales[c][i][k] = __builtin_bit_cast(
               uint16_t, *(const global_f16*)(scales[c] + scale_at));
@@ -891,24 +894,25 @@ DINLINE void read_buffer(
     __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
     for (int c = 0; c < kCopies; ++c)
+      if (read(c))
 #pragma unroll
-      for (int i = 0; i < kRows; ++i)
+        for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k) {
-          auto& out = [&]() -> U(&)[kPackElems] {
-            if constexpr (kSlots)
-              return output[c][i][k];
-            else
-              return output[i][k];
-          }();
-          const uint32_t encoded[2] = {words[c][i][k], group_scales[c][i][k]};
-          if constexpr (kRaw) {
-            out[0] = encoded[0];
-            out[1] = encoded[1];
-          } else {
-            dequantize(encoded, out);
+          for (int k = 0; k < kPacks; ++k) {
+            auto& out = [&]() -> U(&)[kPackElems] {
+              if constexpr (kSlots)
+                return output[c][i][k];
+              else
+                return output[i][k];
+            }();
+            const uint32_t encoded[2] = {words[c][i][k], group_scales[c][i][k]};
+            if constexpr (kRaw) {
+              out[0] = encoded[0];
+              out[1] = encoded[1];
+            } else {
+              dequantize(encoded, out);
+            }
           }
-        }
   }
 }
 
@@ -1748,8 +1752,7 @@ DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
 
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
-          bool TAIL = false, bool PEERS_ONLY = false, typename PTR,
-          typename OUTPUT>
+          bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int input_rank, int input_slot, int64_t input_stride_slot,
                   int64_t input_stride_m, int64_t input_stride_n,
@@ -1760,8 +1763,6 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
-  static_assert(!PEERS_ONLY || PROTOCOL != Protocol::simple,
-                "only an LL or Lamport read skips a slot");
   constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
   if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
                 kPacks != kInt4GroupPacks) {
@@ -1785,15 +1786,18 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
           timeout_ticks);
 #pragma unroll
       for (int c = 0; c < kCopies; ++c)
+        // Not this rank's own copy: the caller holds it.
+        if (!kSlots || (input_slot + c) % WORLD !=
+                           __builtin_amdgcn_readfirstlane(input_rank))
 #pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k)
+          for (int k = 0; k < kInt4GroupPacks; ++k)
 #pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            if constexpr (kSlots)
-              output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
-            else
-              output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
-          }
+            for (int j = 0; j < kPackElems; ++j) {
+              if constexpr (kSlots)
+                output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
+              else
+                output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
+            }
     }
   } else {
     const auto* const entries =
@@ -1801,14 +1805,14 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
     const int first = __builtin_amdgcn_readfirstlane(input_rank);
     if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, PEERS_ONLY>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
           entries[0], input_slot, input_stride_slot, input_stride_m,
           input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
           clip_n, output, offs_m, offs_n, row_step, input_rank, flags,
           status_ptr, status_stride_field, status_size_field, timeout_ticks);
     else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, PEERS_ONLY>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
           internal::ptr_array_at(entries, input_ptr_array_size, first),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,
           input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output,
@@ -1816,7 +1820,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
           status_stride_field, status_size_field, timeout_ticks);
     else
       internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
-                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, PEERS_ONLY>(
+                            QUANTIZE_INT4, PROTOCOL, LAYOUT, TAIL, true>(
           internal::lane_ptr_array_at<void, WORLD>(
               entries, input_ptr_array_size, input_rank),
           input_slot, input_stride_slot, input_stride_m, input_stride_n,
