@@ -24,7 +24,7 @@
 #include "kernels/all_reduce.cuh"
 #include "kernels/all_reduce_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_add_rms_norm.cuh"
-#include "kernels/common.cuh"
+#include "kernels/common/types.cuh"
 #include "kernels/reduce_scatter.cuh"
 
 namespace hip_custom_communicator {

@@ -4,7 +4,10 @@
 // then RMSNorm.
 
 #include <type_traits>
-#include "common.cuh"
+#include "common/load.cuh"
+#include "common/reduce.cuh"
+#include "common/store.cuh"
+#include "common/types.cuh"
 #include "rms_normalize.cuh"
 
 namespace hip_custom_communicator {

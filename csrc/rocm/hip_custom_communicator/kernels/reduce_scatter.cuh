@@ -2,7 +2,14 @@
 
 // Reduce-scatter stages: each rank sums its slice of every rank's input.
 
-#include "common.cuh"
+#include "common/barrier.cuh"
+#include "common/dequantize.cuh"
+#include "common/load.cuh"
+#include "common/quantize.cuh"
+#include "common/recv.cuh"
+#include "common/reduce.cuh"
+#include "common/send.cuh"
+#include "common/types.cuh"
 
 namespace hip_custom_communicator {
 

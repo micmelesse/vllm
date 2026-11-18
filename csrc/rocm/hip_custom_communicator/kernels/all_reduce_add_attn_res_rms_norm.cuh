@@ -4,7 +4,12 @@
 
 #include "all_gather.cuh"
 #include "attn_res.cuh"
-#include "common.cuh"
+#include "common/barrier.cuh"
+#include "common/load.cuh"
+#include "common/recv.cuh"
+#include "common/send.cuh"
+#include "common/store.cuh"
+#include "common/types.cuh"
 #include "reduce_scatter.cuh"
 
 namespace hip_custom_communicator {

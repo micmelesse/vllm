@@ -3,7 +3,11 @@
 // All-reduce kernels, one function per algorithm.
 
 #include "all_gather.cuh"
-#include "common.cuh"
+#include "common/barrier.cuh"
+#include "common/load.cuh"
+#include "common/send.cuh"
+#include "common/store.cuh"
+#include "common/types.cuh"
 #include "reduce_scatter.cuh"
 
 namespace hip_custom_communicator {

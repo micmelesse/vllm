@@ -2,7 +2,8 @@
 
 // RMSNorm over a block's rows.
 
-#include "common.cuh"
+#include "common/reduce.cuh"
+#include "common/types.cuh"
 
 namespace hip_custom_communicator {
 
