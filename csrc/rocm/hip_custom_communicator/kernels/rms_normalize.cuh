@@ -9,8 +9,8 @@ namespace hip_custom_communicator {
 
 enum class NormPart : int { scale = 0, apply = 1, row = 2, wide = 3 };
 
-template <int BLOCK_X, int WAVE_SIZE, typename W, typename T, int ROWS, int K,
-          int P>
+template <int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, typename W, typename T,
+          int ROWS, int K, int P>
 DINLINE void rms_normalize(const float (&input)[ROWS][K][P],
                            float (&scale)[ROWS], const W (&weight)[1][K][P],
                            T (&output)[ROWS][K][P], float eps, float inv_hidden,

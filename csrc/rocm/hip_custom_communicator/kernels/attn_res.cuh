@@ -12,8 +12,8 @@
 
 namespace hip_custom_communicator {
 
-template <int TILE_K, int BLOCK_X, int WAVE_SIZE, Layout LAYOUT, bool TAIL,
-          typename DTYPE, int ROWS, int K, int P>
+template <int TILE_K, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, Layout LAYOUT,
+          bool TAIL, typename DTYPE, int ROWS, int K, int P>
 DINLINE void attn_res(
     const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
     int64_t prefix_stride_m, int64_t prefix_stride_n, const DTYPE* blocks_ptr,
@@ -235,9 +235,9 @@ DINLINE void attn_res(
         output_norm_weight_ptr, 0, 0, 0, output_norm_weight_stride_n, 1, 1,
         input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
-    rms_normalize<BLOCK_X, WAVE_SIZE>(acc, scale, output_norm_weight, result,
-                                      output_eps, inv_hidden, input_size_n,
-                                      offs_n, NormPart::row, false, LAYOUT);
+    rms_normalize<BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+        acc, scale, output_norm_weight, result, output_eps, inv_hidden,
+        input_size_n, offs_n, NormPart::row, false, LAYOUT);
   } else {
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
@@ -253,8 +253,8 @@ DINLINE void attn_res(
       1);
 }
 
-template <int TILE_K, int BLOCK_X, int WAVE_SIZE, Layout LAYOUT, bool TAIL,
-          int ROWS, int K, int P, bool CHUNKED, typename DTYPE>
+template <int TILE_K, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, Layout LAYOUT,
+          bool TAIL, int ROWS, int K, int P, bool CHUNKED, typename DTYPE>
 DINLINE void attn_res(
     const DTYPE* sum_ptr, int64_t sum_stride_m, int64_t sum_stride_n,
     const DTYPE* prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
@@ -441,9 +441,9 @@ DINLINE void attn_res(
         float acc[ROWS][K][P];
         mix(c, acc);
         DTYPE wide_w[1][K][P], wide_out[ROWS][K][P];
-        rms_normalize<BLOCK_X, WAVE_SIZE>(acc, scale, wide_w, wide_out,
-                                          output_eps, inv_hidden, n_all, c,
-                                          NormPart::wide, false, LAYOUT);
+        rms_normalize<BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+            acc, scale, wide_w, wide_out, output_eps, inv_hidden, n_all, c,
+            NormPart::wide, false, LAYOUT);
       }
     }
     for (int c = 0; c < n_all; c += tile_n) {
@@ -455,9 +455,9 @@ DINLINE void attn_res(
         load<1, 1, BLOCK_X, WAVE_SIZE, false, LAYOUT, TAIL>(
             output_norm_weight_ptr, 0, 0, 0, output_norm_weight_stride_n, 1, 1,
             n_all, 1, n_all, output_norm_weight, 0, c, 1);
-        rms_normalize<BLOCK_X, WAVE_SIZE>(acc, scale, output_norm_weight,
-                                          result, output_eps, inv_hidden, n_all,
-                                          c, NormPart::apply, false, LAYOUT);
+        rms_normalize<BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+            acc, scale, output_norm_weight, result, output_eps, inv_hidden,
+            n_all, c, NormPart::apply, false, LAYOUT);
       } else {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i)
@@ -478,7 +478,7 @@ DINLINE void attn_res(
     load<1, ROWS, BLOCK_X, WAVE_SIZE, false, LAYOUT, TAIL>(
         sum_ptr, 0, 0, sum_stride_m, sum_stride_n, 1, input_size_m,
         input_size_n, input_size_m, input_size_n, sum, offs_m, offs_n, 1);
-    attn_res<TILE_K, BLOCK_X, WAVE_SIZE, LAYOUT, TAIL>(
+    attn_res<TILE_K, BLOCK_X, BLOCK_Y, WAVE_SIZE, LAYOUT, TAIL>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,

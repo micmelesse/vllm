@@ -115,19 +115,19 @@ using AllReduceKernel =
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},
-                                      false, false, T, W, 2, 1, 1, 64, 64, 16,
-                                      1, false, false>);
+                                      false, false, T, W, 2, 1, 1, 64, 1, 64,
+                                      16, 1, false, false>);
 template <typename T, typename W>
 using AllReduceAddAttnResRmsNormKernel =
     decltype(&all_reduce_add_attn_res_rms_norm<
-             AllReduceAddAttnResRmsNormAlgorithm{}, false, T, 2, 1, 1, 1, 64,
+             AllReduceAddAttnResRmsNormAlgorithm{}, false, T, 2, 1, 1, 1, 64, 1,
              64, 16, 1, false, false>);
 template <typename T, typename W>
 using AddRmsNormKernel =
-    decltype(&add_rms_norm<false, T, W, 1, 1, 64, 64, 16, 1, false>);
+    decltype(&add_rms_norm<false, T, W, 1, 1, 64, 1, 64, 16, 1, false>);
 template <typename T, typename W>
 using AddAttnResRmsNormKernel =
-    decltype(&add_attn_res_rms_norm<T, 1, 1, 1, 64, 64, 16, 1, false>);
+    decltype(&add_attn_res_rms_norm<T, 1, 1, 1, 64, 1, 64, 16, 1, false>);
 
 #include "hip_custom_communicator_instances.inc"
 #include "hip_custom_communicator_builds.inc"

@@ -305,7 +305,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     hipFuncAttributes attributes;
     if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
       return error_code(Error::hip_failed);
-    if (block_x > attributes.maxThreadsPerBlock)
+    if (block_x * block_y * block_z > attributes.maxThreadsPerBlock)
       return error_code(Error::block_too_large);
     if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
         s.device.lds_bytes)
@@ -316,7 +316,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
 
     int blocks_a_cu = 0;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            &blocks_a_cu, kernel, static_cast<int>(block_x * block_y * block_z),
             shared_memory_bytes) != hipSuccess)
       return error_code(Error::hip_failed);
     if (grid_x > blocks_a_cu * s.device.compute_units)
@@ -442,7 +442,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     if (hipFuncGetAttributes(&rms_norm_attributes, rms_norm_kernel) !=
         hipSuccess)
       return error_code(Error::hip_failed);
-    if (*add_rms_norm_block_x > rms_norm_attributes.maxThreadsPerBlock)
+    if (*add_rms_norm_block_x * *add_rms_norm_block_y * *add_rms_norm_block_z >
+        rms_norm_attributes.maxThreadsPerBlock)
       return error_code(Error::block_too_large);
     if (static_cast<int64_t>(rms_norm_attributes.sharedSizeBytes) +
             shared_memory_bytes >
@@ -474,7 +475,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     hipFuncAttributes attributes;
     if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
       return error_code(Error::hip_failed);
-    if (block_x > attributes.maxThreadsPerBlock)
+    if (block_x * block_y * block_z > attributes.maxThreadsPerBlock)
       return error_code(Error::block_too_large);
     if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
         s.device.lds_bytes)
@@ -485,7 +486,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
 
     int blocks_a_cu = 0;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            &blocks_a_cu, kernel, static_cast<int>(block_x * block_y * block_z),
             shared_memory_bytes) != hipSuccess)
       return error_code(Error::hip_failed);
     if (grid_x > blocks_a_cu * s.device.compute_units)

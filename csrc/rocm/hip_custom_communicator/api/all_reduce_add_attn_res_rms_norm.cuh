@@ -297,7 +297,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     hipFuncAttributes attributes;
     if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
       return error_code(Error::hip_failed);
-    if (block_x > attributes.maxThreadsPerBlock)
+    if (block_x * block_y * block_z > attributes.maxThreadsPerBlock)
       return error_code(Error::block_too_large);
     if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
         s.device.lds_bytes)
@@ -308,7 +308,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
 
     int blocks_a_cu = 0;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_a_cu, kernel, static_cast<int>(block_x),
+            &blocks_a_cu, kernel, static_cast<int>(block_x * block_y * block_z),
             shared_memory_bytes) != hipSuccess)
       return error_code(Error::hip_failed);
     if (grid_x > blocks_a_cu * s.device.compute_units)
@@ -497,7 +497,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   hipFuncAttributes attributes;
   if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
     return error_code(Error::hip_failed);
-  if (block_x > attributes.maxThreadsPerBlock)
+  if (block_x * block_y * block_z > attributes.maxThreadsPerBlock)
     return error_code(Error::block_too_large);
   if (static_cast<int64_t>(attributes.sharedSizeBytes) + 0 > s.device.lds_bytes)
     return error_code(Error::lds_too_large);
@@ -506,7 +506,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
 
   int blocks_a_cu = 0;
   if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &blocks_a_cu, kernel, static_cast<int>(block_x), 0) != hipSuccess)
+          &blocks_a_cu, kernel, static_cast<int>(block_x * block_y * block_z),
+          0) != hipSuccess)
     return error_code(Error::hip_failed);
   if (grid_x > blocks_a_cu * s.device.compute_units)
     return error_code(Error::grid_not_resident);
@@ -656,7 +657,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   hipFuncAttributes second_attributes;
   if (hipFuncGetAttributes(&second_attributes, second_kernel) != hipSuccess)
     return error_code(Error::hip_failed);
-  if (*add_attn_res_rms_norm_block_x > second_attributes.maxThreadsPerBlock)
+  if (*add_attn_res_rms_norm_block_x * *add_attn_res_rms_norm_block_y *
+          *add_attn_res_rms_norm_block_z >
+      second_attributes.maxThreadsPerBlock)
     return error_code(Error::block_too_large);
   if (static_cast<int64_t>(second_attributes.sharedSizeBytes) +
           second_shared_bytes >

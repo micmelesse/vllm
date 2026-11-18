@@ -11,8 +11,9 @@ namespace hip_custom_communicator {
 namespace internal {
 
 // A Simple send: a store into the peer's memory, in any layout.
-template <int WORLD, int TILE_M, int BLOCK_X, int WAVE_SIZE, bool QUANTIZE_INT4,
-          Layout LAYOUT, bool TAIL, typename INPUT, typename PTR>
+template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename INPUT,
+          typename PTR>
 DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
                          int output_ptr_array_size, int output_rank,
                          int output_slot, int64_t output_stride_slot,
@@ -20,6 +21,8 @@ DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
                          int output_size_slot, int output_size_m,
                          int output_size_n, int clip_m, int clip_n, int offs_m,
                          int offs_n, int row_step) {
+  // One row of threads (BLOCK_Y = 1): a row split of Simple is not written yet.
+  static_assert(BLOCK_Y == 1, "a Simple send is one row of threads");
   constexpr int kPacks = std::extent_v<INPUT, 1>;
   if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
                 kPacks != kInt4GroupPacks) {
@@ -35,8 +38,8 @@ DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
 #pragma unroll
         for (int j = 0; j < kPackElems; ++j)
           group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
-      send_simple<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
-                  TAIL>(
+      send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
+                  LAYOUT, TAIL>(
           group, output_ptr_array, output_ptr_array_size, output_rank,
           output_slot, output_stride_slot, output_stride_m, output_stride_n,
           output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
@@ -814,9 +817,8 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
                   int offs_m, int offs_n, int row_step,
                   const uint32_t* flags = nullptr) {
   if constexpr (PROTOCOL == Protocol::simple) {
-    static_assert(BLOCK_Y == 1, "a Simple send is one row of threads");
-    internal::send_simple<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4,
-                          LAYOUT, TAIL>(
+    internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                          QUANTIZE_INT4, LAYOUT, TAIL>(
         input, output_ptr_array, output_ptr_array_size, output_rank,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,

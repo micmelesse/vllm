@@ -11,8 +11,9 @@ namespace hip_custom_communicator {
 namespace internal {
 
 // A Simple recv: a load from the peer's memory, in any layout.
-template <int WORLD, int TILE_M, int BLOCK_X, int WAVE_SIZE, bool QUANTIZE_INT4,
-          Layout LAYOUT, bool TAIL, typename PTR, typename OUTPUT>
+template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename PTR,
+          typename OUTPUT>
 DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
                          int input_rank, int input_slot,
                          int64_t input_stride_slot, int64_t input_stride_m,
@@ -20,6 +21,8 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
                          int input_size_m, int input_size_n, int clip_m,
                          int clip_n, OUTPUT& output, int offs_m, int offs_n,
                          int row_step) {
+  // One row of threads (BLOCK_Y = 1): a row split of Simple is not written yet.
+  static_assert(BLOCK_Y == 1, "a Simple recv is one row of threads");
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
   constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
   if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
@@ -34,8 +37,8 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
 #pragma unroll
     for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
       Group group;
-      recv_simple<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, LAYOUT,
-                  TAIL>(
+      recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
+                  LAYOUT, TAIL>(
           input_ptr_array, input_ptr_array_size, input_rank, input_slot,
           input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
           input_size_m, input_size_n, clip_m, clip_n, group, offs_m,
@@ -1343,9 +1346,8 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
   if constexpr (PROTOCOL == Protocol::simple) {
-    static_assert(BLOCK_Y == 1, "a Simple recv is one row of threads");
-    internal::recv_simple<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4,
-                          LAYOUT, TAIL>(
+    internal::recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                          QUANTIZE_INT4, LAYOUT, TAIL>(
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
