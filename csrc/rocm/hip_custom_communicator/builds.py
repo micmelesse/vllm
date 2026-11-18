@@ -46,7 +46,7 @@ SPLIT_ROWS = {
 }
 TEMPLATE_ARGS = {
     "all_reduce": "algorithm protocol quantize_int4 T world tile_m tile_n block_x "
-    "wave_size pack_bytes waves_per_eu contiguous tail",
+    "block_y wave_size pack_bytes waves_per_eu contiguous tail",
     "all_reduce_add_rms_norm": "algorithm residual quantize_int4 T W world tile_m "
     "tile_n block_x wave_size pack_bytes waves_per_eu chunked tail",
     "all_reduce_add_attn_res_rms_norm": "algorithm quantize_int4 T world tile_m "
@@ -121,6 +121,7 @@ class Instance:
             "tile_n": str(b.tile_n),
             "tile_k": str(b.tile_k),
             "block_x": str(b.block_x),
+            "block_y": str(b.block_y),
             "wave_size": str(self.wave_size),
             "pack_bytes": str(b.pack_bytes),
             "waves_per_eu": str(b.waves_per_eu),
@@ -198,6 +199,20 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     raise SystemExit(
                         f"{path}: {arch}: {build}: its kernel runs only simple"
                     )
+                # Rows of threads that each take some ranks' copies are the
+                # one-shot push's, on LL or Lamport; every other kernel is one
+                # row.
+                if build.block_y != 1 and (
+                    "block_y" not in TEMPLATE_ARGS[build.kernel].split()
+                    or build.algorithm != "one_shot_push"
+                    or build.protocol == "simple"
+                    or build.block_y not in WORLDS
+                ):
+                    raise SystemExit(
+                        f"{path}: {arch}: {build}: its kernel is one row of threads"
+                    )
+                if build.block_z != 1:
+                    raise SystemExit(f"{path}: {arch}: {build}: no block_z")
                 if build not in builds:
                     builds.append(build)
     return out
@@ -213,6 +228,8 @@ def instances(build: Build) -> list[Instance]:
     out: list[Instance] = []
     for dtype in DTYPES:
         for world in WORLDS if "world" in params else (0,):
+            if world % build.block_y != 0:
+                continue
             for weight in (dtype, WEIGHT_DTYPE) if "W" in params else (dtype,):
                 for contiguous in (True, False) if plain and two_shot else (False,):
                     for chunked in (False,) if plain else (True, False):

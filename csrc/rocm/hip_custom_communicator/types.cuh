@@ -111,7 +111,7 @@ struct Instance {
 template <typename T, typename W>
 using AllReduceKernel =
     decltype(&all_reduce<AllReduceAlgorithm{}, Protocol{}, false, T, 2, 1, 1,
-                         64, 64, 16, 1, false, false>);
+                         64, 1, 64, 16, 1, false, false>);
 template <typename T, typename W>
 using AllReduceAddRmsNormKernel =
     decltype(&all_reduce_add_rms_norm<AllReduceAddRmsNormKernelAlgorithm{},

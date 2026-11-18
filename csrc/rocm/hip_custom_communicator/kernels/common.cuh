@@ -276,8 +276,8 @@ DINLINE void read_buffer(
   constexpr bool kRun = LAYOUT == Layout::run || LAYOUT == Layout::group_run;
   if constexpr (PROTOCOL == Protocol::ll) {
     static_assert(LAYOUT == Layout::tile, "LL lines sit in a tile");
-    static_assert(kSlots && kCopies == WORLD,
-                  "a line read is every writer's copy");
+    // kCopies writers' copies, those of writers input_slot on.
+    static_assert(kSlots && kCopies <= WORLD, "a line read is writers' copies");
 
     constexpr int kLines = QUANTIZE_INT4 || sizeof(V) <= kLinePayloadBytes
                                ? 1
@@ -290,7 +290,7 @@ DINLINE void read_buffer(
         "a pack is one or two lines, an INT4 pack a word of 8 values");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (input_slot < 0 || input_slot + WORLD > input_size_slot ||
+        (input_slot < 0 || input_slot + kCopies > input_size_slot ||
          flags == nullptr))
       __builtin_trap();
 
@@ -322,11 +322,11 @@ DINLINE void read_buffer(
             row_at(i) < clip_m &&
             offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
       }
-    u32x4 got[WORLD][kRows][kPacks][kLines];
+    u32x4 got[kCopies][kRows][kPacks][kLines];
     const uint64_t t0 = wall_clock64();
     for (uint32_t n = 1;; ++n) {
 #pragma unroll
-      for (int c = 0; c < WORLD; ++c)
+      for (int c = 0; c < kCopies; ++c)
 #pragma unroll
         for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -343,7 +343,7 @@ DINLINE void read_buffer(
       asm volatile("" ::: "memory");
       bool missing = false;
 #pragma unroll
-      for (int c = 0; c < WORLD; ++c)
+      for (int c = 0; c < kCopies; ++c)
 #pragma unroll
         for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -369,7 +369,7 @@ DINLINE void read_buffer(
       if (!aborted) {
         uint32_t peer = 0, seen = flags[0], want = flags[0];
 #pragma unroll
-        for (int c = 0; c < WORLD; ++c)
+        for (int c = 0; c < kCopies; ++c)
 #pragma unroll
           for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -378,7 +378,7 @@ DINLINE void read_buffer(
               for (int h = 0; h < kLines; ++h)
                 if (waits[i][k] && (got[c][i][k][h][1] != flags[i] ||
                                     got[c][i][k][h][3] != flags[i])) {
-                  peer = c;
+                  peer = input_slot + c;
                   seen = got[c][i][k][h][1];
                   want = flags[i];
                 }
@@ -389,7 +389,7 @@ DINLINE void read_buffer(
     }
 
 #pragma unroll
-    for (int c = 0; c < WORLD; ++c)
+    for (int c = 0; c < kCopies; ++c)
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -416,14 +416,14 @@ DINLINE void read_buffer(
         }
   } else if constexpr (PROTOCOL == Protocol::lamport) {
     static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
-    static_assert(kSlots && kCopies == WORLD,
-                  "a Lamport read is every writer's copy");
+    static_assert(kSlots && kCopies <= WORLD,
+                  "a Lamport read is writers' copies");
     static_assert(!QUANTIZE_INT4 && sizeof(U) == 2,
                   "the sentinel is a 2-byte NaN");
     using W = raw_t<sizeof(V)>;
     constexpr int kHalves = sizeof(V) / 2;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (input_slot < 0 || input_slot + WORLD > input_size_slot ||
+        (input_slot < 0 || input_slot + kCopies > input_size_slot ||
          flags == nullptr))
       __builtin_trap();
 
@@ -459,11 +459,11 @@ DINLINE void read_buffer(
       for (int j = 0; j < kHalves; ++j) any |= h[j] == kLamportEmpty;
       return any;
     };
-    W got[WORLD][kRows][kPacks];
+    W got[kCopies][kRows][kPacks];
     const uint64_t t0 = wall_clock64();
     for (uint32_t n = 1;; ++n) {
 #pragma unroll
-      for (int c = 0; c < WORLD; ++c)
+      for (int c = 0; c < kCopies; ++c)
 #pragma unroll
         for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -476,7 +476,7 @@ DINLINE void read_buffer(
       asm volatile("" ::: "memory");
       bool missing = false;
 #pragma unroll
-      for (int c = 0; c < WORLD; ++c)
+      for (int c = 0; c < kCopies; ++c)
 #pragma unroll
         for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -498,12 +498,12 @@ DINLINE void read_buffer(
       if (!aborted) {
         uint32_t peer = 0;
 #pragma unroll
-        for (int c = 0; c < WORLD; ++c)
+        for (int c = 0; c < kCopies; ++c)
 #pragma unroll
           for (int i = 0; i < kRows; ++i)
 #pragma unroll
             for (int k = 0; k < kPacks; ++k)
-              if (waits[i][k] && empty(got[c][i][k])) peer = c;
+              if (waits[i][k] && empty(got[c][i][k])) peer = input_slot + c;
         give_up(status_ptr, status_stride_field, status_size_field,
                 Where::start, rank, peer, kLamportEmpty, flags[0], waited);
       }
@@ -511,7 +511,7 @@ DINLINE void read_buffer(
     }
 
 #pragma unroll
-    for (int c = 0; c < WORLD; ++c)
+    for (int c = 0; c < kCopies; ++c)
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
@@ -524,7 +524,7 @@ DINLINE void read_buffer(
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
-    for (int c = 0; c < WORLD; ++c)
+    for (int c = 0; c < kCopies; ++c)
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll

@@ -156,7 +156,8 @@ ErrorCode hip_custom_communicator_all_reduce(
   hipFuncAttributes attributes;
   if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
     return error_code(Error::hip_failed);
-  if (block_x > attributes.maxThreadsPerBlock)
+  const int64_t threads = block_x * block_y * block_z;
+  if (threads > attributes.maxThreadsPerBlock)
     return error_code(Error::block_too_large);
   if (static_cast<int64_t>(attributes.sharedSizeBytes) + shared_memory_bytes >
       s.device.lds_bytes)
@@ -166,7 +167,7 @@ ErrorCode hip_custom_communicator_all_reduce(
 
   int blocks_a_cu = 0;
   if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &blocks_a_cu, kernel, static_cast<int>(block_x),
+          &blocks_a_cu, kernel, static_cast<int>(threads),
           shared_memory_bytes) != hipSuccess)
     return error_code(Error::hip_failed);
   if (grid_x > blocks_a_cu * s.device.compute_units)
