@@ -2,6 +2,7 @@
 
 // Reduce-scatter stages: each rank sums its slice of every rank's input.
 
+#include "common/address.cuh"
 #include "common/barrier.cuh"
 #include "common/dequantize.cuh"
 #include "common/load.cuh"
@@ -99,8 +100,8 @@ DINLINE void reduce_scatter_flat_pull(
     char* staged[WORLD];
 #pragma unroll
     for (int i = 0; i < WORLD; ++i)
-      staged[i] =
-          load(staging_ptr_array, staging_ptr_array_size, (rank + i) % WORLD);
+      staged[i] = address(staging_ptr_array, staging_ptr_array_size,
+                          (rank + i) % WORLD);
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
                    signals_stride_writer, signals_size_parity,
@@ -154,9 +155,9 @@ DINLINE void reduce_scatter_flat_pull(
     constexpr bool kWaves = kLanes % WAVE_SIZE == 0;
     [[maybe_unused]] const DTYPE* input_entry = nullptr;
     if constexpr (kWaves)
-      input_entry = load(input_ptr_array, input_ptr_array_size, w);
+      input_entry = address(input_ptr_array, input_ptr_array_size, w);
     char* const partials_entry =
-        load(partials_ptr_array, partials_ptr_array_size, rank);
+        address(partials_ptr_array, partials_ptr_array_size, rank);
 
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
@@ -304,7 +305,7 @@ DINLINE void reduce_scatter_flat_push(
 
     const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
     char* const partials_entry =
-        load(partials_ptr_array, partials_ptr_array_size, rank);
+        address(partials_ptr_array, partials_ptr_array_size, rank);
 
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       const int len = flat_share_len(w, slice, total);

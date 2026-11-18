@@ -3,6 +3,7 @@
 // All-reduce kernels, one function per algorithm.
 
 #include "all_gather.cuh"
+#include "common/address.cuh"
 #include "common/barrier.cuh"
 #include "common/load.cuh"
 #include "common/send.cuh"
@@ -69,9 +70,9 @@ DINLINE void all_reduce_one_shot_pull(
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) {
     if constexpr (QUANTIZE_INT4)
-      entries[r] = load(staging_ptr_array, staging_ptr_array_size, r);
+      entries[r] = address(staging_ptr_array, staging_ptr_array_size, r);
     else
-      entries[r] = load(input_ptr_array, input_ptr_array_size, r);
+      entries[r] = address(input_ptr_array, input_ptr_array_size, r);
   }
 
   constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::started;

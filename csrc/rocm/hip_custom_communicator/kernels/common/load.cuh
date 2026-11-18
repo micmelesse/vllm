@@ -451,9 +451,4 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
   }
 }
 
-template <typename T>
-DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
-  return internal::ptr_array_at(x_ptr_array, x_ptr_array_size, x_rank);
-}
-
 }  // namespace hip_custom_communicator
