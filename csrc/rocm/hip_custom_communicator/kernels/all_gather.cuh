@@ -71,7 +71,7 @@ DINLINE void all_gather_flat_pull(
                          : min(g_end, share_len(r) / kInt4Group) * kInt4Group;
     for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
       uint32_t words[1][kInt4GroupPacks][2];
-      recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+      recv<WORLD, WORLD, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            Layout::group_run, TAIL>(
           partials_ptr_array, partials_ptr_array_size, r, 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
@@ -106,7 +106,7 @@ DINLINE void all_gather_flat_pull(
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       DTYPE got[1][kPacks][kPackElems];
 
-      recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
+      recv<WORLD, WORLD, BLOCK_X, 1, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
           partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1,
           slice, 1, kWhole ? slice : min(slice, chunk * kChunkN + kChunkN), got,
           0, chunk * kChunkN, 0);
@@ -148,7 +148,7 @@ DINLINE void all_gather_rows_pull(
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         DTYPE pack[1][1][kPackElems];
-        recv<WORLD, 1, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+        recv<WORLD, 1, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
              Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
@@ -161,7 +161,7 @@ DINLINE void all_gather_rows_pull(
       uint32_t raw[kPacks][1][1][2];
 #pragma unroll
       for (int k = 0; k < kPacks; ++k)
-        recv<WORLD, 1, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+        recv<WORLD, 1, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
              Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
@@ -205,7 +205,7 @@ DINLINE void all_gather_columns_pull(
 #pragma unroll
     for (int k = 0; k < kPacks; ++k) {
       DTYPE pack[kRows][1][kPackElems];
-      recv<WORLD, kRows, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+      recv<WORLD, kRows, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            Layout::tile, TAIL>(
           partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
@@ -220,7 +220,7 @@ DINLINE void all_gather_columns_pull(
     uint32_t raw[kPacks][kRows][1][2];
 #pragma unroll
     for (int k = 0; k < kPacks; ++k)
-      recv<WORLD, kRows, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+      recv<WORLD, kRows, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            Layout::tile, TAIL>(
           partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
@@ -244,7 +244,7 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
   static_assert(PROTOCOL == Protocol::simple, "this pull has no LL branch yet");
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
-    recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+    recv<WORLD, TILE_M, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile, TAIL>(&entries[r], 1, 0, 0, 0, stride_m, stride_n, 1,
                              size_m, size_n, size_m, clip_n, copies[r], offs_m,
                              offs_n, 1);
@@ -295,7 +295,7 @@ DINLINE void all_gather_tile_push(
                              : int64_t{input_size_m} * input_size_n;
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+      send<WORLD, TILE_M, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
                                r, rank, slot, input_size_n, 1, WORLD,
                                input_size_m, input_size_n, input_size_m, clip_n,
@@ -306,7 +306,7 @@ DINLINE void all_gather_tile_push(
                    signals_size_block, signals_size_writer, status_ptr,
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::launched, 0);
-    recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+    recv<WORLD, TILE_M, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, rank, 0,
                              slot, input_size_n, 1, WORLD, input_size_m,
                              input_size_n, input_size_m, clip_n, copies, offs_m,
@@ -320,14 +320,6 @@ DINLINE void all_gather_tile_push(
   } else {
     static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
                   "a tile push is simple, LL or Lamport");
-    // Every row of threads (BLOCK_Y of them) pushes the same tile and ends
-    // with every rank's copy. Row y sends to and receives from kRanks ranks,
-    // those from y * kRanks; the rows exchange what they received.
-    constexpr int kRanks = WORLD / BLOCK_Y;
-    // threadIdx.y is below BLOCK_Y; the % says so to the compiler, so one row
-    // is rank 0's from.
-    const int first_rank = __builtin_amdgcn_readfirstlane(
-        static_cast<int>(threadIdx.y % BLOCK_Y) * kRanks);
     constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
     constexpr int kThreadsN = BLOCK_X / kThreadsM;
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
@@ -380,20 +372,22 @@ DINLINE void all_gather_tile_push(
           quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
                    reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
 #pragma unroll
-      for (int r = first_rank; r < first_rank + kRanks; ++r)
-        send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::tile>(
-            payload, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
-            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
-            lines_n, first_row, 0, 1, epochs);
+      for (int r = 0; r < WORLD; ++r)
+        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+             Layout::tile>(payload, unfenced_ptr_array, unfenced_ptr_array_size,
+                           r, rank, unfenced_stride_slot, unfenced_stride_m,
+                           unfenced_stride_n, unfenced_size_slot,
+                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
+                           first_row, 0, 1, epochs);
     } else {
 #pragma unroll
-      for (int r = first_rank; r < first_rank + kRanks; ++r)
-        send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
-            mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
-            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
-            lines_n, first_row, 0, 1, epochs);
+      for (int r = 0; r < WORLD; ++r)
+        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::tile>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r,
+                           rank, unfenced_stride_slot, unfenced_stride_m,
+                           unfenced_stride_n, unfenced_size_slot,
+                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
+                           first_row, 0, 1, epochs);
     }
     // The epochs are saved now, not after the recv: there they would wait for
     // the recv's stores.
@@ -406,29 +400,13 @@ DINLINE void all_gather_tile_push(
         unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
         unfenced_epochs_size_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, first_row, 0, 1);
-    DTYPE got[kRanks][ROWS][PACKS][ELEMS];
-    recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank,
-                       first_rank, unfenced_stride_slot, unfenced_stride_m,
+    recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+                       unfenced_stride_slot, unfenced_stride_m,
                        unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
-                       unfenced_size_n, lines_m, lines_n, got, first_row, 0, 1,
-                       epochs, status_ptr, status_stride_field,
+                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
+                       1, epochs, status_ptr, status_stride_field,
                        status_size_field, timeout_ticks);
-    // One row holds every copy; rows that hold some exchange them.
-    if constexpr (kRanks == WORLD) {
-      __builtin_memcpy(copies, got, sizeof(got));
-    } else {
-      __shared__ DTYPE exchanged[WORLD][BLOCK_X][ROWS][PACKS][ELEMS];
-      const int tid = static_cast<int>(threadIdx.x);
-#pragma unroll
-      for (int c = 0; c < kRanks; ++c)
-        __builtin_memcpy(exchanged[first_rank + c][tid], got[c],
-                         sizeof(got[c]));
-      __syncthreads();
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        __builtin_memcpy(copies[r], exchanged[r][tid], sizeof(copies[r]));
-    }
     __syncthreads();
   }
 }

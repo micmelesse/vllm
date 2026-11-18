@@ -154,7 +154,7 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
         load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
             mine, t * TILE_M, c, 1);
-        send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, true, Protocol::simple,
+        send<WORLD, TILE_M, BLOCK_X, 1, WAVE_SIZE, true, Protocol::simple,
              Layout::tile, TAIL>(mine, staging_ptr_array,
                                  staging_ptr_array_size, rank, 0, 0, n, 1, 1, m,
                                  n, m, n, t * TILE_M, c, 1);
@@ -474,11 +474,11 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, Protocol::simple,
-           Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size,
-                               rank, 0, 0, partials_stride_m, partials_stride_n,
-                               1, partials_size_m, partials_size_n, m, n, sum,
-                               row, c, 1);
+      recv<WORLD, TILE_M, BLOCK_X, 1, WAVE_SIZE, QUANTIZE_INT4,
+           Protocol::simple, Layout::tile, TAIL>(
+          partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+          partials_stride_m, partials_stride_n, 1, partials_size_m,
+          partials_size_n, m, n, sum, row, c, 1);
 
       if constexpr (CHUNKED)
         store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
