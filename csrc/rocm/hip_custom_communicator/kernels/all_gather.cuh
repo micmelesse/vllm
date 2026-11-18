@@ -364,7 +364,8 @@ DINLINE void all_gather_tile_push(
     }
     const int lines_m = first_row + clip_m;
     const int lines_n = min(TILE_N, input_size_n - offs_n);
-    // Quantized once, then sent to every rank.
+    // Quantized once, then sent to every other rank: this rank's own copy is
+    // taken from registers.
     if constexpr (QUANTIZE_INT4) {
       uint32_t payload[ROWS][PACKS][2];
 #pragma unroll
@@ -375,21 +376,42 @@ DINLINE void all_gather_tile_push(
                    reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-             Layout::tile>(payload, unfenced_ptr_array, unfenced_ptr_array_size,
-                           r, rank, unfenced_stride_slot, unfenced_stride_m,
-                           unfenced_stride_n, unfenced_size_slot,
-                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, epochs);
+        if (r != rank)
+          send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
+               Layout::tile>(
+              payload, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
+              unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+              unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+              lines_n, first_row, 0, 1, epochs);
+      // This rank's own copy is what its peers decode.
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        if (r == rank)
+#pragma unroll
+          for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+            for (int k = 0; k < PACKS; ++k)
+              dequantize(payload[i][k], copies[r][i][k]);
     } else {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r,
-                           rank, unfenced_stride_slot, unfenced_stride_m,
-                           unfenced_stride_n, unfenced_size_slot,
-                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, epochs);
+        if (r != rank)
+          send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
+               Layout::tile>(mine, unfenced_ptr_array, unfenced_ptr_array_size,
+                             r, rank, unfenced_stride_slot, unfenced_stride_m,
+                             unfenced_stride_n, unfenced_size_slot,
+                             unfenced_size_m, unfenced_size_n, lines_m, lines_n,
+                             first_row, 0, 1, epochs);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        if (r == rank)
+#pragma unroll
+          for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+            for (int k = 0; k < PACKS; ++k)
+#pragma unroll
+              for (int j = 0; j < ELEMS; ++j)
+                copies[r][i][k][j] = mine[i][k][j];
     }
     // The epochs are saved now, not after the recv: there they would wait for
     // the recv's stores.
@@ -403,12 +425,12 @@ DINLINE void all_gather_tile_push(
         unfenced_epochs_size_n, unfenced_epochs_size_block,
         unfenced_epochs_size_n, first_row, 0, 1);
     recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
-                       unfenced_stride_slot, unfenced_stride_m,
-                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
-                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
-                       1, epochs, status_ptr, status_stride_field,
-                       status_size_field, timeout_ticks);
+         Layout::tile, false, true>(
+        unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
+        copies, first_row, 0, 1, epochs, status_ptr, status_stride_field,
+        status_size_field, timeout_ticks);
     __syncthreads();
   }
 }
