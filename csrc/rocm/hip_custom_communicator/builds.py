@@ -199,14 +199,15 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     raise SystemExit(
                         f"{path}: {arch}: {build}: its kernel runs only simple"
                     )
-                # Rows of threads that each take some ranks' copies are the
-                # one-shot push's, on LL or Lamport; every other kernel is one
-                # row.
+                # Rows of threads, each a peer's sends and receives, are the
+                # one-shot push's on LL or Lamport, in whole waves; every other
+                # kernel is one row.
                 if build.block_y != 1 and (
                     "block_y" not in TEMPLATE_ARGS[build.kernel].split()
                     or build.algorithm != "one_shot_push"
                     or build.protocol == "simple"
                     or build.block_y not in WORLDS
+                    or build.block_x % WAVE_SIZE != 0
                 ):
                     raise SystemExit(
                         f"{path}: {arch}: {build}: its kernel is one row of threads"

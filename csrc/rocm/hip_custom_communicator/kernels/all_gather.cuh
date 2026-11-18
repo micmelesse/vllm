@@ -284,7 +284,6 @@ DINLINE void all_gather_tile_push(
     int offs_n, int clip_m, int clip_n,
     DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   if constexpr (PROTOCOL == Protocol::simple) {
-    static_assert(BLOCK_Y == 1, "a Simple tile push is one row of threads");
     DTYPE mine[ROWS][PACKS][ELEMS];
     load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
@@ -321,12 +320,12 @@ DINLINE void all_gather_tile_push(
   } else {
     static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
                   "a tile push is simple, LL or Lamport");
-    // The block's rows of threads (BLOCK_Y) each push the same tile and take
-    // the copies of kRanks ranks, row y those of ranks y * kRanks on; they
-    // meet in shared memory, where row 0 takes them all.
+    // Every row of threads (BLOCK_Y of them) pushes the same tile and ends
+    // with every rank's copy. Row y sends to and receives from kRanks ranks,
+    // those from y * kRanks; the rows exchange what they received.
     constexpr int kRanks = WORLD / BLOCK_Y;
-    static_assert(kRanks * BLOCK_Y == WORLD && BLOCK_X % WAVE_SIZE == 0,
-                  "a row of threads is whole waves, the ranks whole rows");
+    // threadIdx.y is below BLOCK_Y; the % says so to the compiler, so one row
+    // is rank 0's from.
     const int first_rank = __builtin_amdgcn_readfirstlane(
         static_cast<int>(threadIdx.y % BLOCK_Y) * kRanks);
     constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
@@ -402,12 +401,11 @@ DINLINE void all_gather_tile_push(
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
       next[i][0][0] = static_cast<int32_t>(epochs[i]);
-    if (first_rank == 0)
-      store<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
-          next, unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
-          unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
-          unfenced_epochs_size_n, unfenced_epochs_size_block,
-          unfenced_epochs_size_n, first_row, 0, 1);
+    store<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+        next, unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
+        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, unfenced_epochs_size_block,
+        unfenced_epochs_size_n, first_row, 0, 1);
     DTYPE got[kRanks][ROWS][PACKS][ELEMS];
     recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank,
@@ -416,19 +414,20 @@ DINLINE void all_gather_tile_push(
                        unfenced_size_n, lines_m, lines_n, got, first_row, 0, 1,
                        epochs, status_ptr, status_stride_field,
                        status_size_field, timeout_ticks);
-    if constexpr (BLOCK_Y == 1) {
+    // One row holds every copy; rows that hold some exchange them.
+    if constexpr (kRanks == WORLD) {
       __builtin_memcpy(copies, got, sizeof(got));
     } else {
-      __shared__ DTYPE met[WORLD][BLOCK_X][ROWS][PACKS][ELEMS];
+      __shared__ DTYPE exchanged[WORLD][BLOCK_X][ROWS][PACKS][ELEMS];
       const int tid = static_cast<int>(threadIdx.x);
 #pragma unroll
       for (int c = 0; c < kRanks; ++c)
-        __builtin_memcpy(met[first_rank + c][tid], got[c], sizeof(got[c]));
+        __builtin_memcpy(exchanged[first_rank + c][tid], got[c],
+                         sizeof(got[c]));
       __syncthreads();
-      if (first_rank == 0)
 #pragma unroll
-        for (int r = 0; r < WORLD; ++r)
-          __builtin_memcpy(copies[r], met[r][tid], sizeof(copies[r]));
+      for (int r = 0; r < WORLD; ++r)
+        __builtin_memcpy(copies[r], exchanged[r][tid], sizeof(copies[r]));
     }
     __syncthreads();
   }

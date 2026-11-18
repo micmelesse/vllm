@@ -216,8 +216,6 @@ DINLINE void all_reduce_one_shot_push(
         status_ptr, status_stride_field, status_size_field, rank,
         timeout_ticks);
 
-    // The copies are thread row 0's.
-    if (threadIdx.y % BLOCK_Y != 0) continue;
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -306,8 +304,6 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
     int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks) {
-  static_assert(BLOCK_Y == 1 || ALGORITHM == AllReduceAlgorithm::one_shot_push,
-                "only the one-shot push splits its block by peer");
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
     all_reduce_one_shot_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                              TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
