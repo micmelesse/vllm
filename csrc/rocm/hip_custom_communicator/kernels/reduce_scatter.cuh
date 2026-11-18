@@ -21,17 +21,16 @@ DINLINE int flat_share_len(int r, int slice, int64_t total) {
       max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
 }
 
-template <int THREADS_PER_BLOCK, int WAVE_SIZE, int SLICE_WAVES>
+template <int BLOCK_X, int WAVE_SIZE, int SLICE_WAVES>
 constexpr int columns_threads_n() {
-  for (int t = SLICE_WAVES < THREADS_PER_BLOCK ? SLICE_WAVES
-                                               : THREADS_PER_BLOCK;
-       t < THREADS_PER_BLOCK; t += WAVE_SIZE)
-    if (THREADS_PER_BLOCK % t == 0) return t;
-  return THREADS_PER_BLOCK;
+  for (int t = SLICE_WAVES < BLOCK_X ? SLICE_WAVES : BLOCK_X; t < BLOCK_X;
+       t += WAVE_SIZE)
+    if (BLOCK_X % t == 0) return t;
+  return BLOCK_X;
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, int WORLD, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_flat_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
@@ -64,8 +63,8 @@ DINLINE void reduce_scatter_flat_pull(
     const int per_block = (groups_all + grid - 1) / grid;
     const int g_first = static_cast<int>(blockIdx.x) * per_block;
     const int g_end = min(g_first + per_block, groups_all);
-    constexpr int kRankLanes = THREADS_PER_BLOCK / WORLD;
-    static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK,
+    constexpr int kRankLanes = BLOCK_X / WORLD;
+    static_assert(kRankLanes * WORLD == BLOCK_X,
                   "a block is a row of threads a rank");
     const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
     const int len = flat_share_len(r, slice, total);
@@ -73,14 +72,14 @@ DINLINE void reduce_scatter_flat_pull(
     if (TAIL ? len != 0 : len / kInt4Group != 0)
       for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
         DTYPE x[1][kInt4GroupPacks][kPackElems];
-        load<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
+        load<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, kInput, TAIL>(
             input_ptr, r, slice, input_stride_m, input_stride_n, WORLD,
             input_size_m, input_size_n, input_size_m, len, x, 0,
             g0 * kInt4Group, 1);
 
         uint32_t payload[1][kInt4GroupPacks][2];
         quantize(x[0], payload[0]);
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
             payload, staging_ptr_array, staging_ptr_array_size, rank, r, slice,
             staging_stride_m, staging_stride_n, WORLD, staging_size_m,
@@ -104,26 +103,24 @@ DINLINE void reduce_scatter_flat_pull(
 
     const int own = flat_share_len(rank, slice, total);
     if (TAIL ? own != 0 : own / kInt4Group != 0)
-      for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
+      for (int g0 = g_first; g0 < g_end; g0 += BLOCK_X) {
         uint32_t words[WORLD][1][kInt4GroupPacks][2];
 #pragma unroll
         for (int i = 0; i < WORLD; ++i)
-          recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-               Layout::group_run, TAIL>(
-              &staged[i], 1, 0, rank, slice, staging_stride_m, staging_stride_n,
-              WORLD, staging_size_m, staging_size_n, 1, own, words[i], 0,
-              g0 * kInt4Group, 1);
+          recv<WORLD, 1, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::group_run,
+               TAIL>(&staged[i], 1, 0, rank, slice, staging_stride_m,
+                     staging_stride_n, WORLD, staging_size_m, staging_size_n, 1,
+                     own, words[i], 0, g0 * kInt4Group, 1);
 
         float sum[1][kInt4GroupPacks][kPackElems];
         dequantize<DTYPE>(words, sum);
-        send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(
-            sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-            partials_stride_m, partials_stride_n, 1, partials_size_m,
-            partials_size_n, 1,
-            TAIL ? min(g_end * kInt4Group, own)
-                 : min(g_end, own / kInt4Group) * kInt4Group,
-            0, g0 * kInt4Group, 1);
+        send<WORLD, 1, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::group_run,
+             TAIL>(sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+                   partials_stride_m, partials_stride_n, 1, partials_size_m,
+                   partials_size_n, 1,
+                   TAIL ? min(g_end * kInt4Group, own)
+                        : min(g_end, own / kInt4Group) * kInt4Group,
+                   0, g0 * kInt4Group, 1);
       }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
@@ -133,12 +130,12 @@ DINLINE void reduce_scatter_flat_pull(
                    Until::visible, 1);
   } else {
     constexpr Layout kInput = CONTIGUOUS ? Layout::run : Layout::flat;
-    constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
+    constexpr int kLanes = BLOCK_X / WORLD;
 
     constexpr int kChunkN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
     constexpr int kPacks =
         (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
-    static_assert(kLanes * WORLD == THREADS_PER_BLOCK,
+    static_assert(kLanes * WORLD == BLOCK_X,
                   "a block is a group of threads a rank");
 
     constexpr bool kWhole = kPacks * kPackElems * kLanes == kChunkN;
@@ -165,23 +162,21 @@ DINLINE void reduce_scatter_flat_pull(
         const int end = kWhole ? len : min(len, chunk * kChunkN + kChunkN);
         DTYPE got[1][kPacks][kPackElems];
         if constexpr (kWaves)
-          recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL, kInput,
-               TAIL>(&input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
-                     input_ptr_array_stride_n, WORLD, input_size_m,
-                     input_size_n, input_size_m, end, got, 0, chunk * kChunkN,
-                     1);
+          recv<WORLD, 1, BLOCK_X, WAVE_SIZE, false, PROTOCOL, kInput, TAIL>(
+              &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
+              input_ptr_array_stride_n, WORLD, input_size_m, input_size_n,
+              input_size_m, end, got, 0, chunk * kChunkN, 1);
         else
-          recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL, kInput,
-               TAIL>(input_ptr_array, input_ptr_array_size, w, rank, slice,
-                     input_ptr_array_stride_m, input_ptr_array_stride_n, WORLD,
-                     input_size_m, input_size_n, input_size_m, end, got, 0,
-                     chunk * kChunkN, 1);
+          recv<WORLD, 1, BLOCK_X, WAVE_SIZE, false, PROTOCOL, kInput, TAIL>(
+              input_ptr_array, input_ptr_array_size, w, rank, slice,
+              input_ptr_array_stride_m, input_ptr_array_stride_n, WORLD,
+              input_size_m, input_size_n, input_size_m, end, got, 0,
+              chunk * kChunkN, 1);
         DTYPE rounded[1][kPacks][kPackElems];
-        reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
-                                                                   rounded[0]);
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1,
-                           len, 1, end, 0, chunk * kChunkN, 1);
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
+            rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1, len, 1, end, 0,
+            chunk * kChunkN, 1);
       }
     }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
@@ -194,7 +189,7 @@ DINLINE void reduce_scatter_flat_pull(
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, int WORLD, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_flat_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
@@ -225,8 +220,8 @@ DINLINE void reduce_scatter_flat_push(
     const int per_block = (groups_all + grid - 1) / grid;
     const int g_first = static_cast<int>(blockIdx.x) * per_block;
     const int g_end = min(g_first + per_block, groups_all);
-    constexpr int kRankLanes = THREADS_PER_BLOCK / WORLD;
-    static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK,
+    constexpr int kRankLanes = BLOCK_X / WORLD;
+    static_assert(kRankLanes * WORLD == BLOCK_X,
                   "a block is a row of threads a rank");
     const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
     const int len = flat_share_len(r, slice, total);
@@ -234,14 +229,14 @@ DINLINE void reduce_scatter_flat_push(
     if (TAIL ? len != 0 : len / kInt4Group != 0)
       for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
         DTYPE x[1][kInt4GroupPacks][kPackElems];
-        load<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
+        load<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, kInput, TAIL>(
             input_ptr, r, slice, input_stride_m, input_stride_n, WORLD,
             input_size_m, input_size_n, input_size_m, len, x, 0,
             g0 * kInt4Group, 1);
 
         uint32_t payload[1][kInt4GroupPacks][2];
         quantize(x[0], payload[0]);
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
             payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
             staging_stride_m, staging_stride_n, WORLD, staging_size_m,
@@ -259,24 +254,22 @@ DINLINE void reduce_scatter_flat_push(
 
     const int own = flat_share_len(rank, slice, total);
     if (TAIL ? own != 0 : own / kInt4Group != 0)
-      for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
+      for (int g0 = g_first; g0 < g_end; g0 += BLOCK_X) {
         uint32_t words[WORLD][1][kInt4GroupPacks][2];
-        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(
-            staging_ptr_array, staging_ptr_array_size, rank, rank, slice,
-            staging_stride_m, staging_stride_n, WORLD, staging_size_m,
-            staging_size_n, 1, own, words, 0, g0 * kInt4Group, 1);
+        recv<WORLD, 1, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::group_run,
+             TAIL>(staging_ptr_array, staging_ptr_array_size, rank, rank, slice,
+                   staging_stride_m, staging_stride_n, WORLD, staging_size_m,
+                   staging_size_n, 1, own, words, 0, g0 * kInt4Group, 1);
 
         float sum[1][kInt4GroupPacks][kPackElems];
         dequantize<DTYPE>(words, sum);
-        send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(
-            sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-            partials_stride_m, partials_stride_n, 1, partials_size_m,
-            partials_size_n, 1,
-            TAIL ? min(g_end * kInt4Group, own)
-                 : min(g_end, own / kInt4Group) * kInt4Group,
-            0, g0 * kInt4Group, 1);
+        send<WORLD, 1, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::group_run,
+             TAIL>(sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+                   partials_stride_m, partials_stride_n, 1, partials_size_m,
+                   partials_size_n, 1,
+                   TAIL ? min(g_end * kInt4Group, own)
+                        : min(g_end, own / kInt4Group) * kInt4Group,
+                   0, g0 * kInt4Group, 1);
       }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
@@ -286,12 +279,12 @@ DINLINE void reduce_scatter_flat_push(
                    Until::visible, 1);
   } else {
     constexpr Layout kInput = CONTIGUOUS ? Layout::run : Layout::flat;
-    constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
+    constexpr int kLanes = BLOCK_X / WORLD;
 
     constexpr int kChunkN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
     constexpr int kPacks =
         (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
-    static_assert(kLanes * WORLD == THREADS_PER_BLOCK,
+    static_assert(kLanes * WORLD == BLOCK_X,
                   "a block is a group of threads a rank");
 
     constexpr bool kWhole = kPacks * kPackElems * kLanes == kChunkN;
@@ -307,15 +300,14 @@ DINLINE void reduce_scatter_flat_push(
 
       const int end = kWhole ? len : min(len, chunk * kChunkN + kChunkN);
       DTYPE part[1][kPacks][kPackElems];
-      load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, kInput, TAIL>(
+      load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kInput, TAIL>(
           input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
           input_size_m, input_size_n, input_size_m, end, part, 0,
           chunk * kChunkN, 1);
-      send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-           Layout::run>(part, staging_ptr_array, staging_ptr_array_size, w,
-                        rank, staging_stride_m, staging_stride_m,
-                        staging_stride_n, WORLD, staging_size_m, staging_size_n,
-                        1, end, 0, chunk * kChunkN, 1);
+      send<WORLD, 1, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::run>(
+          part, staging_ptr_array, staging_ptr_array_size, w, rank,
+          staging_stride_m, staging_stride_m, staging_stride_n, WORLD,
+          staging_size_m, staging_size_n, 1, end, 0, chunk * kChunkN, 1);
     }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
@@ -329,17 +321,15 @@ DINLINE void reduce_scatter_flat_push(
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
         const int end = kWhole ? len : min(len, chunk * kChunkN + kChunkN);
         DTYPE got[1][kPacks][kPackElems];
-        recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-             Layout::run>(staging_ptr_array, staging_ptr_array_size, rank, w,
-                          staging_stride_m, staging_stride_m, staging_stride_n,
-                          WORLD, staging_size_m, staging_size_n, 1, end, got, 0,
-                          chunk * kChunkN, 1);
+        recv<WORLD, 1, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::run>(
+            staging_ptr_array, staging_ptr_array_size, rank, w,
+            staging_stride_m, staging_stride_m, staging_stride_n, WORLD,
+            staging_size_m, staging_size_n, 1, end, got, 0, chunk * kChunkN, 1);
         DTYPE rounded[1][kPacks][kPackElems];
-        reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
-                                                                   rounded[0]);
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1,
-                           len, 1, end, 0, chunk * kChunkN, 1);
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
+            rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1, len, 1, end, 0,
+            chunk * kChunkN, 1);
       }
     }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
@@ -352,7 +342,7 @@ DINLINE void reduce_scatter_flat_push(
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, int WORLD, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_columns_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
@@ -385,19 +375,18 @@ DINLINE void reduce_scatter_columns_pull(
     constexpr int kTiles = TILE_M < 4 ? 4 / TILE_M : 1;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
     for (int t = blockIdx.x; t < tiles; t += kTiles * gridDim.x)
-      for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+      for (int c = 0; c < input_size_n; c += BLOCK_X * kPackElems) {
         DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false,
-               Layout::tile>(
+          load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
               input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
               input_size_n, input_size_m, input_size_n, x[s],
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-               PROTOCOL, Layout::tile, TAIL>(
+          send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+               Layout::tile, TAIL>(
               x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
@@ -411,8 +400,8 @@ DINLINE void reduce_scatter_columns_pull(
                  signals_stride_writer, signals_size_parity, signals_size_block,
                  signals_size_writer, status_ptr, status_stride_field,
                  status_size_field, rank, timeout_ticks, kFirst, 0);
-  constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
-  static_assert(kLanes * WORLD == THREADS_PER_BLOCK,
+  constexpr int kLanes = BLOCK_X / WORLD;
+  static_assert(kLanes * WORLD == BLOCK_X,
                 "a block is a row of threads a rank");
   using Summed = std::conditional_t<QUANTIZE_INT4, float, DTYPE>;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
@@ -423,24 +412,22 @@ DINLINE void reduce_scatter_columns_pull(
         const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][1][kPackElems];
         if constexpr (!QUANTIZE_INT4)
-          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-               Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0,
-                             input_ptr_array_stride_m, input_ptr_array_stride_n,
-                             1, input_size_m, input_size_n, input_size_m, end,
-                             got, row, c, 0);
+          recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
+              input_ptr_array, input_ptr_array_size, r, 0, 0,
+              input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
+              input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
         else
-          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-               PROTOCOL, Layout::tile, TAIL>(
-              staging_ptr_array, staging_ptr_array_size, r, 0, 0,
-              staging_stride_m, staging_stride_n, 1, staging_size_m,
-              staging_size_n, input_size_m, end, got, row, c, 0);
+          recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+               Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r,
+                                   0, 0, staging_stride_m, staging_stride_n, 1,
+                                   staging_size_m, staging_size_n, input_size_m,
+                                   end, got, row, c, 0);
 
         Summed rounded[1][1][kPackElems];
-        reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
-                                                                   rounded[0]);
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
 
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-             PROTOCOL, Layout::tile, TAIL>(
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+             Layout::tile, TAIL>(
             rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, row + 1, end, row, c, 1);
@@ -453,7 +440,7 @@ DINLINE void reduce_scatter_columns_pull(
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, int WORLD, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_rows_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
@@ -482,19 +469,18 @@ DINLINE void reduce_scatter_rows_pull(
     constexpr int kTiles = TILE_M < 4 ? 4 / TILE_M : 1;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
     for (int t = blockIdx.x; t < tiles; t += kTiles * gridDim.x)
-      for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+      for (int c = 0; c < input_size_n; c += BLOCK_X * kPackElems) {
         DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false,
-               Layout::tile>(
+          load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
               input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
               input_size_n, input_size_m, input_size_n, x[s],
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-               PROTOCOL, Layout::tile, TAIL>(
+          send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+               Layout::tile, TAIL>(
               x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
@@ -508,8 +494,8 @@ DINLINE void reduce_scatter_rows_pull(
                  signals_stride_writer, signals_size_parity, signals_size_block,
                  signals_size_writer, status_ptr, status_stride_field,
                  status_size_field, rank, timeout_ticks, kFirst, 0);
-  constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
-  static_assert(kLanes * WORLD == THREADS_PER_BLOCK,
+  constexpr int kLanes = BLOCK_X / WORLD;
+  static_assert(kLanes * WORLD == BLOCK_X,
                 "a block is a row of threads a rank");
   using Summed = std::conditional_t<QUANTIZE_INT4, float, DTYPE>;
 
@@ -521,24 +507,22 @@ DINLINE void reduce_scatter_rows_pull(
         const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][1][kPackElems];
         if constexpr (!QUANTIZE_INT4)
-          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, false, PROTOCOL,
-               Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0,
-                             input_ptr_array_stride_m, input_ptr_array_stride_n,
-                             1, input_size_m, input_size_n, input_size_m, end,
-                             got, row, c, 0);
+          recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, PROTOCOL, Layout::tile>(
+              input_ptr_array, input_ptr_array_size, r, 0, 0,
+              input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
+              input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
         else
-          recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-               PROTOCOL, Layout::tile, TAIL>(
-              staging_ptr_array, staging_ptr_array_size, r, 0, 0,
-              staging_stride_m, staging_stride_n, 1, staging_size_m,
-              staging_size_n, input_size_m, end, got, row, c, 0);
+          recv<WORLD, WORLD, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+               Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r,
+                                   0, 0, staging_stride_m, staging_stride_n, 1,
+                                   staging_size_m, staging_size_n, input_size_m,
+                                   end, got, row, c, 0);
 
         Summed rounded[1][1][kPackElems];
-        reduce<WORLD, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::m>(got[0],
-                                                                   rounded[0]);
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
 
-        send<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-             PROTOCOL, Layout::tile, TAIL>(
+        send<WORLD, WORLD, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+             Layout::tile, TAIL>(
             rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, row + 1, end, row, c, 1);
@@ -551,7 +535,7 @@ DINLINE void reduce_scatter_rows_pull(
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, int WORLD, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           bool CONTIGUOUS, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter_columns_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
@@ -585,19 +569,18 @@ DINLINE void reduce_scatter_columns_push(
     constexpr int kTiles = TILE_M < 4 ? 4 / TILE_M : 1;
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
     for (int t = blockIdx.x; t < tiles; t += kTiles * gridDim.x)
-      for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+      for (int c = 0; c < input_size_n; c += BLOCK_X * kPackElems) {
         DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false,
-               Layout::tile>(
+          load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
               input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
               input_size_n, input_size_m, input_size_n, x[s],
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-               PROTOCOL, Layout::tile, TAIL>(
+          send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+               Layout::tile, TAIL>(
               x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
@@ -615,8 +598,8 @@ DINLINE void reduce_scatter_columns_push(
       (TILE_N / WORLD / kPackElems + WAVE_SIZE - 1) / WAVE_SIZE * WAVE_SIZE;
 
   constexpr int kThreadsN =
-      columns_threads_n<THREADS_PER_BLOCK, WAVE_SIZE, kSliceWaves>();
-  constexpr int kThreadsM = THREADS_PER_BLOCK / kThreadsN;
+      columns_threads_n<BLOCK_X, WAVE_SIZE, kSliceWaves>();
+  constexpr int kThreadsM = BLOCK_X / kThreadsN;
   using Summed = std::conditional_t<QUANTIZE_INT4, float, DTYPE>;
   const int offs_n = col0 * kPackElems;
   const int size_n = own_packs * kPackElems;
@@ -630,12 +613,12 @@ DINLINE void reduce_scatter_columns_push(
           if constexpr (!QUANTIZE_INT4) {
             DTYPE peers[WORLD][1][1][kPackElems];
             for (int r = 0; r < WORLD; ++r)
-              recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE, false,
-                   PROTOCOL, Layout::tile>(
-                  input_ptr_array, input_ptr_array_size, r, 0, 0,
-                  input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
-                  input_size_m, input_size_n, tile_end, offs_n + size_n,
-                  peers[r], row, c, 1);
+              recv<WORLD, kThreadsM, BLOCK_X, WAVE_SIZE, false, PROTOCOL,
+                   Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0,
+                                 input_ptr_array_stride_m,
+                                 input_ptr_array_stride_n, 1, input_size_m,
+                                 input_size_n, tile_end, offs_n + size_n,
+                                 peers[r], row, c, 1);
 
 #pragma unroll
             for (int j = 0; j < kPackElems; ++j) {
@@ -648,8 +631,8 @@ DINLINE void reduce_scatter_columns_push(
           } else {
             uint32_t raw[WORLD][1][1][2];
             for (int r = 0; r < WORLD; ++r)
-              recv<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
-                   QUANTIZE_INT4, PROTOCOL, Layout::tile, TAIL>(
+              recv<WORLD, kThreadsM, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4,
+                   PROTOCOL, Layout::tile, TAIL>(
                   staging_ptr_array, staging_ptr_array_size, r, 0, 0,
                   staging_stride_m, staging_stride_n, 1, staging_size_m,
                   staging_size_n, tile_end, offs_n + size_n, raw[r], row, c, 1);
@@ -696,14 +679,14 @@ DINLINE void reduce_scatter_columns_push(
           }
           for (int r = 0; r < WORLD; ++r) {
             if constexpr (QUANTIZE_INT4)
-              send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
-                   QUANTIZE_INT4, PROTOCOL, Layout::tile, TAIL>(
+              send<WORLD, kThreadsM, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4,
+                   PROTOCOL, Layout::tile, TAIL>(
                   payload, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
                   partials_stride_m, partials_stride_n, 1, partials_size_m,
                   partials_size_n, tile_end, offs_n + size_n, row, c, 1);
             else
-              send<WORLD, kThreadsM, THREADS_PER_BLOCK, WAVE_SIZE,
-                   QUANTIZE_INT4, PROTOCOL, Layout::tile, TAIL>(
+              send<WORLD, kThreadsM, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4,
+                   PROTOCOL, Layout::tile, TAIL>(
                   rounded, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
                   partials_stride_m, partials_stride_n, 1, partials_size_m,
                   partials_size_n, tile_end, offs_n + size_n, row, c, 1);
@@ -719,9 +702,9 @@ DINLINE void reduce_scatter_columns_push(
 }  // namespace internal
 
 template <ReduceScatterAlgorithm ALGORITHM, Protocol PROTOCOL,
-          bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
-          bool TAIL, typename DTYPE>
+          bool QUANTIZE_INT4, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS, bool TAIL,
+          typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -739,8 +722,8 @@ DINLINE void reduce_scatter(
     int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_pull)
     internal::reduce_scatter_flat_pull<PROTOCOL, QUANTIZE_INT4, WORLD, TILE_M,
-                                       TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                                       PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
+                                       TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                                       CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -753,8 +736,8 @@ DINLINE void reduce_scatter(
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::flat_push)
     internal::reduce_scatter_flat_push<PROTOCOL, QUANTIZE_INT4, WORLD, TILE_M,
-                                       TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                                       PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
+                                       TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                                       CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m,
         staging_stride_n, staging_size_m, staging_size_n, partials_ptr_array,
@@ -766,8 +749,8 @@ DINLINE void reduce_scatter(
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::rows_pull)
     internal::reduce_scatter_rows_pull<PROTOCOL, QUANTIZE_INT4, WORLD, TILE_M,
-                                       TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                                       PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
+                                       TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                                       CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -779,9 +762,9 @@ DINLINE void reduce_scatter(
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_pull)
-    internal::reduce_scatter_columns_pull<
-        PROTOCOL, QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_columns_pull<PROTOCOL, QUANTIZE_INT4, WORLD,
+                                          TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                                          PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -793,9 +776,9 @@ DINLINE void reduce_scatter(
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == ReduceScatterAlgorithm::columns_push)
-    internal::reduce_scatter_columns_push<
-        PROTOCOL, QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
+    internal::reduce_scatter_columns_push<PROTOCOL, QUANTIZE_INT4, WORLD,
+                                          TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                                          PACK_BYTES, CONTIGUOUS, TAIL, DTYPE>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, staging_ptr_array, staging_ptr_array_size,

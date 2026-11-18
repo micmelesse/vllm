@@ -8,8 +8,8 @@ namespace hip_custom_communicator {
 
 enum class NormPart : int { scale = 0, apply = 1, row = 2, wide = 3 };
 
-template <int THREADS_PER_BLOCK, int WAVE_SIZE, typename W, typename T,
-          int ROWS, int K, int P>
+template <int BLOCK_X, int WAVE_SIZE, typename W, typename T, int ROWS, int K,
+          int P>
 DINLINE void rms_normalize(const float (&input)[ROWS][K][P],
                            float (&scale)[ROWS], const W (&weight)[1][K][P],
                            T (&output)[ROWS][K][P], float eps, float inv_hidden,
@@ -26,23 +26,22 @@ DINLINE void rms_normalize(const float (&input)[ROWS][K][P],
 #pragma unroll
         for (int j = 0; j < P; ++j)
           ss_k = fmaf(input[m][k][j], input[m][k][j], ss_k);
-        const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
+        const int t = static_cast<int>(threadIdx.x) % BLOCK_X;
         const int n =
             layout == Layout::tile
-                ? offs_n / P + t + k * THREADS_PER_BLOCK
+                ? offs_n / P + t + k * BLOCK_X
                 : offs_n / P +
-                      ((k / kInt4GroupPacks) * THREADS_PER_BLOCK + t) *
-                          kInt4GroupPacks +
+                      ((k / kInt4GroupPacks) * BLOCK_X + t) * kInt4GroupPacks +
                       k % kInt4GroupPacks;
         ss[0][m] += n < size_n / P ? ss_k : 0.0f;
       }
     }
-    if (part == NormPart::wide && offs_n + K * P * THREADS_PER_BLOCK < size_n) {
+    if (part == NormPart::wide && offs_n + K * P * BLOCK_X < size_n) {
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) scale[m] = ss[0][m];
       return;
     }
-    reduce<1, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::all>(ss, ss);
+    reduce<1, BLOCK_X, WAVE_SIZE, ReduceAxis::all>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m)
       scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);

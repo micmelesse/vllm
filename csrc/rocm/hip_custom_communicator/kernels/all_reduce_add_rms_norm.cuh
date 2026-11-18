@@ -16,7 +16,7 @@ enum class AllReduceAddRmsNormKernelAlgorithm {
   two_shot_push
 };
 
-template <bool RESIDUAL, int THREADS_PER_BLOCK, int WAVE_SIZE, typename DTYPE,
+template <bool RESIDUAL, int BLOCK_X, int WAVE_SIZE, typename DTYPE,
           typename WEIGHT_DTYPE, int ROWS, int K, int P>
 DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
                                const WEIGHT_DTYPE (&w)[1][K][P],
@@ -32,7 +32,7 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
   const float inv_hidden = 1.0f / static_cast<float>(n);
   DTYPE res[ROWS][K][P];
   if constexpr (RESIDUAL)
-    load<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, ROWS, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n, m, n,
         res, offs_m, 0, 1);
   float s[ROWS][K][P];
@@ -48,22 +48,20 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
         added[i][k][j] = static_cast<DTYPE>(s[i][k][j]);
       }
   if constexpr (RESIDUAL)
-    store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    store<1, ROWS, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         added, residual_output_ptr, 0, 0, residual_output_stride_m,
         residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
   float scale[ROWS];
   DTYPE normed[ROWS][K][P];
-  rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(s, scale, w, normed, eps,
-                                              inv_hidden, n, 0, NormPart::row,
-                                              true, Layout::tile);
-  store<1, ROWS, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+  rms_normalize<BLOCK_X, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n, 0,
+                                    NormPart::row, true, Layout::tile);
+  store<1, ROWS, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
       normed, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n,
       offs_m, 0, 1);
 }
 
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED>
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED>
 DINLINE void add_rms_norm_rows(
     int offs_m, const DTYPE* input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -75,9 +73,9 @@ DINLINE void add_rms_norm_rows(
     float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
 
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   if constexpr (CHUNKED) {
@@ -85,11 +83,11 @@ DINLINE void add_rms_norm_rows(
     for (int i = 0; i < TILE_M; ++i) scale[i] = 0.0f;
     for (int c = 0; c < n; c += kSpan) {
       DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
-      load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      load<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
           input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
           offs_m, c, 1);
       if constexpr (RESIDUAL)
-        load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        load<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n,
             m, n, res, offs_m, c, 1);
       float s[TILE_M][kPacks][kPackElems];
@@ -105,18 +103,18 @@ DINLINE void add_rms_norm_rows(
           }
       WEIGHT_DTYPE unused_w[1][kPacks][kPackElems];
       DTYPE unused_out[TILE_M][kPacks][kPackElems];
-      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(
-          s, scale, unused_w, unused_out, eps, inv_hidden, n, c, NormPart::wide,
-          true, Layout::tile);
+      rms_normalize<BLOCK_X, WAVE_SIZE>(s, scale, unused_w, unused_out, eps,
+                                        inv_hidden, n, c, NormPart::wide, true,
+                                        Layout::tile);
     }
 
     for (int c = 0; c < n; c += kSpan) {
       DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
-      load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      load<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
           input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
           offs_m, c, 1);
       if constexpr (RESIDUAL)
-        load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        load<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             residual_ptr, 0, 0, residual_stride_m, residual_stride_n, 1, m, n,
             m, n, res, offs_m, c, 1);
       float s[TILE_M][kPacks][kPackElems];
@@ -133,29 +131,28 @@ DINLINE void add_rms_norm_rows(
             added[i][k][j] = static_cast<DTYPE>(s[i][k][j]);
           }
       if constexpr (RESIDUAL)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             added, residual_output_ptr, 0, 0, residual_output_stride_m,
             residual_output_stride_n, 1, m, n, m, n, offs_m, c, 1);
       WEIGHT_DTYPE w[1][kPacks][kPackElems];
-      load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
           weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, c, 1);
       DTYPE normed[TILE_M][kPacks][kPackElems];
-      rms_normalize<THREADS_PER_BLOCK, WAVE_SIZE>(
-          s, scale, w, normed, eps, inv_hidden, n, c, NormPart::apply, true,
-          Layout::tile);
-      store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      rms_normalize<BLOCK_X, WAVE_SIZE>(s, scale, w, normed, eps, inv_hidden, n,
+                                        c, NormPart::apply, true, Layout::tile);
+      store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
           normed, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n,
           m, n, offs_m, c, 1);
     }
   } else {
     DTYPE x[TILE_M][kPacks][kPackElems];
-    load<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x,
         offs_m, 0, 1);
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
-    add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+    add_rms_norm_rows<RESIDUAL, BLOCK_X, WAVE_SIZE>(
         offs_m, x, w, m, n, residual_ptr, residual_stride_m, residual_stride_n,
         output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
         residual_output_stride_m, residual_output_stride_n, eps);
@@ -163,9 +160,9 @@ DINLINE void add_rms_norm_rows(
 }
 
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
-          int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
+          int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
           int WAVES_PER_EU, bool CHUNKED>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+__global__ void __launch_bounds__(BLOCK_X, WAVES_PER_EU)
     add_rms_norm(const DTYPE* input_ptr, int64_t input_stride_m,
                  int64_t input_stride_n, int input_size_m, int input_size_n,
                  const DTYPE* residual_ptr, int64_t residual_stride_m,
@@ -180,8 +177,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                  int residual_output_size_n, float eps) {
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
-                      THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
+                      WAVE_SIZE, PACK_BYTES, CHUNKED>(
         t * TILE_M, input_ptr, input_stride_m, input_stride_n, input_size_m,
         input_size_n, residual_ptr, residual_stride_m, residual_stride_n,
         weight_ptr, weight_stride_n, output_ptr, output_stride_m,
@@ -190,9 +187,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
-          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
-          bool TAIL>
+          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -210,22 +206,22 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   if constexpr (QUANTIZE_INT4)
     for (int t = blockIdx.x; t * TILE_M < m; t += gridDim.x)
       for (int c = 0; c < n; c += kSpan) {
         DTYPE mine[TILE_M][kPacks][kPackElems];
-        load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
             mine, t * TILE_M, c, 1);
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true,
-             Protocol::simple, Layout::tile, TAIL>(
-            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
-            1, m, n, m, n, t * TILE_M, c, 1);
+        send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, true, Protocol::simple,
+             Layout::tile, TAIL>(mine, staging_ptr_array,
+                                 staging_ptr_array_size, rank, 0, 0, n, 1, 1, m,
+                                 n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
@@ -245,15 +241,15 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
 
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::tile_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, false, TAIL>(
+                 DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 false, TAIL>(
           entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
           QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
           0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
@@ -274,19 +270,19 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
           }
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_rms_norm_rows<RESIDUAL, BLOCK_X, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
             residual_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
     if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
-                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
+                        WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
           residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
           output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -301,9 +297,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
 }
 
 template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
-          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
-          bool TAIL>
+          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -325,14 +320,14 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::rows_pull, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -348,35 +343,35 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
 
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::rows_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, true, TAIL>(
-          partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-          partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
-          row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0,
-          rank, 0);
+                 DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 true, TAIL>(partials_ptr_array, partials_ptr_array_size,
+                             partials_stride_m, partials_stride_n,
+                             partials_size_m, partials_size_n, sum, 0, 0, m, n,
+                             row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0,
+                             0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0,
+                             0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_rms_norm_rows<RESIDUAL, BLOCK_X, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
             residual_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
     if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
-                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
+                        WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
           residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
           output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -385,9 +380,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_rows(
 }
 
 template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
-          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
-          bool TAIL>
+          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -409,14 +403,14 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::columns_pull, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -432,14 +426,14 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
 
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::columns_pull, Protocol::simple,
-                 QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
+                 QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X,
                  WAVE_SIZE, PACK_BYTES, true, TAIL>(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
@@ -448,19 +442,19 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
           rank, 0);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_rms_norm_rows<RESIDUAL, BLOCK_X, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
             residual_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
     if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
-                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
+                        WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
           residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
           output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -469,9 +463,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
 }
 
 template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
-          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
-          bool TAIL>
+          typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_two_shot_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -493,14 +486,14 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::columns_push, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -514,32 +507,32 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
 
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
-    load<1, 1, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
 
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::tile, TAIL>(
-          partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-          partials_stride_m, partials_stride_n, 1, partials_size_m,
-          partials_size_n, m, n, sum, row, c, 1);
+      recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, Protocol::simple,
+           Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size,
+                               rank, 0, 0, partials_stride_m, partials_stride_n,
+                               1, partials_size_m, partials_size_n, m, n, sum,
+                               row, c, 1);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_rms_norm_rows<RESIDUAL, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_rms_norm_rows<RESIDUAL, BLOCK_X, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
             residual_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
     if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
-                        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
+                        WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
           residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
           output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -549,9 +542,9 @@ DINLINE void all_reduce_add_rms_norm_two_shot_push(
 
 template <AllReduceAddRmsNormKernelAlgorithm ALGORITHM, bool RESIDUAL,
           bool QUANTIZE_INT4, typename DTYPE, typename WEIGHT_DTYPE, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED, bool TAIL>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+          int TILE_M, int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
+          int WAVES_PER_EU, bool CHUNKED, bool TAIL>
+__global__ void __launch_bounds__(BLOCK_X, WAVES_PER_EU)
     all_reduce_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -581,7 +574,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)
     all_reduce_add_rms_norm_one_shot_pull<
         RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M, TILE_N,
-        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        BLOCK_X, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, residual_ptr, residual_stride_m,
@@ -597,7 +590,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                      AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_rows)
     all_reduce_add_rms_norm_two_shot_pull_rows<
         RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M, TILE_N,
-        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        BLOCK_X, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, residual_ptr, residual_stride_m,
@@ -616,7 +609,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                      AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns)
     all_reduce_add_rms_norm_two_shot_pull_columns<
         RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M, TILE_N,
-        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        BLOCK_X, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, residual_ptr, residual_stride_m,
@@ -635,7 +628,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                      AllReduceAddRmsNormKernelAlgorithm::two_shot_push)
     all_reduce_add_rms_norm_two_shot_push<
         RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M, TILE_N,
-        THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        BLOCK_X, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, residual_ptr, residual_stride_m,

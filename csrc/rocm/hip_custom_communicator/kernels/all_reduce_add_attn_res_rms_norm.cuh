@@ -16,8 +16,8 @@ enum class AllReduceAddAttnResRmsNormAlgorithm {
   two_shot_push
 };
 
-template <int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, typename DTYPE,
-          int ROWS, int K, int P>
+template <int TILE_K, int BLOCK_X, int WAVE_SIZE, typename DTYPE, int ROWS,
+          int K, int P>
 DINLINE void add_attn_res_rms_norm_rows(
     int offs_m, const DTYPE (&sum)[ROWS][K][P], int input_size_m,
     int input_size_n, const DTYPE* prefix_ptr, int64_t prefix_stride_m,
@@ -32,7 +32,7 @@ DINLINE void add_attn_res_rms_norm_rows(
     int64_t block_output_stride_m, int64_t block_output_stride_n,
     int num_blocks, float eps, float output_eps) {
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, Layout::tile, false>(
+  attn_res<TILE_K, BLOCK_X, WAVE_SIZE, Layout::tile, false>(
       sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
       blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
       norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -43,8 +43,8 @@ DINLINE void add_attn_res_rms_norm_rows(
       eps, output_eps, inv_hidden);
 }
 
-template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED>
+template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, bool CHUNKED>
 DINLINE void add_attn_res_rms_norm_rows(
     int offs_m, const DTYPE* input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -60,11 +60,11 @@ DINLINE void add_attn_res_rms_norm_rows(
     int64_t block_output_stride_n, int num_blocks, float eps,
     float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, Layout::tile, false, TILE_M,
-           kPacks, kPackElems, CHUNKED>(
+  attn_res<TILE_K, BLOCK_X, WAVE_SIZE, Layout::tile, false, TILE_M, kPacks,
+           kPackElems, CHUNKED>(
       input_ptr, input_stride_m, input_stride_n, prefix_ptr, prefix_stride_m,
       prefix_stride_n, blocks_ptr, blocks_stride_m, blocks_stride_r,
       blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -75,34 +75,32 @@ DINLINE void add_attn_res_rms_norm_rows(
       offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
 }
 
-template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          int WAVES_PER_EU, bool CHUNKED>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    add_attn_res_rms_norm(
-        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
-        int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
-        int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
-        const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
-        int64_t blocks_stride_r, int64_t blocks_stride_n, int blocks_size_m,
-        int blocks_size_r, int blocks_size_n,
-        const DTYPE* __restrict__ norm_weight_ptr, int64_t norm_weight_stride_n,
-        int norm_weight_size_n, const DTYPE* __restrict__ qk_weight_ptr,
-        int64_t qk_weight_stride_n, int qk_weight_size_n,
-        const DTYPE* __restrict__ output_norm_weight_ptr,
-        int64_t output_norm_weight_stride_n, int output_norm_weight_size_n,
-        DTYPE* __restrict__ prefix_output_ptr, int64_t prefix_output_stride_m,
-        int64_t prefix_output_stride_n, int prefix_output_size_m,
-        int prefix_output_size_n, DTYPE* __restrict__ output_ptr,
-        int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, DTYPE* __restrict__ block_output_ptr,
-        int64_t block_output_stride_m, int64_t block_output_stride_n,
-        int block_output_size_m, int block_output_size_n, int num_blocks,
-        float eps, float output_eps) {
+template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
+__global__ void __launch_bounds__(BLOCK_X, WAVES_PER_EU) add_attn_res_rms_norm(
+    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+    int64_t input_stride_n, int input_size_m, int input_size_n,
+    const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
+    int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
+    const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n, int blocks_size_m,
+    int blocks_size_r, int blocks_size_n,
+    const DTYPE* __restrict__ norm_weight_ptr, int64_t norm_weight_stride_n,
+    int norm_weight_size_n, const DTYPE* __restrict__ qk_weight_ptr,
+    int64_t qk_weight_stride_n, int qk_weight_size_n,
+    const DTYPE* __restrict__ output_norm_weight_ptr,
+    int64_t output_norm_weight_stride_n, int output_norm_weight_size_n,
+    DTYPE* __restrict__ prefix_output_ptr, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, int prefix_output_size_m,
+    int prefix_output_size_n, DTYPE* __restrict__ output_ptr,
+    int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
+    int output_size_n, DTYPE* __restrict__ block_output_ptr,
+    int64_t block_output_stride_m, int64_t block_output_stride_n,
+    int block_output_size_m, int block_output_size_n, int num_blocks, float eps,
+    float output_eps) {
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
-    add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, THREADS_PER_BLOCK,
+    add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
                                WAVE_SIZE, PACK_BYTES, CHUNKED>(
         t * TILE_M, input_ptr, input_stride_m, input_stride_n, input_size_m,
         input_size_n, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
@@ -116,8 +114,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED, bool TAIL>
+          int TILE_K, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
+          bool TAIL>
 DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -144,22 +142,22 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   if constexpr (QUANTIZE_INT4)
     for (int t = blockIdx.x; t * TILE_M < m; t += gridDim.x)
       for (int c = 0; c < n; c += kSpan) {
         DTYPE mine[TILE_M][kPacks][kPackElems];
-        load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
             mine, t * TILE_M, c, 1);
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true,
-             Protocol::simple, Layout::tile, TAIL>(
-            mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0, n, 1,
-            1, m, n, m, n, t * TILE_M, c, 1);
+        send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, true, Protocol::simple,
+             Layout::tile, TAIL>(mine, staging_ptr_array,
+                                 staging_ptr_array_size, rank, 0, 0, n, 1, 1, m,
+                                 n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
@@ -181,8 +179,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::tile_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, false, TAIL>(
+                 DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 false, TAIL>(
           entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
           QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
           0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
@@ -203,11 +201,11 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
           }
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
             blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
             norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -219,9 +217,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
             output_eps);
     }
     if constexpr (CHUNKED)
-      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K,
-                                 THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                 CHUNKED>(
+      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
           prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -241,8 +238,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
 }
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED, bool TAIL>
+          int TILE_K, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
+          bool TAIL>
 DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -269,14 +266,14 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::rows_pull, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -294,20 +291,20 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::rows_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, true, TAIL>(
-          partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-          partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
-          row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0,
-          rank, 0);
+                 DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 true, TAIL>(partials_ptr_array, partials_ptr_array_size,
+                             partials_stride_m, partials_stride_n,
+                             partials_size_m, partials_size_n, sum, 0, 0, m, n,
+                             row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0,
+                             0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0,
+                             0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
             blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
             norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -319,9 +316,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
             output_eps);
     }
     if constexpr (CHUNKED)
-      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K,
-                                 THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                 CHUNKED>(
+      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
           prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -335,8 +331,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
 }
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED, bool TAIL>
+          int TILE_K, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
+          bool TAIL>
 DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -363,14 +359,14 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::columns_pull, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -388,7 +384,7 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
       all_gather<AllGatherAlgorithm::columns_pull, Protocol::simple,
-                 QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
+                 QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X,
                  WAVE_SIZE, PACK_BYTES, true, TAIL>(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
@@ -397,11 +393,11 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
           rank, 0);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
             blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
             norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -413,9 +409,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
             output_eps);
     }
     if constexpr (CHUNKED)
-      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K,
-                                 THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                 CHUNKED>(
+      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
           prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -429,8 +424,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
 }
 
 template <bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int TILE_K, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          bool CHUNKED, bool TAIL>
+          int TILE_K, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED,
+          bool TAIL>
 DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -457,14 +452,14 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = (TILE_N + kPackElems * THREADS_PER_BLOCK - 1) /
-                         (kPackElems * THREADS_PER_BLOCK);
-  constexpr int kSpan = kPacks * kPackElems * THREADS_PER_BLOCK;
+  constexpr int kPacks =
+      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
 
   reduce_scatter<ReduceScatterAlgorithm::columns_push, Protocol::simple,
-                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK,
-                 WAVE_SIZE, PACK_BYTES, true, TAIL>(
+                 QUANTIZE_INT4, WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE,
+                 PACK_BYTES, true, TAIL>(
       input_ptr, input_stride_m, input_stride_n, m, n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m,
@@ -479,18 +474,18 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
   for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
     for (int c = 0; c < n; c += kSpan) {
       DTYPE sum[TILE_M][kPacks][kPackElems];
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZE_INT4,
-           Protocol::simple, Layout::tile, TAIL>(
-          partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-          partials_stride_m, partials_stride_n, 1, partials_size_m,
-          partials_size_n, m, n, sum, row, c, 1);
+      recv<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, QUANTIZE_INT4, Protocol::simple,
+           Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size,
+                               rank, 0, 0, partials_stride_m, partials_stride_n,
+                               1, partials_size_m, partials_size_n, m, n, sum,
+                               row, c, 1);
 
       if constexpr (CHUNKED)
-        store<1, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_attn_res_rms_norm_rows<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE>(
+        add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
             blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
             norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -502,9 +497,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
             output_eps);
     }
     if constexpr (CHUNKED)
-      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K,
-                                 THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                                 CHUNKED>(
+      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
+                                 WAVE_SIZE, PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
           prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -519,9 +513,9 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
 
 template <AllReduceAddAttnResRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4,
           typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          int WAVES_PER_EU, bool CHUNKED, bool TAIL>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+          int BLOCK_X, int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU,
+          bool CHUNKED, bool TAIL>
+__global__ void __launch_bounds__(BLOCK_X, WAVES_PER_EU)
     all_reduce_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -557,8 +551,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
   if constexpr (ALGORITHM == AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull)
     all_reduce_add_attn_res_rms_norm_one_shot_pull<
-        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, BLOCK_X, WAVE_SIZE,
+        PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -579,8 +573,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   else if constexpr (ALGORITHM ==
                      AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_rows)
     all_reduce_add_attn_res_rms_norm_two_shot_pull_rows<
-        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, BLOCK_X, WAVE_SIZE,
+        PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -601,8 +595,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   else if constexpr (ALGORITHM ==
                      AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns)
     all_reduce_add_attn_res_rms_norm_two_shot_pull_columns<
-        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, BLOCK_X, WAVE_SIZE,
+        PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, prefix_ptr, prefix_stride_m, prefix_stride_n,
@@ -623,8 +617,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   else if constexpr (ALGORITHM ==
                      AllReduceAddAttnResRmsNormAlgorithm::two_shot_push)
     all_reduce_add_attn_res_rms_norm_two_shot_push<
-        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, THREADS_PER_BLOCK,
-        WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, BLOCK_X, WAVE_SIZE,
+        PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, prefix_ptr, prefix_stride_m, prefix_stride_n,

@@ -16,8 +16,8 @@ enum class AllReduceAlgorithm {
 };
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
+          int TILE_M, int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL>
 DINLINE void all_reduce_one_shot_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -31,8 +31,8 @@ DINLINE void all_reduce_one_shot_pull(
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
-  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
-  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
+  constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
+  constexpr int kThreadsN = BLOCK_X / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
 
@@ -50,14 +50,13 @@ DINLINE void all_reduce_one_shot_pull(
       const int clip_n =
           kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
       DTYPE mine[kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+      load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
           input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
           input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, true, PROTOCOL,
-           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
-                               rank, 0, 0, input_size_n, 1, 1, input_size_m,
-                               input_size_n, input_size_m, clip_n, offs_m,
-                               offs_n, 1);
+      send<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, true, PROTOCOL, Layout::tile,
+           TAIL>(mine, staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
+                 input_size_n, 1, 1, input_size_m, input_size_n, input_size_m,
+                 clip_n, offs_m, offs_n, 1);
     }
   }
 
@@ -83,8 +82,8 @@ DINLINE void all_reduce_one_shot_pull(
         kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
-               WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-               false, TAIL>(
+               WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, false,
+               TAIL>(
         entries, 0,
         QUANTIZE_INT4 ? int64_t{input_size_n} : input_ptr_array_stride_m,
         QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, input_size_m,
@@ -104,7 +103,7 @@ DINLINE void all_reduce_one_shot_pull(
             acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    store<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         rounded, output_ptr, 0, 0, output_stride_m, output_stride_n, 1,
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
@@ -117,8 +116,8 @@ DINLINE void all_reduce_one_shot_pull(
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
+          int TILE_M, int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL>
 DINLINE void all_reduce_two_shot_pull(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
@@ -137,8 +136,8 @@ DINLINE void all_reduce_two_shot_pull(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
   reduce_scatter<ReduceScatterAlgorithm::flat_pull, PROTOCOL, QUANTIZE_INT4,
-                 WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, CONTIGUOUS, TAIL>(
+                 WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 CONTIGUOUS, TAIL>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
       input_ptr_array_stride_n, staging_ptr_array, staging_ptr_array_size,
@@ -150,18 +149,18 @@ DINLINE void all_reduce_two_shot_pull(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
   all_gather<AllGatherAlgorithm::flat_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
-             WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-             CONTIGUOUS, TAIL>(
-      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, output_ptr,
-      output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
-      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
-      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+             WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+             TAIL>(partials_ptr_array, partials_ptr_array_size,
+                   partials_stride_m, partials_stride_n, partials_size_m,
+                   partials_size_n, output_ptr, output_stride_m,
+                   output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0, 0,
+                   nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0,
+                   0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
+          int TILE_M, int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL>
 DINLINE void all_reduce_one_shot_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
@@ -179,8 +178,8 @@ DINLINE void all_reduce_one_shot_push(
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
-  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
-  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
+  constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
+  constexpr int kThreadsN = BLOCK_X / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
 
   constexpr int kPackElems =
@@ -202,7 +201,7 @@ DINLINE void all_reduce_one_shot_push(
 
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile_push, PROTOCOL, QUANTIZE_INT4, DTYPE,
-               WORLD, TILE_M, kTileN, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
+               WORLD, TILE_M, kTileN, BLOCK_X, WAVE_SIZE, PACK_BYTES,
                CONTIGUOUS, TAIL>(
         input_ptr, 0, input_stride_m, input_stride_n, input_size_m,
         input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
@@ -230,15 +229,15 @@ DINLINE void all_reduce_one_shot_push(
             acc += static_cast<float>(copies[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, false, Layout::tile>(
+    store<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         rounded, output_ptr, 0, 0, output_stride_m, output_stride_n, 1,
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
-          int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
+          int TILE_M, int TILE_N, int BLOCK_X, int WAVE_SIZE, int PACK_BYTES,
+          bool CONTIGUOUS, bool TAIL>
 DINLINE void all_reduce_two_shot_push(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
@@ -255,8 +254,8 @@ DINLINE void all_reduce_two_shot_push(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks) {
   reduce_scatter<ReduceScatterAlgorithm::flat_push, PROTOCOL, QUANTIZE_INT4,
-                 WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE,
-                 PACK_BYTES, CONTIGUOUS, TAIL>(
+                 WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES,
+                 CONTIGUOUS, TAIL>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       static_cast<const DTYPE* const*>(nullptr), 0, 0, 1, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -268,20 +267,20 @@ DINLINE void all_reduce_two_shot_push(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
   all_gather<AllGatherAlgorithm::flat_pull, PROTOCOL, QUANTIZE_INT4, DTYPE,
-             WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-             CONTIGUOUS, TAIL>(
-      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, output_ptr,
-      output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
-      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
-      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+             WORLD, TILE_M, TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+             TAIL>(partials_ptr_array, partials_ptr_array_size,
+                   partials_stride_m, partials_stride_n, partials_size_m,
+                   partials_size_n, output_ptr, output_stride_m,
+                   output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0, 0,
+                   nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0,
+                   0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
-          typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          int WAVES_PER_EU, bool CONTIGUOUS, bool TAIL>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
+          typename DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
+          int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CONTIGUOUS,
+          bool TAIL>
+__global__ void __launch_bounds__(BLOCK_X, WAVES_PER_EU) all_reduce(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
@@ -307,8 +306,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
     int status_size_field, int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
     all_reduce_one_shot_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+                             TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                             TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, output_ptr, output_stride_m, output_stride_n,
@@ -319,8 +318,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_pull)
     all_reduce_two_shot_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+                             TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                             TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, output_ptr, output_stride_m, output_stride_n,
@@ -334,8 +333,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         rank, timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
     all_reduce_one_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+                             TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                             TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
@@ -350,8 +349,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU) all_reduce(
         timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_push)
     all_reduce_two_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+                             TILE_N, BLOCK_X, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                             TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, partials_ptr_array,
         partials_ptr_array_size, partials_stride_m, partials_stride_n,
