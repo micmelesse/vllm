@@ -60,7 +60,7 @@ DINLINE void all_reduce_one_shot_pull(
           input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
       send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
            Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
-                               rank, 0, 0, input_size_n, 1, 1, input_size_m,
+                               rank, 1, 0, 0, input_size_n, 1, 1, input_size_m,
                                input_size_n, input_size_m, clip_n, offs_m,
                                offs_n, 1);
     }

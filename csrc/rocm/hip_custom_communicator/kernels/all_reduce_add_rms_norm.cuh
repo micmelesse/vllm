@@ -229,8 +229,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
             mine, t * TILE_M, c, 1);
         send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, Protocol::simple,
              Layout::tile, TAIL>(mine, staging_ptr_array,
-                                 staging_ptr_array_size, rank, 0, 0, n, 1, 1, m,
-                                 n, m, n, t * TILE_M, c, 1);
+                                 staging_ptr_array_size, rank, 1, 0, 0, n, 1, 1,
+                                 m, n, m, n, t * TILE_M, c, 1);
       }
 
   std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];

@@ -954,10 +954,11 @@ template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void send(
     const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
-    int output_rank, int output_slot, int64_t output_stride_slot,
-    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
-    int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
-    int offs_n, int row_step, Connection* connection = nullptr,
+    int output_rank, int output_rank_count, int output_slot,
+    int64_t output_stride_slot, int64_t output_stride_m,
+    int64_t output_stride_n, int output_size_slot, int output_size_m,
+    int output_size_n, int clip_m, int clip_n, int offs_m, int offs_n,
+    int row_step, Connection* connection = nullptr,
     uint32_t* const* counters_ptr_array = nullptr,
     int counters_ptr_array_size = 0, int64_t counters_stride_kind = 0,
     int64_t counters_stride_block = 0, int64_t counters_stride_peer = 0,
@@ -967,37 +968,42 @@ DINLINE void send(
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
       connection == nullptr)
     internal::check_failed();
-  if constexpr (PROTOCOL == Protocol::simple) {
-    internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                          QUANTIZE_INT4, LAYOUT, TAIL>(
-        input, output_ptr_array, output_ptr_array_size, output_rank,
-        output_slot, output_stride_slot, output_stride_m, output_stride_n,
-        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step);
-  } else if constexpr (PROTOCOL == Protocol::ll) {
-    internal::send_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
-                      LAYOUT, TAIL>(
-        input, output_ptr_array, output_ptr_array_size, output_rank,
-        output_slot, output_stride_slot, output_stride_m, output_stride_n,
-        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, *connection);
-  } else if constexpr (PROTOCOL == Protocol::simple_write) {
-    internal::send_simple_write<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                                QUANTIZE_INT4, LAYOUT, TAIL>(
-        input, output_ptr_array, output_ptr_array_size, output_rank,
-        output_slot, output_stride_slot, output_stride_m, output_stride_n,
-        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, *connection, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, timeout_ticks);
-  } else {
-    internal::send_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                           QUANTIZE_INT4, LAYOUT, TAIL>(
-        input, output_ptr_array, output_ptr_array_size, output_rank,
-        output_slot, output_stride_slot, output_stride_m, output_stride_n,
-        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, *connection);
+  // The ranks output_rank on, output_rank_count of them, a leaf call each.
+#pragma unroll
+  for (int j = 0; j < output_rank_count; ++j) {
+    const int r = j == 0 ? output_rank : (output_rank + j) % WORLD;
+    if constexpr (PROTOCOL == Protocol::simple) {
+      internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                            QUANTIZE_INT4, LAYOUT, TAIL>(
+          input, output_ptr_array, output_ptr_array_size, r, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n,
+          output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
+          offs_m, offs_n, row_step);
+    } else if constexpr (PROTOCOL == Protocol::ll) {
+      internal::send_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                        QUANTIZE_INT4, LAYOUT, TAIL>(
+          input, output_ptr_array, output_ptr_array_size, r, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n,
+          output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
+          offs_m, offs_n, row_step, *connection);
+    } else if constexpr (PROTOCOL == Protocol::simple_write) {
+      internal::send_simple_write<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                                  QUANTIZE_INT4, LAYOUT, TAIL>(
+          input, output_ptr_array, output_ptr_array_size, r, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n,
+          output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
+          offs_m, offs_n, row_step, *connection, counters_ptr_array,
+          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+          counters_stride_peer, counters_size_block, counters_size_peer,
+          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+    } else {
+      internal::send_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                             QUANTIZE_INT4, LAYOUT, TAIL>(
+          input, output_ptr_array, output_ptr_array_size, r, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n,
+          output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
+          offs_m, offs_n, row_step, *connection);
+    }
   }
 }
 

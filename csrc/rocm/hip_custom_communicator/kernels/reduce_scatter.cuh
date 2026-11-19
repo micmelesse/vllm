@@ -89,8 +89,8 @@ DINLINE void reduce_scatter_flat_pull(
         quantize(x[0], payload[0]);
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
-            payload, staging_ptr_array, staging_ptr_array_size, rank, r, slice,
-            staging_stride_m, staging_stride_n, WORLD, staging_size_m,
+            payload, staging_ptr_array, staging_ptr_array_size, rank, 1, r,
+            slice, staging_stride_m, staging_stride_n, WORLD, staging_size_m,
             staging_size_n, 1,
             TAIL ? min(g_end * kInt4Group, len)
                  : min(g_end, len / kInt4Group) * kInt4Group,
@@ -131,7 +131,7 @@ DINLINE void reduce_scatter_flat_pull(
         dequantize<DTYPE>(words, sum);
         send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
-            sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+            sum, partials_ptr_array, partials_ptr_array_size, rank, 1, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, 1, own_end, 0, g0 * kInt4Group, 1);
       }
@@ -189,7 +189,7 @@ DINLINE void reduce_scatter_flat_pull(
         DTYPE rounded[1][kPacks][kPackElems];
         reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1,
+             Layout::tile>(rounded, &partials_entry, 1, 0, 1, 0, 0, 0, 1, 1, 1,
                            len, 1, end, 0, chunk * kChunkN, 1);
       }
     }
@@ -252,8 +252,8 @@ DINLINE void reduce_scatter_flat_push(
         quantize(x[0], payload[0]);
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
-            payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
-            staging_stride_m, staging_stride_n, WORLD, staging_size_m,
+            payload, staging_ptr_array, staging_ptr_array_size, r, 1, rank,
+            slice, staging_stride_m, staging_stride_n, WORLD, staging_size_m,
             staging_size_n, 1,
             TAIL ? min(g_end * kInt4Group, len)
                  : min(g_end, len / kInt4Group) * kInt4Group,
@@ -286,7 +286,7 @@ DINLINE void reduce_scatter_flat_push(
         dequantize<DTYPE>(words, sum);
         send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
-            sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+            sum, partials_ptr_array, partials_ptr_array_size, rank, 1, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, 1, own_end, 0, g0 * kInt4Group, 1);
       }
@@ -324,7 +324,7 @@ DINLINE void reduce_scatter_flat_push(
           input_size_m, input_size_n, input_size_m, end, part, 0,
           chunk * kChunkN, 1);
       send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          part, staging_ptr_array, staging_ptr_array_size, w, rank,
+          part, staging_ptr_array, staging_ptr_array_size, w, 1, rank,
           staging_stride_m, staging_stride_m, staging_stride_n, WORLD,
           staging_size_m, staging_size_n, 1, end, 0, chunk * kChunkN, 1);
     }
@@ -348,7 +348,7 @@ DINLINE void reduce_scatter_flat_push(
         DTYPE rounded[1][kPacks][kPackElems];
         reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m>(got[0], rounded[0]);
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0, 0, 1, 1, 1,
+             Layout::tile>(rounded, &partials_entry, 1, 0, 1, 0, 0, 0, 1, 1, 1,
                            len, 1, end, 0, chunk * kChunkN, 1);
       }
     }
@@ -407,7 +407,7 @@ DINLINE void reduce_scatter_columns_pull(
         for (int s = 0; s < kTiles; ++s)
           send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                PROTOCOL, Layout::tile, TAIL>(
-              x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
+              x[s], staging_ptr_array, staging_ptr_array_size, rank, 1, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -449,7 +449,7 @@ DINLINE void reduce_scatter_columns_pull(
 
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
              Layout::tile, TAIL>(
-            rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+            rounded, partials_ptr_array, partials_ptr_array_size, rank, 1, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, row + 1, end, row, c, 1);
       }
@@ -502,7 +502,7 @@ DINLINE void reduce_scatter_rows_pull(
         for (int s = 0; s < kTiles; ++s)
           send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                PROTOCOL, Layout::tile, TAIL>(
-              x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
+              x[s], staging_ptr_array, staging_ptr_array_size, rank, 1, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -545,7 +545,7 @@ DINLINE void reduce_scatter_rows_pull(
 
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
              Layout::tile, TAIL>(
-            rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+            rounded, partials_ptr_array, partials_ptr_array_size, rank, 1, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
             partials_size_n, row + 1, end, row, c, 1);
       }
@@ -603,7 +603,7 @@ DINLINE void reduce_scatter_columns_push(
         for (int s = 0; s < kTiles; ++s)
           send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                PROTOCOL, Layout::tile, TAIL>(
-              x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0,
+              x[s], staging_ptr_array, staging_ptr_array_size, rank, 1, 0, 0,
               staging_stride_m, staging_stride_n, 1, staging_size_m,
               staging_size_n, input_size_m, input_size_n,
               (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -703,14 +703,14 @@ DINLINE void reduce_scatter_columns_push(
             if constexpr (QUANTIZE_INT4)
               send<WORLD, kThreadsM, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                    PROTOCOL, Layout::tile, TAIL>(
-                  payload, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
-                  partials_stride_m, partials_stride_n, 1, partials_size_m,
+                  payload, partials_ptr_array, partials_ptr_array_size, r, 1, 0,
+                  0, partials_stride_m, partials_stride_n, 1, partials_size_m,
                   partials_size_n, tile_end, offs_n + size_n, row, c, 1);
             else
               send<WORLD, kThreadsM, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                    PROTOCOL, Layout::tile, TAIL>(
-                  rounded, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
-                  partials_stride_m, partials_stride_n, 1, partials_size_m,
+                  rounded, partials_ptr_array, partials_ptr_array_size, r, 1, 0,
+                  0, partials_stride_m, partials_stride_n, 1, partials_size_m,
                   partials_size_n, tile_end, offs_n + size_n, row, c, 1);
           }
         }

@@ -305,13 +305,11 @@ DINLINE void all_gather_tile_push(
                                 kInt4ScalesAlign - 1) /
                                    kInt4ScalesAlign * kInt4ScalesAlign
                              : int64_t{input_size_m} * input_size_n;
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-           Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size,
-                               r, rank, slot, input_size_n, 1, WORLD,
-                               input_size_m, input_size_n, input_size_m, clip_n,
-                               offs_m, offs_n, 1);
+    send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
+         Layout::tile, TAIL>(mine, staging_ptr_array, staging_ptr_array_size, 0,
+                             WORLD, rank, slot, input_size_n, 1, WORLD,
+                             input_size_m, input_size_n, input_size_m, clip_n,
+                             offs_m, offs_n, 1);
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
                    signals_stride_writer, signals_size_parity,
@@ -350,31 +348,25 @@ DINLINE void all_gather_tile_push(
         for (int k = 0; k < PACKS; ++k)
           quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
                    reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::tile>(
-            payload, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
-            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
-            lines_n, first_row, 0, 1, connection, counters_ptr_array,
-            counters_ptr_array_size, counters_stride_kind,
-            counters_stride_block, counters_stride_peer, counters_size_block,
-            counters_size_peer, status_ptr, status_stride_field,
-            status_size_field, timeout_ticks);
+      send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+           Layout::tile>(
+          payload, unfenced_ptr_array, unfenced_ptr_array_size, 0, WORLD, rank,
+          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+          unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+          lines_n, first_row, 0, 1, connection, counters_ptr_array,
+          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+          counters_stride_peer, counters_size_block, counters_size_peer,
+          status_ptr, status_stride_field, status_size_field, timeout_ticks);
     } else {
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(
-            mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
-            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
-            lines_n, first_row, 0, 1, connection, counters_ptr_array,
-            counters_ptr_array_size, counters_stride_kind,
-            counters_stride_block, counters_stride_peer, counters_size_block,
-            counters_size_peer, status_ptr, status_stride_field,
-            status_size_field, timeout_ticks);
+      send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+           Layout::tile>(
+          mine, unfenced_ptr_array, unfenced_ptr_array_size, 0, WORLD, rank,
+          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+          unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+          lines_n, first_row, 0, 1, connection, counters_ptr_array,
+          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+          counters_stride_peer, counters_size_block, counters_size_peer,
+          status_ptr, status_stride_field, status_size_field, timeout_ticks);
     }
     recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile>(
