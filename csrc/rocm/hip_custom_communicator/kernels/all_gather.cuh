@@ -77,12 +77,16 @@ DINLINE void all_gather_flat_pull(
     const int end = TAIL ? min(g_end * kInt4Group, share_len(r))
                          : min(g_end, share_len(r) / kInt4Group) * kInt4Group;
     for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
+      // Read to the block's end (end): a lane past it rereads the block's
+      // last group, which its barrier covers, not another block's, which a
+      // peer may not have written yet.
+      if (end <= g0 * kInt4Group) break;
       uint32_t words[1][kInt4GroupPacks][2];
       recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
            Layout::group_run, TAIL>(
           partials_ptr_array, partials_ptr_array_size, r, 0, 0,
           partials_stride_m, partials_stride_n, 1, partials_size_m,
-          partials_size_n, 1, slice, words, 0, g0 * kInt4Group, 1);
+          partials_size_n, 1, end, words, 0, g0 * kInt4Group, 1);
 
       DTYPE x[1][kInt4GroupPacks][kPackElems];
 #pragma unroll

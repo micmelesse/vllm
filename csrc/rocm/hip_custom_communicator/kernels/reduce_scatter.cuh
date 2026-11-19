@@ -110,15 +110,21 @@ DINLINE void reduce_scatter_flat_pull(
                    Until::launched, 0);
 
     const int own = flat_share_len(rank, slice, total);
+    // The block's end of this rank's share: recv reads to it (a lane past it
+    // rereads the block's last group, which its barrier covers, not another
+    // block's, which a peer may not have written yet), send writes to it.
+    const int own_end = TAIL ? min(g_end * kInt4Group, own)
+                             : min(g_end, own / kInt4Group) * kInt4Group;
     if (TAIL ? own != 0 : own / kInt4Group != 0)
       for (int g0 = g_first; g0 < g_end; g0 += BLOCK_X) {
+        if (own_end <= g0 * kInt4Group) break;
         uint32_t words[WORLD][1][kInt4GroupPacks][2];
 #pragma unroll
         for (int i = 0; i < WORLD; ++i)
           recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
                Layout::group_run, TAIL>(
               &staged[i], 1, 0, rank, slice, staging_stride_m, staging_stride_n,
-              WORLD, staging_size_m, staging_size_n, 1, own, words[i], 0,
+              WORLD, staging_size_m, staging_size_n, 1, own_end, words[i], 0,
               g0 * kInt4Group, 1);
 
         float sum[1][kInt4GroupPacks][kPackElems];
@@ -127,10 +133,7 @@ DINLINE void reduce_scatter_flat_pull(
              Layout::group_run, TAIL>(
             sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
-            partials_size_n, 1,
-            TAIL ? min(g_end * kInt4Group, own)
-                 : min(g_end, own / kInt4Group) * kInt4Group,
-            0, g0 * kInt4Group, 1);
+            partials_size_n, 1, own_end, 0, g0 * kInt4Group, 1);
       }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
@@ -264,14 +267,20 @@ DINLINE void reduce_scatter_flat_push(
                    Until::launched, 0);
 
     const int own = flat_share_len(rank, slice, total);
+    // The block's end of this rank's share: recv reads to it (a lane past it
+    // rereads the block's last group, which its barrier covers, not another
+    // block's, which a peer may not have written yet), send writes to it.
+    const int own_end = TAIL ? min(g_end * kInt4Group, own)
+                             : min(g_end, own / kInt4Group) * kInt4Group;
     if (TAIL ? own != 0 : own / kInt4Group != 0)
       for (int g0 = g_first; g0 < g_end; g0 += BLOCK_X) {
+        if (own_end <= g0 * kInt4Group) break;
         uint32_t words[WORLD][1][kInt4GroupPacks][2];
         recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
              Layout::group_run, TAIL>(
             staging_ptr_array, staging_ptr_array_size, rank, rank, slice,
             staging_stride_m, staging_stride_n, WORLD, staging_size_m,
-            staging_size_n, 1, own, words, 0, g0 * kInt4Group, 1);
+            staging_size_n, 1, own_end, words, 0, g0 * kInt4Group, 1);
 
         float sum[1][kInt4GroupPacks][kPackElems];
         dequantize<DTYPE>(words, sum);
@@ -279,10 +288,7 @@ DINLINE void reduce_scatter_flat_push(
              Layout::group_run, TAIL>(
             sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m,
-            partials_size_n, 1,
-            TAIL ? min(g_end * kInt4Group, own)
-                 : min(g_end, own / kInt4Group) * kInt4Group,
-            0, g0 * kInt4Group, 1);
+            partials_size_n, 1, own_end, 0, g0 * kInt4Group, 1);
       }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
                    signals_stride_parity, signals_stride_block,
