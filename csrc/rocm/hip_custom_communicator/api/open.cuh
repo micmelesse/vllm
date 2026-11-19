@@ -170,6 +170,18 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   made = made &&
          hipMemset(symmetric.lamport, kLamportEmpty & 0xff,
                    static_cast<size_t>(symmetric.lamport_bytes)) == hipSuccess;
+  // A checked build fills Simple's data buffers with 0xff, a NaN in bf16 and
+  // fp16 and in an INT4 group's scale, where zeros would read as finite data:
+  // a read of what no rank wrote fails a check or a test on its first call.
+  // The signals, the connections and the inboxes keep the start their
+  // protocols need.
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG)
+    made =
+        made &&
+        hipMemset(symmetric.staging, 0xff,
+                  static_cast<size_t>(symmetric.staging_bytes)) == hipSuccess &&
+        hipMemset(symmetric.partials, 0xff,
+                  static_cast<size_t>(symmetric.partials_bytes)) == hipSuccess;
   allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.partials_ptr_array, ptr_array_bytes, false);
