@@ -948,8 +948,8 @@ DINLINE void send_simple_write(
 }
 
 // A simple_read send: once every receiver has read the last round (their
-// heads), the data into this rank's own staging, once, then the round posted
-// to each (their tails, COUNTERS).
+// heads), the data into this rank's own inbox, at each receiver's slot, then
+// the round posted to each (their tails, COUNTERS).
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename INPUT,
           typename PTR>
@@ -1047,25 +1047,33 @@ DINLINE void send_simple_read(
     __builtin_amdgcn_endpgm();
   }
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-  char* const slot = reinterpret_cast<char*>(output) + int64_t{output_slot} *
-                                                           output_stride_slot *
-                                                           int64_t{sizeof(U)};
+  // A region a receiver, in this rank's own inbox: the slot is the receiver's
+  // (a connection a pair of ranks, NCCL's), so a send to several stores a copy
+  // for each.
   const uint32_t row_bytes =
       static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
 #pragma unroll
-  for (int i = 0; i < kRows; ++i) {
-    if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row_at(i) >= output_size_m)
-      internal::check_failed();
+  for (int j = 0; j < WORLD; ++j) {
+    if (j >= output_rank_count) break;
+    const int reader = (output_rank + j) % WORLD;
+    char* const slot =
+        reinterpret_cast<char*>(output) +
+        int64_t{reader} * output_stride_slot * int64_t{sizeof(U)};
 #pragma unroll
-    for (int k = 0; k < kPacks; ++k) {
-      if (col_at(k) >= clip_n / kPackElems) continue;
-      W w;
-      __builtin_memcpy(&w, input[i][k], sizeof(w));
-      uint32_t at = static_cast<uint32_t>(row_at(i)) * row_bytes +
-                    static_cast<uint32_t>(col_at(k)) * uint32_t{sizeof(V)};
-      asm volatile("" : "+v"(at));
-      *(__attribute__((address_space(1))) W*)(slot + at) = w;
+    for (int i = 0; i < kRows; ++i) {
+      if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row_at(i) >= output_size_m)
+        internal::check_failed();
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k) {
+        if (col_at(k) >= clip_n / kPackElems) continue;
+        W w;
+        __builtin_memcpy(&w, input[i][k], sizeof(w));
+        uint32_t at = static_cast<uint32_t>(row_at(i)) * row_bytes +
+                      static_cast<uint32_t>(col_at(k)) * uint32_t{sizeof(V)};
+        asm volatile("" : "+v"(at));
+        *(__attribute__((address_space(1))) W*)(slot + at) = w;
+      }
     }
   }
   // The block's stores, then the round posted to each receiver (its tail from
@@ -1105,7 +1113,8 @@ DINLINE void send(
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
       connection == nullptr)
     internal::check_failed();
-  // simple_read writes once for every receiver: the leaf takes the set.
+  // simple_read waits on and posts to every receiver at once: the leaf takes
+  // the set.
   if constexpr (PROTOCOL == Protocol::simple_read) {
     internal::send_simple_read<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                                QUANTIZE_INT4, LAYOUT, TAIL>(

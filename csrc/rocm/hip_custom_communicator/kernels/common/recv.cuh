@@ -1500,8 +1500,8 @@ DINLINE void recv_simple_write(
 }
 
 // A simple_read recv: each writer's round waited for (its tail), each copy
-// loaded from its writer's own staging, then each writer told (its head,
-// COUNTERS).
+// loaded from its writer's own inbox at this rank's slot, then each writer
+// told (its head, COUNTERS).
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename PTR,
           typename OUTPUT>
@@ -1605,11 +1605,11 @@ DINLINE void recv_simple_read(
       static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
 #pragma unroll
   for (int c = 0; c < kCopies; ++c) {
-    // Writer input_slot + c's copy, in its own staging, at its slot.
+    // Writer input_slot + c's copy, in its own inbox, at this rank's slot.
     const char* const first =
         reinterpret_cast<const char*>(
             ptr_array_at(entries, input_ptr_array_size, input_slot + c)) +
-        static_cast<int64_t>(input_slot + c) * slot_bytes;
+        static_cast<int64_t>(owner) * slot_bytes;
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       const int row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;

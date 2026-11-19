@@ -221,8 +221,9 @@ ErrorCode hip_custom_communicator_all_reduce(
       }
       break;
     case AllReduceAlgorithm::one_shot_push:
-      // simple_write's and simple_read's inbox: a row a block, each the tile
-      // (simple_read's writer keeps its own slot in its own).
+      // simple_write's and simple_read's inbox: a slot a pair of ranks (the
+      // writer's in the reader's inbox, or the reader's in the writer's), a
+      // row a block, each the tile.
       if (protocol == Protocol::simple_write ||
           protocol == Protocol::simple_read) {
         if (grid_x * tile_m > s.symmetric.lamport_blocks ||
