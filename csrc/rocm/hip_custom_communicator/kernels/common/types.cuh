@@ -44,8 +44,10 @@ constexpr uint16_t kLamportEmpty = 0xffff;
 // the steps buffer, from tile to tile and launch to launch. A tile's step is
 // the next after the row's last (0 is none): LL writes it in every line and
 // waits for it, Lamport takes its bank from it. LL alternates two banks;
-// Lamport three, so a bank it re-armed is written again two tiles later, and
-// the re-arm need only land before the next tile's recv polls (recv_lamport).
+// Lamport three, so a bank it re-armed is written again only after this rank's
+// sends two tiles later, and the next tile's recv polls before those: a poll
+// that returns has the wave's earlier stores, the re-arm, behind it
+// (recv_lamport), so nothing waits for the re-arm.
 // The wrap skips 0 and keeps consecutive steps in different banks of two and of
 // three (0xfffffffe, then 3).
 constexpr int kLlBanks = 2;

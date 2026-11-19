@@ -1268,11 +1268,6 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
             row_at(i) < clip_m &&
             offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
       }
-    // This wave's re-arm of the bank it read two tiles ago lands before this
-    // tile's polls; a peer writes that bank again only after this rank's next
-    // tile's sends (three banks, STEPS). The polls' loads would wait behind it
-    // anyway: a wave's memory counter is in order.
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     const auto empty = [](const W& w) {
       uint16_t h[kHalves];
       __builtin_memcpy(h, &w, sizeof(h));
@@ -1342,8 +1337,10 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
           __builtin_memcpy(into[c][i][k], &got[c][i][k], sizeof(V));
 
     // Re-arm what was read. A peer writes this bank again only after this
-    // rank's sends two tiles on (three banks, STEPS); this wave's next recv
-    // waits for these stores before it polls.
+    // rank's sends two tiles on (three banks, STEPS), and those come after this
+    // wave's next recv has polled: a wave's loads and stores complete in the
+    // order it issues them, so a poll that returns has these stores behind it.
+    // No wait here or before the sends.
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
