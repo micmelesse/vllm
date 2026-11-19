@@ -894,7 +894,7 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
   }
 }
 
-// An LL recv: each line polled until it carries its row's epoch.
+// An LL recv: each line polled until it carries its row's step.
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename PTR,
           typename OUTPUT>
@@ -903,7 +903,8 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
                      int64_t input_stride_m, int64_t input_stride_n,
                      int input_size_slot, int input_size_m, int input_size_n,
                      int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                     int offs_n, int row_step, const uint32_t* flags,
+                     int offs_n, int row_step, int32_t* steps_ptr,
+                     int64_t steps_stride_m, int steps_size_m,
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, uint64_t timeout_ticks) {
   // A block of BLOCK_Y rows of threads, each the same tile: row y reads the
@@ -963,6 +964,20 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
     const int n = offs_n / kElems + tid % kThreadsN + k * kThreadsN;
     return n < clip_n / kElems ? n : clip_n / kElems - 1;
   };
+  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
+  // tile left, the next where this tile writes the row.
+  uint32_t flags[kRows];
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) {
+    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
+      __builtin_trap();
+    uint32_t last =
+        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
+  }
   {
     static_assert(LAYOUT == Layout::tile, "LL lines sit in a tile");
     // kCopies writers' copies, those of writers input_slot on.
@@ -979,8 +994,7 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
         "a pack is one or two lines, an INT4 pack a word of 8 values");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (input_slot < 0 || input_slot + kCopies > input_size_slot ||
-         flags == nullptr))
+        (input_slot < 0 || input_slot + kCopies > input_size_slot))
       __builtin_trap();
 
     const char* const first = reinterpret_cast<const char*>(input) +
@@ -991,14 +1005,15 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
 
     const uint32_t half =
         static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
-    const int bank_rows = input_size_m / 2;
+    const int bank_rows = input_size_m / kLlBanks;
     uint32_t line_at[kRows][kPacks];
     bool waits[kRows][kPacks];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
-        const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+        const int row =
+            row_at(i) + static_cast<int>(flags[i] % kLlBanks) * bank_rows;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (row < 0 || row >= input_size_m || flags[i] == 0))
           __builtin_trap();
@@ -1119,6 +1134,15 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
     // Read before any row writes the next call's.
     __syncthreads();
   }
+  // Saved once every wave of the block has read it (STEPS): rows of threads
+  // waited for each other in their exchange; one row of several waves waits
+  // here. Every thread stores it, so a wave's next read follows its own store.
+  if constexpr (BLOCK_Y == 1 && BLOCK_X > WAVE_SIZE) __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kRows; ++i)
+    if (row_at(i) < clip_m)
+      steps_ptr[int64_t{row_at(i)} * steps_stride_m] =
+          static_cast<int32_t>(flags[i]);
 }
 
 // A Lamport recv: each pack polled until no element is the sentinel, then
@@ -1132,7 +1156,8 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
                           int64_t input_stride_n, int input_size_slot,
                           int input_size_m, int input_size_n, int clip_m,
                           int clip_n, OUTPUT& output, int offs_m, int offs_n,
-                          int row_step, const uint32_t* flags,
+                          int row_step, int32_t* steps_ptr,
+                          int64_t steps_stride_m, int steps_size_m,
                           uint32_t* status_ptr, int64_t status_stride_field,
                           int status_size_field, uint64_t timeout_ticks) {
   // A block of BLOCK_Y rows of threads, each the same tile: row y reads the
@@ -1192,6 +1217,20 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     const int n = offs_n / kElems + tid % kThreadsN + k * kThreadsN;
     return n < clip_n / kElems ? n : clip_n / kElems - 1;
   };
+  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
+  // tile left, the next where this tile writes the row.
+  uint32_t flags[kRows];
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) {
+    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
+      __builtin_trap();
+    uint32_t last =
+        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
+  }
   {
     static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
     static_assert(kSlots && kCopies <= WORLD,
@@ -1201,8 +1240,7 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     using W = raw_t<sizeof(V)>;
     constexpr int kHalves = sizeof(V) / 2;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (input_slot < 0 || input_slot + kCopies > input_size_slot ||
-         flags == nullptr))
+        (input_slot < 0 || input_slot + kCopies > input_size_slot))
       __builtin_trap();
 
     char* const first =
@@ -1212,14 +1250,15 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
         static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
     const uint32_t row_bytes =
         static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
-    const int bank_rows = input_size_m / 2;
+    const int bank_rows = input_size_m / kLamportBanks;
     uint32_t at[kRows][kPacks];
     bool waits[kRows][kPacks];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
-        const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+        const int row =
+            row_at(i) + static_cast<int>(flags[i] % kLamportBanks) * bank_rows;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (row < 0 || row >= input_size_m || flags[i] == 0))
           __builtin_trap();
@@ -1229,6 +1268,11 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
             row_at(i) < clip_m &&
             offs_n / kElems + tid % kThreadsN + k * kThreadsN < clip_n / kElems;
       }
+    // This wave's re-arm of the bank it read two tiles ago lands before this
+    // tile's polls; a peer writes that bank again only after this rank's next
+    // tile's sends (three banks, STEPS). The polls' loads would wait behind it
+    // anyway: a wave's memory counter is in order.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     const auto empty = [](const W& w) {
       uint16_t h[kHalves];
       __builtin_memcpy(h, &w, sizeof(h));
@@ -1298,8 +1342,8 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
           __builtin_memcpy(into[c][i][k], &got[c][i][k], sizeof(V));
 
     // Re-arm what was read. A peer writes this bank again only after this
-    // input_rank's next sends, and a Lamport tile push waits for these stores
-    // before sending.
+    // rank's sends two tiles on (three banks, STEPS); this wave's next recv
+    // waits for these stores before it polls.
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
 #pragma unroll
@@ -1329,6 +1373,15 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     // Read before any row writes the next call's.
     __syncthreads();
   }
+  // Saved once every wave of the block has read it (STEPS): rows of threads
+  // waited for each other in their exchange; one row of several waves waits
+  // here. Every thread stores it, so a wave's next read follows its own store.
+  if constexpr (BLOCK_Y == 1 && BLOCK_X > WAVE_SIZE) __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kRows; ++i)
+    if (row_at(i) < clip_m)
+      steps_ptr[int64_t{row_at(i)} * steps_stride_m] =
+          static_cast<int32_t>(flags[i]);
 }
 
 }  // namespace internal
@@ -1341,7 +1394,8 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int64_t input_stride_m, int64_t input_stride_n,
                   int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                  int offs_n, int row_step, const uint32_t* flags = nullptr,
+                  int offs_n, int row_step, int32_t* steps_ptr = nullptr,
+                  int64_t steps_stride_m = 0, int steps_size_m = 0,
                   uint32_t* status_ptr = nullptr,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
@@ -1358,16 +1412,16 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step, flags, status_ptr, status_stride_field, status_size_field,
-        timeout_ticks);
+        row_step, steps_ptr, steps_stride_m, steps_size_m, status_ptr,
+        status_stride_field, status_size_field, timeout_ticks);
   } else {
     internal::recv_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step, flags, status_ptr, status_stride_field, status_size_field,
-        timeout_ticks);
+        row_step, steps_ptr, steps_stride_m, steps_size_m, status_ptr,
+        status_stride_field, status_size_field, timeout_ticks);
   }
 }
 

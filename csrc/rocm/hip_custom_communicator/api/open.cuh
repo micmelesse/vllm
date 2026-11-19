@@ -98,7 +98,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
       2 * max_blocks * world * int64_t{sizeof(uint32_t)};
 
   const int64_t unfenced_blocks = 128, unfenced_slot_bytes = 2048;
-  const int64_t unfenced_epoch_words = kPackBytes / int64_t{sizeof(int32_t)};
+  const int64_t step_words = kPackBytes / int64_t{sizeof(int32_t)};
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
                                  unfenced_slot_bytes *
                                  (kLineBytes / kLinePayloadBytes);
@@ -106,7 +106,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   // each for a grid that covers 64 tokens of 7168 at a tile of 1024.
   const int64_t lamport_blocks = 1024;
   const int64_t lamport_bytes =
-      2 * lamport_blocks * world * unfenced_slot_bytes;
+      kLamportBanks * lamport_blocks * world * unfenced_slot_bytes;
 
   const int64_t input_table_slots = int64_t{1} << 18;
 
@@ -146,7 +146,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
-  s->unfenced_epoch_words = unfenced_epoch_words;
+  s->step_rows = lamport_blocks;
+  s->step_words = step_words;
   s->input_tables.slots = input_table_slots;
 
   bool made = true;
@@ -176,11 +177,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
-  allocate(s->unfenced_epochs,
-           unfenced_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
-           false);
-  allocate(s->lamport_epochs,
-           lamport_blocks * unfenced_epoch_words * int64_t{sizeof(int32_t)},
+  allocate(s->steps, 2 * lamport_blocks * step_words * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
@@ -279,23 +276,20 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 }
 
 // For the tests: views of the state LL and Lamport keep from launch to launch,
-// this rank's Lamport inbox (bytes) and the LL and Lamport epochs (a row of
-// words a block), so a test can check what every launch must leave: the inbox
-// all the sentinel, the epochs equal on every rank. No copy; the views live as
-// long as the communicator.
+// this rank's Lamport inbox (bytes) and the steps (LL's, Lamport's: a row of
+// words a block row), so a test can check what every launch must leave: the
+// inbox all the sentinel, the steps equal on every rank. No copy; the views
+// live as long as the communicator.
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   using namespace hip_custom_communicator;
   using namespace hip_custom_communicator::internal;
   TORCH_CHECK(state != 0, "hip_custom_communicator_inspect: not open");
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const auto on = torch::TensorOptions().device(torch::kCUDA, s.device.index);
-  const int64_t words = kPackBytes / int64_t{sizeof(int32_t)};
   return {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
-      torch::from_blob(s.lamport_epochs, {s.symmetric.lamport_blocks, words},
-                       on.dtype(torch::kInt32)),
-      torch::from_blob(s.unfenced_epochs, {s.symmetric.unfenced_blocks, words},
+      torch::from_blob(s.steps, {2, s.step_rows, s.step_words},
                        on.dtype(torch::kInt32)),
   };
 }

@@ -584,7 +584,7 @@ DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
   }
 }
 
-// An LL send: half of each line the data, half its row's epoch.
+// An LL send: half of each line the data, half its row's step.
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename INPUT,
           typename PTR>
@@ -594,7 +594,8 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
                      int64_t output_stride_m, int64_t output_stride_n,
                      int output_size_slot, int output_size_m, int output_size_n,
                      int clip_m, int clip_n, int offs_m, int offs_n,
-                     int row_step, const uint32_t* flags) {
+                     int row_step, int32_t* steps_ptr, int64_t steps_stride_m,
+                     int steps_size_m) {
   // A block of BLOCK_Y rows of threads sends to output_rank from the row that
   // receives its copy (recv's rows): row output_rank / (WORLD / BLOCK_Y).
   if constexpr (BLOCK_Y > 1)
@@ -636,6 +637,20 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
   const auto col_at = [&](int k) {
     return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
   };
+  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
+  // tile left, the next where this tile writes the row.
+  uint32_t flags[kRows];
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) {
+    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
+      __builtin_trap();
+    uint32_t last =
+        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
+  }
   {
     static_assert(LAYOUT == Layout::tile, "LL lines sit in a tile");
     constexpr int kLines = QUANTIZE_INT4 || sizeof(V) <= kLinePayloadBytes
@@ -648,7 +663,6 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
             kLines >= 1 && kLines <= 2 && sizeof(u32x4) == kLineBytes,
         "a pack is one or two lines, an INT4 pack a word of 8 values");
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
 
     [[maybe_unused]] uint32_t payload[kRows][kPacks][2];
     if constexpr (QUANTIZE_INT4) {
@@ -665,7 +679,7 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
           }
         }
     }
-    const int bank_rows = output_size_m / 2;
+    const int bank_rows = output_size_m / kLlBanks;
 
     constexpr int64_t kElemBytes = kRaw ? 2 : int64_t{sizeof(U)};
     char* const slot =
@@ -675,7 +689,8 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
     for (int i = 0; i < kRows; ++i) {
       if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
 
-      const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+      const int row =
+          row_at(i) + static_cast<int>(flags[i] % kLlBanks) * bank_rows;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (row >= output_size_m || flags[i] == 0))
         __builtin_trap();
@@ -722,7 +737,8 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
                           int64_t output_stride_m, int64_t output_stride_n,
                           int output_size_slot, int output_size_m,
                           int output_size_n, int clip_m, int clip_n, int offs_m,
-                          int offs_n, int row_step, const uint32_t* flags) {
+                          int offs_n, int row_step, int32_t* steps_ptr,
+                          int64_t steps_stride_m, int steps_size_m) {
   // A block of BLOCK_Y rows of threads sends to output_rank from the row that
   // receives its copy (recv's rows): row output_rank / (WORLD / BLOCK_Y).
   if constexpr (BLOCK_Y > 1)
@@ -764,14 +780,27 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
   const auto col_at = [&](int k) {
     return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
   };
+  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
+  // tile left, the next where this tile writes the row.
+  uint32_t flags[kRows];
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) {
+    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
+      __builtin_trap();
+    uint32_t last =
+        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
+  }
   {
     static_assert(LAYOUT == Layout::tile, "Lamport lines sit in a tile");
     static_assert(!QUANTIZE_INT4 && sizeof(U) == 2,
                   "the sentinel is a 2-byte NaN");
     using W = raw_t<sizeof(V)>;
     constexpr int kHalves = sizeof(V) / 2;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flags == nullptr) __builtin_trap();
-    const int bank_rows = output_size_m / 2;
+    const int bank_rows = output_size_m / kLamportBanks;
     char* const slot =
         reinterpret_cast<char*>(output) +
         int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)};
@@ -780,7 +809,8 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
-      const int row = row_at(i) + static_cast<int>(flags[i] & 1u) * bank_rows;
+      const int row =
+          row_at(i) + static_cast<int>(flags[i] % kLamportBanks) * bank_rows;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (row >= output_size_m || flags[i] == 0))
         __builtin_trap();
@@ -815,7 +845,8 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
                   int64_t output_stride_n, int output_size_slot,
                   int output_size_m, int output_size_n, int clip_m, int clip_n,
                   int offs_m, int offs_n, int row_step,
-                  const uint32_t* flags = nullptr) {
+                  int32_t* steps_ptr = nullptr, int64_t steps_stride_m = 0,
+                  int steps_size_m = 0) {
   if constexpr (PROTOCOL == Protocol::simple) {
     internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(
@@ -829,14 +860,14 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
         input, output_ptr_array, output_ptr_array_size, output_rank,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, flags);
+        offs_n, row_step, steps_ptr, steps_stride_m, steps_size_m);
   } else {
     internal::send_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
         input, output_ptr_array, output_ptr_array_size, output_rank,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, flags);
+        offs_n, row_step, steps_ptr, steps_stride_m, steps_size_m);
   }
 }
 

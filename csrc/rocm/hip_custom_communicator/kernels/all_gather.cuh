@@ -264,13 +264,12 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
 //   simple: plain stores into every rank's staging buffer, which holds every
 //     rank's whole input; a barrier says every copy is in, a second that every
 //     rank has read it.
-//   ll, lamport: the data is its own signal, sent into an inbox row for each
-//     row the block owns, in one of two banks by the row's epoch. LL's lines
-//     are half data, half the epoch, and a reader polls each until it carries
-//     the epoch. Lamport's are all data, and a reader polls each until no
-//     element is the sentinel, then writes the sentinel back. Each row's epoch
-//     is kept in this rank's epochs buffer from tile to tile and launch to
-//     launch, and the next tile reuses the inbox rows.
+//   ll, lamport: the data is its own signal, sent into the inbox rows the
+//     block owns; send and recv keep the rows' steps (STEPS, common/types.cuh)
+//     and pick the bank from them. LL's lines are half data, half the step,
+//     and a reader polls each until it carries the step. Lamport's are all
+//     data, and a reader polls each until no element is the sentinel, then
+//     writes the sentinel back.
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
@@ -280,9 +279,8 @@ DINLINE void all_gather_tile_push(
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* unfenced_epochs_ptr,
-    int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n,
-    int unfenced_epochs_size_block, int unfenced_epochs_size_n,
+    int unfenced_size_n, int32_t* steps_ptr, int64_t steps_stride_block,
+    int64_t steps_stride_n, int steps_size_block, int steps_size_n,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -328,48 +326,14 @@ DINLINE void all_gather_tile_push(
   } else {
     static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
                   "a tile push is simple, LL or Lamport");
-    constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
-    constexpr int kThreadsN = BLOCK_X / kThreadsM;
+    // The block's rows of the inbox: its steps and its lines (STEPS).
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        static_cast<int>(gridDim.x) * TILE_M > unfenced_size_m / 2)
-      __builtin_trap();
-    // The epochs first, so they arrive while the tile does.
-    int32_t last[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))];
-    load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
-        unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, last, first_row, 0, 1);
+    const int lines_m = first_row + clip_m;
+    const int lines_n = min(TILE_N, input_size_n - offs_n);
     DTYPE mine[ROWS][PACKS][ELEMS];
     load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         input_ptr, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
         input_size_n, input_size_m, clip_n, mine, offs_m, offs_n, 1);
-    uint32_t epochs[ROWS];
-#pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
-      const uint32_t before = kThreadsM == 1
-                                  ? __builtin_amdgcn_readfirstlane(
-                                        static_cast<uint32_t>(last[i][0][0]))
-                                  : static_cast<uint32_t>(last[i][0][0]);
-      const bool written =
-          (kThreadsM == 1 ? i
-                          : static_cast<int>(threadIdx.x) / kThreadsN +
-                                i * kThreadsM) < clip_m;
-      epochs[i] = !written ? before : before + 1u == 0u ? 2u : before + 1u;
-    }
-    if constexpr (PROTOCOL == Protocol::lamport) {
-      // This rank's last re-arm of its inbox lands before these sends, which a
-      // peer must have before it writes that bank again. A launch's first tile
-      // has the kernel boundary for that, and waiting there would hold the
-      // tile's load behind the epochs'.
-      const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
-      if (offs_m / TILE_M * tiles_n + offs_n / TILE_N !=
-          static_cast<int>(blockIdx.x))
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    }
-    const int lines_m = first_row + clip_m;
-    const int lines_n = min(TILE_N, input_size_n - offs_n);
     // Quantized once, then sent to every rank.
     if constexpr (QUANTIZE_INT4) {
       uint32_t payload[ROWS][PACKS][2];
@@ -386,7 +350,8 @@ DINLINE void all_gather_tile_push(
                            r, rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, epochs);
+                           first_row, 0, 1, steps_ptr, steps_stride_block,
+                           steps_size_block);
     } else {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
@@ -395,27 +360,17 @@ DINLINE void all_gather_tile_push(
                            rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, epochs);
+                           first_row, 0, 1, steps_ptr, steps_stride_block,
+                           steps_size_block);
     }
-    // The epochs are saved now, not after the recv: there they would wait for
-    // the recv's stores.
-    int32_t next[ROWS][1][kLineBytes / static_cast<int>(sizeof(int32_t))] = {};
-#pragma unroll
-    for (int i = 0; i < ROWS; ++i)
-      next[i][0][0] = static_cast<int32_t>(epochs[i]);
-    store<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
-        next, unfenced_epochs_ptr, 0, 0, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, 1, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, first_row, 0, 1);
     recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
                        unfenced_stride_slot, unfenced_stride_m,
                        unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
                        unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
-                       1, epochs, status_ptr, status_stride_field,
-                       status_size_field, timeout_ticks);
-    __syncthreads();
+                       1, steps_ptr, steps_stride_block, steps_size_block,
+                       status_ptr, status_stride_field, status_size_field,
+                       timeout_ticks);
   }
 }
 
@@ -439,9 +394,8 @@ DINLINE void all_gather(
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* unfenced_epochs_ptr,
-    int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n,
-    int unfenced_epochs_size_block, int unfenced_epochs_size_n,
+    int unfenced_size_n, int32_t* steps_ptr, int64_t steps_stride_block,
+    int64_t steps_stride_n, int steps_size_block, int steps_size_n,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -484,13 +438,12 @@ DINLINE void all_gather(
         input, input_stride_m, input_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        unfenced_epochs_ptr, unfenced_epochs_stride_block,
-        unfenced_epochs_stride_n, unfenced_epochs_size_block,
-        unfenced_epochs_size_n, signals_ptr_array, signals_ptr_array_size,
-        signals_stride_parity, signals_stride_block, signals_stride_writer,
-        signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n, steps_ptr,
+        steps_stride_block, steps_stride_n, steps_size_block, steps_size_n,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+        signals_stride_block, signals_stride_writer, signals_size_parity,
+        signals_size_block, signals_size_writer, status_ptr,
+        status_stride_field, status_size_field, rank, timeout_ticks,
         input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 

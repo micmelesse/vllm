@@ -111,7 +111,7 @@ def _int4_sum(xs, config):
 
 
 def _inspect(comm):
-    """This rank's Lamport inbox and the LL and Lamport epochs, as views.
+    """This rank's Lamport inbox and the LL and Lamport steps, as views.
     Module-level, so ray ships the test's body without torch.ops."""
     return torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
 
@@ -187,13 +187,13 @@ def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
     where it pushes one: right, the same bits as every other build at the shape,
     and after each call the state LL and Lamport keep from launch to launch as
     every launch must leave it: this rank's Lamport inbox all the sentinel
-    (whatever was written was read and re-armed), the epochs equal on every
+    (whatever was written was read and re-armed), the steps equal on every
     rank."""
 
     def body(comm, group, device, rank):
         world = comm.arguments.world
         q = comm.arguments.quantization
-        inbox, lamport_epochs, ll_epochs = _inspect(comm)
+        inbox, steps = _inspect(comm)
         builds: dict[tuple, AllReduceConfig] = {}
         for c in comm.state.tuned_table.configs:
             if (
@@ -254,8 +254,7 @@ def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
                         torch.accelerator.synchronize()
                         dist.barrier(group=group.cpu_group)
                         assert bool((inbox == 0xFF).all()), (where, "inbox armed")
-                        same_everywhere(lamport_epochs, (where, "lamport epochs"))
-                        same_everywhere(ll_epochs, (where, "ll epochs"))
+                        same_everywhere(steps, (where, "steps"))
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 

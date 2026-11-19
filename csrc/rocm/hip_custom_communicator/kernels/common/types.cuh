@@ -40,6 +40,18 @@ using raw_t = std::conditional_t<
 // data never carries it.
 constexpr uint16_t kLamportEmpty = 0xffff;
 
+// STEPS (NCCL's name): LL and Lamport keep a step a block row of the inbox, in
+// the steps buffer, from tile to tile and launch to launch. A tile's step is
+// the next after the row's last (0 is none): LL writes it in every line and
+// waits for it, Lamport takes its bank from it. LL alternates two banks;
+// Lamport three, so a bank it re-armed is written again two tiles later, and
+// the re-arm need only land before the next tile's recv polls (recv_lamport).
+// The wrap skips 0 and keeps consecutive steps in different banks of two and of
+// three (0xfffffffe, then 3).
+constexpr int kLlBanks = 2;
+constexpr int kLamportBanks = 3;
+constexpr uint32_t kLastStep = 0xfffffffeu;
+
 typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 
 #ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
