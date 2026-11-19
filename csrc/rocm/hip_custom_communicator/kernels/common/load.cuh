@@ -33,8 +33,15 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
     const T* const at = input + int64_t{input_slot} * input_stride_slot +
                         int64_t{row} * input_stride_m +
                         int64_t{offs_n} * input_stride_n;
+    // Vector loads, though the address is the block's: they wait with the
+    // tile's other vector loads, where scalar loads would wait in line
+    // behind the kernel's argument loads.
 #pragma unroll
-    for (int j = 0; j < kElems; ++j) output[0][0][j] = at[j * input_stride_n];
+    for (int j = 0; j < kElems; ++j) {
+      int64_t e = int64_t{j} * input_stride_n;
+      asm volatile("" : "+v"(e));
+      output[0][0][j] = at[e];
+    }
   } else if constexpr ((LAYOUT == Layout::group_run ||
                         LAYOUT == Layout::group_flat) &&
                        kPacks != kInt4GroupPacks) {

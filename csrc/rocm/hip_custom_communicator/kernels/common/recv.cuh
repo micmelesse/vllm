@@ -970,7 +970,8 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
     uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
-    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    // Left in a vector register, as send's: a readfirstlane here, after the
+    // sends' lane-masked stores, would wait for those stores to complete.
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
   {
@@ -1211,7 +1212,8 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
     uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
-    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    // Left in a vector register, as send's: a readfirstlane here, after the
+    // sends' lane-masked stores, would wait for those stores to complete.
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
   {
