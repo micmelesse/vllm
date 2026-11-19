@@ -94,8 +94,8 @@ DINLINE void all_reduce_one_shot_pull(
         QUANTIZE_INT4 ? int64_t{input_size_n} : input_ptr_array_stride_m,
         QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, input_size_m,
         input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, 0, clip_n, 0, nullptr,
-        0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr, 0, 0, 0,
-        0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+        0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0,
+        nullptr, 0, 0, rank, 0);
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -160,8 +160,8 @@ DINLINE void all_reduce_two_shot_pull(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,
       output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
-      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
-      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0,
+      0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
@@ -175,8 +175,9 @@ DINLINE void all_reduce_one_shot_push(
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* steps_ptr, int64_t steps_stride_block,
-    int64_t steps_stride_n, int steps_size_block, int steps_size_n,
+    int unfenced_size_n, int32_t* connection_ptr,
+    int64_t connection_stride_block, int64_t connection_stride_word,
+    int connection_size_block, int connection_size_word,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -198,6 +199,13 @@ DINLINE void all_reduce_one_shot_push(
   const int tiles_n = (input_size_n + kTileN - 1) / kTileN;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
 
+  // The block's connection, a line of its own: loaded before the first tile,
+  // stored after the last (CONNECTION, common/types.cuh).
+  Connection connection;
+  load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+      connection_ptr, 0, 0, connection_stride_block, connection_stride_word, 1,
+      connection_size_block, connection_size_word, connection_size_block,
+      connection_size_word, connection, static_cast<int>(blockIdx.x), 0, 1);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
     const int clip_m = min(TILE_M, input_size_m - offs_m);
@@ -213,8 +221,7 @@ DINLINE void all_reduce_one_shot_push(
         staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
         unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
         unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        steps_ptr, steps_stride_block, steps_stride_n, steps_size_block,
-        steps_size_n, signals_ptr_array, signals_ptr_array_size,
+        &connection, signals_ptr_array, signals_ptr_array_size,
         signals_stride_parity, signals_stride_block, signals_stride_writer,
         signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank,
@@ -237,6 +244,11 @@ DINLINE void all_reduce_one_shot_push(
         rounded, output_ptr, 0, 0, output_stride_m, output_stride_n, 1,
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
+  store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+      connection, connection_ptr, 0, 0, connection_stride_block,
+      connection_stride_word, 1, connection_size_block, connection_size_word,
+      connection_size_block, connection_size_word, static_cast<int>(blockIdx.x),
+      0, 1);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
@@ -276,8 +288,8 @@ DINLINE void all_reduce_two_shot_push(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,
       output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
-      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, nullptr,
-      0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+      0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0,
+      0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
@@ -299,12 +311,13 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
     char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* __restrict__ steps_ptr,
-    int64_t steps_stride_block, int64_t steps_stride_n, int steps_size_block,
-    int steps_size_n, uint32_t* const* __restrict__ signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    int unfenced_size_n, int32_t* __restrict__ connection_ptr,
+    int64_t connection_stride_block, int64_t connection_stride_word,
+    int connection_size_block, int connection_size_word,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+    int64_t signals_stride_parity, int64_t signals_stride_block,
+    int64_t signals_stride_writer, int signals_size_parity,
+    int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_pull)
@@ -342,12 +355,13 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
         output_ptr, output_stride_m, output_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, steps_ptr,
-        steps_stride_block, steps_stride_n, steps_size_block, steps_size_n,
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
-        signals_stride_block, signals_stride_writer, signals_size_parity,
-        signals_size_block, signals_size_writer, status_ptr,
-        status_stride_field, status_size_field, rank, timeout_ticks);
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection_ptr,
+        connection_stride_block, connection_stride_word, connection_size_block,
+        connection_size_word, signals_ptr_array, signals_ptr_array_size,
+        signals_stride_parity, signals_stride_block, signals_stride_writer,
+        signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_push)
     all_reduce_two_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                              TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,

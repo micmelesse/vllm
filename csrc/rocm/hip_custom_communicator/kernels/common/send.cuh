@@ -594,8 +594,7 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
                      int64_t output_stride_m, int64_t output_stride_n,
                      int output_size_slot, int output_size_m, int output_size_n,
                      int clip_m, int clip_n, int offs_m, int offs_n,
-                     int row_step, int32_t* steps_ptr, int64_t steps_stride_m,
-                     int steps_size_m) {
+                     int row_step, Connection& connection) {
   // A block of BLOCK_Y rows of threads sends to output_rank from the row that
   // receives its copy (recv's rows): row output_rank / (WORLD / BLOCK_Y).
   if constexpr (BLOCK_Y > 1)
@@ -637,17 +636,13 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
   const auto col_at = [&](int k) {
     return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
   };
-  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
-  // tile left, the next where this tile writes the row.
+  // The tile's step (CONNECTION, types.cuh): the next after the one the block's
+  // last tile left.
+  static_assert(TILE_M == 1, "a connection's step is one inbox row's");
   uint32_t flags[kRows];
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
-    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
-      __builtin_trap();
-    uint32_t last =
-        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
     // Left in a vector register: a readfirstlane is convergent, so a send to
     // each rank would keep its own, the sends' stores could not share a
     // branch, and each rank's address load would wait in its own.
@@ -739,8 +734,7 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
                           int64_t output_stride_m, int64_t output_stride_n,
                           int output_size_slot, int output_size_m,
                           int output_size_n, int clip_m, int clip_n, int offs_m,
-                          int offs_n, int row_step, int32_t* steps_ptr,
-                          int64_t steps_stride_m, int steps_size_m) {
+                          int offs_n, int row_step, Connection& connection) {
   // A block of BLOCK_Y rows of threads sends to output_rank from the row that
   // receives its copy (recv's rows): row output_rank / (WORLD / BLOCK_Y).
   if constexpr (BLOCK_Y > 1)
@@ -782,17 +776,13 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
   const auto col_at = [&](int k) {
     return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
   };
-  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
-  // tile left, the next where this tile writes the row.
+  // The tile's step (CONNECTION, types.cuh): the next after the one the block's
+  // last tile left.
+  static_assert(TILE_M == 1, "a connection's step is one inbox row's");
   uint32_t flags[kRows];
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
-    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
-      __builtin_trap();
-    uint32_t last =
-        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
     // Left in a vector register: a readfirstlane is convergent, so a send to
     // each rank would keep its own, the sends' stores could not share a
     // branch, and each rank's address load would wait in its own.
@@ -849,8 +839,10 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
                   int64_t output_stride_n, int output_size_slot,
                   int output_size_m, int output_size_n, int clip_m, int clip_n,
                   int offs_m, int offs_n, int row_step,
-                  int32_t* steps_ptr = nullptr, int64_t steps_stride_m = 0,
-                  int steps_size_m = 0) {
+                  Connection* connection = nullptr) {
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
+      connection == nullptr)
+    __builtin_trap();
   if constexpr (PROTOCOL == Protocol::simple) {
     internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(
@@ -864,14 +856,14 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
         input, output_ptr_array, output_ptr_array_size, output_rank,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, steps_ptr, steps_stride_m, steps_size_m);
+        offs_n, row_step, *connection);
   } else {
     internal::send_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
         input, output_ptr_array, output_ptr_array_size, output_rank,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
-        offs_n, row_step, steps_ptr, steps_stride_m, steps_size_m);
+        offs_n, row_step, *connection);
   }
 }
 

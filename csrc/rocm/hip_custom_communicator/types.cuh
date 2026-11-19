@@ -188,10 +188,11 @@ struct CommsState {
   DeviceProperties device;
   SymmetricMemory symmetric;
 
-  // The LL and Lamport steps (STEPS, kernels/common/types.cuh): LL's rows, then
-  // Lamport's, step_rows of them each, step_words words a row.
-  int32_t* steps = nullptr;
-  int64_t step_rows = 0, step_words = 0;
+  // The blocks' connections (CONNECTION, kernels/common/types.cuh): a region a
+  // protocol, at its Protocol value (simple, LL, Lamport), connection_blocks
+  // blocks of connection_words words each.
+  int32_t* connections = nullptr;
+  int64_t connection_blocks = 0, connection_words = 0;
   uint32_t* status_device = nullptr;
   InputTables input_tables;
 };

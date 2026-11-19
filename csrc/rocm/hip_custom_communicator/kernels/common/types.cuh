@@ -40,16 +40,25 @@ using raw_t = std::conditional_t<
 // data never carries it.
 constexpr uint16_t kLamportEmpty = 0xffff;
 
-// STEPS (NCCL's name): LL and Lamport keep a step a block row of the inbox, in
-// the steps buffer, from tile to tile and launch to launch. A tile's step is
-// the next after the row's last (0 is none): LL writes it in every line and
-// waits for it, Lamport takes its bank from it. LL alternates two banks;
-// Lamport three, so a bank it re-armed is written again only after this rank's
-// sends two tiles later, and the next tile's recv polls before those: a poll
-// that returns has the wave's earlier stores, the re-arm, behind it
-// (recv_lamport), so nothing waits for the re-arm.
+// CONNECTION (NCCL's word for what a send and a recv coordinate through): a
+// block's few words of state for the peer buffer it talks through, a register
+// array. The stage loads it before its first tile and stores it after its
+// last; send and recv read and advance it, and each protocol decides what the
+// words are. Every wave keeps its own copy and every copy advances the same
+// way, and the next read is the next launch's, so no wave waits for another
+// to save it. Each peer buffer has its own connections (the LL inbox's, the
+// Lamport inbox's, Simple's staging), a block's at its block index.
+// LL and Lamport: word 0 is the step of the block's inbox row (a tile is one
+// row). A tile's step is the next after the last (0 is none): LL writes it in
+// every line and waits for it, Lamport takes its bank from it. LL alternates
+// two banks; Lamport three, so a bank it re-armed is written again only after
+// this rank's sends two tiles later, and the next tile's recv polls before
+// those: a poll that returns has the wave's earlier stores, the re-arm, behind
+// it (recv_lamport), so nothing waits for the re-arm.
 // The wrap skips 0 and keeps consecutive steps in different banks of two and of
 // three (0xfffffffe, then 3).
+constexpr int kConnectionWords = 4;
+using Connection = int32_t[1][1][kConnectionWords];
 constexpr int kLlBanks = 2;
 constexpr int kLamportBanks = 3;
 constexpr uint32_t kLastStep = 0xfffffffeu;
@@ -127,7 +136,10 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 typedef __attribute__((address_space(1))) uint32_t global_u32;
 typedef __attribute__((address_space(1))) __fp16 global_f16;
 
-enum class Layout { tile, run, flat, group_run, group_flat };
+// block: the block's one line (a row of one pack), every thread the same copy,
+// at an address uniform over the block, so it is read with scalar loads, which
+// wait behind no vector store (a block's connection, CONNECTION).
+enum class Layout { tile, run, flat, group_run, group_flat, block };
 
 // How a receiver knows a peer's data has arrived. Simple: the data, then a
 // barrier. LL: a flag in every line, half the line payload.

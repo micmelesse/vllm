@@ -903,8 +903,7 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
                      int64_t input_stride_m, int64_t input_stride_n,
                      int input_size_slot, int input_size_m, int input_size_n,
                      int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                     int offs_n, int row_step, int32_t* steps_ptr,
-                     int64_t steps_stride_m, int steps_size_m,
+                     int offs_n, int row_step, Connection& connection,
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, uint64_t timeout_ticks) {
   // A block of BLOCK_Y rows of threads, each the same tile: row y reads the
@@ -964,17 +963,13 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
     const int n = offs_n / kElems + tid % kThreadsN + k * kThreadsN;
     return n < clip_n / kElems ? n : clip_n / kElems - 1;
   };
-  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
-  // tile left, the next where this tile writes the row.
+  // The tile's step (CONNECTION, types.cuh): the next after the one the block's
+  // last tile left.
+  static_assert(TILE_M == 1, "a connection's step is one inbox row's");
   uint32_t flags[kRows];
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
-    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
-      __builtin_trap();
-    uint32_t last =
-        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
     if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
@@ -1134,15 +1129,8 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
     // Read before any row writes the next call's.
     __syncthreads();
   }
-  // Saved once every wave of the block has read it (STEPS): rows of threads
-  // waited for each other in their exchange; one row of several waves waits
-  // here. Every thread stores it, so a wave's next read follows its own store.
-  if constexpr (BLOCK_Y == 1 && BLOCK_X > WAVE_SIZE) __syncthreads();
-#pragma unroll
-  for (int i = 0; i < kRows; ++i)
-    if (row_at(i) < clip_m)
-      steps_ptr[int64_t{row_at(i)} * steps_stride_m] =
-          static_cast<int32_t>(flags[i]);
+  // The block's next tile starts from this one's step (CONNECTION).
+  connection[0][0][0] = static_cast<int32_t>(flags[0]);
 }
 
 // A Lamport recv: each pack polled until no element is the sentinel, then
@@ -1156,8 +1144,7 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
                           int64_t input_stride_n, int input_size_slot,
                           int input_size_m, int input_size_n, int clip_m,
                           int clip_n, OUTPUT& output, int offs_m, int offs_n,
-                          int row_step, int32_t* steps_ptr,
-                          int64_t steps_stride_m, int steps_size_m,
+                          int row_step, Connection& connection,
                           uint32_t* status_ptr, int64_t status_stride_field,
                           int status_size_field, uint64_t timeout_ticks) {
   // A block of BLOCK_Y rows of threads, each the same tile: row y reads the
@@ -1217,17 +1204,13 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     const int n = offs_n / kElems + tid % kThreadsN + k * kThreadsN;
     return n < clip_n / kElems ? n : clip_n / kElems - 1;
   };
-  // The tile's step, a row each (STEPS, types.cuh): the step the row's last
-  // tile left, the next where this tile writes the row.
+  // The tile's step (CONNECTION, types.cuh): the next after the one the block's
+  // last tile left.
+  static_assert(TILE_M == 1, "a connection's step is one inbox row's");
   uint32_t flags[kRows];
 #pragma unroll
   for (int i = 0; i < kRows; ++i) {
-    const int step_row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (steps_ptr == nullptr || step_row < 0 || step_row >= steps_size_m))
-      __builtin_trap();
-    uint32_t last =
-        static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
+    uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
     if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
@@ -1337,9 +1320,10 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
           __builtin_memcpy(into[c][i][k], &got[c][i][k], sizeof(V));
 
     // Re-arm what was read. A peer writes this bank again only after this
-    // rank's sends two tiles on (three banks, STEPS), and those come after this
-    // wave's next recv has polled: a wave's loads and stores complete in the
-    // order it issues them, so a poll that returns has these stores behind it.
+    // rank's sends two tiles on (three banks, CONNECTION), and those come
+    // after this wave's next recv has polled: a wave's loads and stores
+    // complete in the order it issues them, so a poll that returns has these
+    // stores behind it.
     // No wait here or before the sends.
     W cleared;
     __builtin_memset(&cleared, 0xff, sizeof(cleared));
@@ -1370,15 +1354,8 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     // Read before any row writes the next call's.
     __syncthreads();
   }
-  // Saved once every wave of the block has read it (STEPS): rows of threads
-  // waited for each other in their exchange; one row of several waves waits
-  // here. Every thread stores it, so a wave's next read follows its own store.
-  if constexpr (BLOCK_Y == 1 && BLOCK_X > WAVE_SIZE) __syncthreads();
-#pragma unroll
-  for (int i = 0; i < kRows; ++i)
-    if (row_at(i) < clip_m)
-      steps_ptr[int64_t{row_at(i)} * steps_stride_m] =
-          static_cast<int32_t>(flags[i]);
+  // The block's next tile starts from this one's step (CONNECTION).
+  connection[0][0][0] = static_cast<int32_t>(flags[0]);
 }
 
 }  // namespace internal
@@ -1391,11 +1368,13 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int64_t input_stride_m, int64_t input_stride_n,
                   int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                  int offs_n, int row_step, int32_t* steps_ptr = nullptr,
-                  int64_t steps_stride_m = 0, int steps_size_m = 0,
+                  int offs_n, int row_step, Connection* connection = nullptr,
                   uint32_t* status_ptr = nullptr,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
+      connection == nullptr)
+    __builtin_trap();
   if constexpr (PROTOCOL == Protocol::simple) {
     internal::recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(
@@ -1409,16 +1388,16 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step, steps_ptr, steps_stride_m, steps_size_m, status_ptr,
-        status_stride_field, status_size_field, timeout_ticks);
+        row_step, *connection, status_ptr, status_stride_field,
+        status_size_field, timeout_ticks);
   } else {
     internal::recv_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step, steps_ptr, steps_stride_m, steps_size_m, status_ptr,
-        status_stride_field, status_size_field, timeout_ticks);
+        row_step, *connection, status_ptr, status_stride_field,
+        status_size_field, timeout_ticks);
   }
 }
 

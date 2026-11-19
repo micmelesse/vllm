@@ -98,7 +98,6 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
       2 * max_blocks * world * int64_t{sizeof(uint32_t)};
 
   const int64_t unfenced_blocks = 128, unfenced_slot_bytes = 2048;
-  const int64_t step_words = kPackBytes / int64_t{sizeof(int32_t)};
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
                                  unfenced_slot_bytes *
                                  (kLineBytes / kLinePayloadBytes);
@@ -146,8 +145,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
-  s->step_rows = lamport_blocks;
-  s->step_words = step_words;
+  s->connection_blocks = lamport_blocks;
+  s->connection_words = kConnectionWords;
   s->input_tables.slots = input_table_slots;
 
   bool made = true;
@@ -177,7 +176,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
-  allocate(s->steps, 2 * lamport_blocks * step_words * int64_t{sizeof(int32_t)},
+  allocate(s->connections,
+           3 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
@@ -276,10 +276,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 }
 
 // For the tests: views of the state LL and Lamport keep from launch to launch,
-// this rank's Lamport inbox (bytes) and the steps (LL's, Lamport's: a row of
-// words a block row), so a test can check what every launch must leave: the
-// inbox all the sentinel, the steps equal on every rank. No copy; the views
-// live as long as the communicator.
+// this rank's Lamport inbox (bytes) and the connections ([protocol][block]
+// [word], CONNECTION), so a test can check what every launch must leave: the
+// inbox all the sentinel, the connections equal on every rank. No copy; the
+// views live as long as the communicator.
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   using namespace hip_custom_communicator;
   using namespace hip_custom_communicator::internal;
@@ -289,7 +289,8 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   return {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
-      torch::from_blob(s.steps, {2, s.step_rows, s.step_words},
+      torch::from_blob(s.connections,
+                       {3, s.connection_blocks, s.connection_words},
                        on.dtype(torch::kInt32)),
   };
 }

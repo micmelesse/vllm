@@ -18,8 +18,26 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
                 "a pointer array is other ranks' memory: send or recv it");
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
   constexpr int kPacks = std::extent_v < OUTPUT, kSlots ? 2 : 1 > ;
-  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
-                kPacks != kInt4GroupPacks) {
+  if constexpr (LAYOUT == Layout::block) {
+    static_assert(!QUANTIZE_INT4 && !kSlots && std::extent_v<OUTPUT, 0> == 1 &&
+                      kPacks == 1,
+                  "a block's line is one row of one pack");
+    constexpr int kElems = std::extent_v<OUTPUT, 2>;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (input_slot < 0 || input_slot >= input_size_slot || offs_n < 0 ||
+         offs_n + kElems > clip_n || clip_n > input_size_n || clip_m < 1 ||
+         clip_m > input_size_m))
+      __builtin_trap();
+    // A row past the clip reads the last, as the tile walk's do.
+    const int row = offs_m < clip_m ? offs_m : clip_m - 1;
+    const T* const at = input + int64_t{input_slot} * input_stride_slot +
+                        int64_t{row} * input_stride_m +
+                        int64_t{offs_n} * input_stride_n;
+#pragma unroll
+    for (int j = 0; j < kElems; ++j) output[0][0][j] = at[j * input_stride_n];
+  } else if constexpr ((LAYOUT == Layout::group_run ||
+                        LAYOUT == Layout::group_flat) &&
+                       kPacks != kInt4GroupPacks) {
     static_assert(kPacks % kInt4GroupPacks == 0, "a thread holds whole groups");
     constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
     constexpr int kPackElems = std::extent_v < OUTPUT, kSlots ? 3 : 2 > ;

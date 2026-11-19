@@ -265,11 +265,11 @@ DINLINE void all_gather_tile_pull(ENTRY (&entries)[WORLD], int64_t stride_m,
 //     rank's whole input; a barrier says every copy is in, a second that every
 //     rank has read it.
 //   ll, lamport: the data is its own signal, sent into the inbox rows the
-//     block owns; send and recv keep the rows' steps (STEPS, common/types.cuh)
-//     and pick the bank from them. LL's lines are half data, half the step,
-//     and a reader polls each until it carries the step. Lamport's are all
-//     data, and a reader polls each until no element is the sentinel, then
-//     writes the sentinel back.
+//     block owns; send and recv keep the step in the block's connection
+//     (CONNECTION, common/types.cuh) and pick the bank from it. LL's lines are
+//     half data, half the step, and a reader polls each until it carries the
+//     step. Lamport's are all data, and a reader polls each until no element is
+//     the sentinel, then writes the sentinel back.
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
@@ -279,8 +279,7 @@ DINLINE void all_gather_tile_push(
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* steps_ptr, int64_t steps_stride_block,
-    int64_t steps_stride_n, int steps_size_block, int steps_size_n,
+    int unfenced_size_n, Connection* connection,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -326,7 +325,7 @@ DINLINE void all_gather_tile_push(
   } else {
     static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
                   "a tile push is simple, LL or Lamport");
-    // The block's rows of the inbox: its steps and its lines (STEPS).
+    // The block's row of the inbox (CONNECTION).
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
     const int lines_m = first_row + clip_m;
     const int lines_n = min(TILE_N, input_size_n - offs_n);
@@ -350,8 +349,7 @@ DINLINE void all_gather_tile_push(
                            r, rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, steps_ptr, steps_stride_block,
-                           steps_size_block);
+                           first_row, 0, 1, connection);
     } else {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
@@ -360,17 +358,15 @@ DINLINE void all_gather_tile_push(
                            rank, unfenced_stride_slot, unfenced_stride_m,
                            unfenced_stride_n, unfenced_size_slot,
                            unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, steps_ptr, steps_stride_block,
-                           steps_size_block);
+                           first_row, 0, 1, connection);
     }
     recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
          Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
                        unfenced_stride_slot, unfenced_stride_m,
                        unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
                        unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
-                       1, steps_ptr, steps_stride_block, steps_size_block,
-                       status_ptr, status_stride_field, status_size_field,
-                       timeout_ticks);
+                       1, connection, status_ptr, status_stride_field,
+                       status_size_field, timeout_ticks);
   }
 }
 
@@ -394,8 +390,7 @@ DINLINE void all_gather(
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* steps_ptr, int64_t steps_stride_block,
-    int64_t steps_stride_n, int steps_size_block, int steps_size_n,
+    int unfenced_size_n, Connection* connection,
     uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -438,8 +433,7 @@ DINLINE void all_gather(
         input, input_stride_m, input_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, steps_ptr,
-        steps_stride_block, steps_stride_n, steps_size_block, steps_size_n,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection,
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
         signals_stride_block, signals_stride_writer, signals_size_parity,
         signals_size_block, signals_size_writer, status_ptr,

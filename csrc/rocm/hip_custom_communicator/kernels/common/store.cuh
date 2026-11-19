@@ -17,8 +17,27 @@ DINLINE void store(const INPUT& input, T* output, int output_slot,
   static_assert(!std::is_pointer_v<T>,
                 "a pointer array is other ranks' memory: send or recv it");
   constexpr int kPacks = std::extent_v<INPUT, 1>;
-  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
-                kPacks != kInt4GroupPacks) {
+  if constexpr (LAYOUT == Layout::block) {
+    static_assert(!QUANTIZE_INT4 && std::rank_v<INPUT> == 3 &&
+                      std::extent_v<INPUT, 0> == 1 && kPacks == 1,
+                  "a block's line is one row of one pack");
+    constexpr int kElems = std::extent_v<INPUT, 2>;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (output_slot < 0 || output_slot >= output_size_slot || offs_n < 0 ||
+         offs_n + kElems > clip_n || clip_n > output_size_n ||
+         clip_m > output_size_m))
+      __builtin_trap();
+    // A row past the clip is not written, as the tile walk's are not.
+    if (offs_m >= clip_m) return;
+    T* const at = output + int64_t{output_slot} * output_stride_slot +
+                  int64_t{offs_m} * output_stride_m +
+                  int64_t{offs_n} * output_stride_n;
+    // Every thread holds the same copy and writes it.
+#pragma unroll
+    for (int j = 0; j < kElems; ++j) at[j * output_stride_n] = input[0][0][j];
+  } else if constexpr ((LAYOUT == Layout::group_run ||
+                        LAYOUT == Layout::group_flat) &&
+                       kPacks != kInt4GroupPacks) {
     static_assert(std::extent_v<INPUT, 0> == 1 && kPacks % kInt4GroupPacks == 0,
                   "a thread holds whole groups");
     constexpr int kPackElems = std::extent_v<INPUT, 2>;
