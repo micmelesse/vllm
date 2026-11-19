@@ -1376,127 +1376,193 @@ DINLINE void recv_simple_write(
     int64_t counters_stride_peer, int counters_size_block,
     int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
     int status_size_field, uint64_t timeout_ticks) {
-  static_assert(
-      LAYOUT == Layout::tile && !QUANTIZE_INT4 && TILE_M == 1 && BLOCK_Y == 1,
-      "a simple_write recv is an exact tile of one row, into one "
-      "row of threads");
-  static_assert(BLOCK_X % WAVE_SIZE == 0, "a block is whole waves");
-  static_assert(std::rank_v<OUTPUT> == 4, "a recv here is writers' copies");
-  const auto* const entries =
-      (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-  const int owner = __builtin_amdgcn_readfirstlane(input_rank);
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
-    internal::check_failed();
-  const void* const input = ptr_array_at(entries, input_ptr_array_size, owner);
-#if defined(__AMDGCN_WAVEFRONT_SIZE)
-  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
-                "the compiler's wave is not the one handed");
-#endif
-  constexpr int kCopies = std::extent_v<OUTPUT, 0>;
-  constexpr int kRows = std::extent_v<OUTPUT, 1>;
-  constexpr int kPacks = std::extent_v<OUTPUT, 2>;
-  constexpr int kPackElems = std::extent_v<OUTPUT, 3>;
-  using U = std::remove_all_extents_t<OUTPUT>;
-  static_assert(kCopies <= WORLD, "a read is writers' copies");
-  constexpr int kThreadsM = TILE_M / kRows;
-  constexpr int kThreadsN = BLOCK_X / kThreadsM;
-  static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
-  static_assert(kThreadsM * kThreadsN == BLOCK_X, "the layout is the block");
-  using V = vec<U, kPackElems>;
-  using W = raw_t<sizeof(V)>;
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      (input_slot < 0 || input_slot + kCopies > input_size_slot))
-    internal::check_failed();
-  const int tid = static_cast<int>(threadIdx.x);
-  const auto row_at = [&](int i) {
-    return offs_m +
-           (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
-  };
-  const auto pack_of = [&](int k) {
-    const int n = offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
-    return n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
-  };
-  // The round: the next after the block's last (CONNECTION).
-  const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
-  const uint32_t next = last == kLastStep ? 3u : last + 1u;
-  const auto offset = [&](Counter kind, int peer) {
+  if constexpr (LAYOUT != Layout::tile) {
+    // A flat walk: a peer a lane group, this lane's input_slot its group's
+    // writer; this rank is input_rank.
+    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat,
+                  "a flat walk here is exact: run or flat");
+    static_assert(!QUANTIZE_INT4 && BLOCK_Y == 1, "an exact walk, one row");
+    constexpr int kLanes = BLOCK_X / WORLD;
+    static_assert(kLanes * WORLD == BLOCK_X,
+                  "a block is a group of threads a rank");
+    // The round: the next after the block's last (CONNECTION).
+    const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
+    const uint32_t next = last == kLastStep ? 3u : last + 1u;
+    const int64_t at_block = int64_t{blockIdx.x} * counters_stride_block;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (static_cast<int>(blockIdx.x) >= counters_size_block || peer < 0 ||
-         peer >= counters_size_peer))
+        (static_cast<int>(blockIdx.x) >= counters_size_block ||
+         input_slot < 0 || input_slot >= counters_size_peer))
       internal::check_failed();
-    return static_cast<int64_t>(kind) * counters_stride_kind +
-           int64_t{blockIdx.x} * counters_stride_block +
-           int64_t{peer} * counters_stride_peer;
-  };
-  // Each wave waits for every writer's round (their tails, in this rank's
-  // counters).
-  uint32_t* const mine =
-      ptr_array_at(counters_ptr_array, counters_ptr_array_size, owner);
-  const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1;; ++n) {
-    bool missing = false;
-    uint32_t seen = next;
-#pragma unroll
-    for (int c = 0; c < kCopies; ++c) {
-      const uint32_t v =
-          __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
-                                 __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      if (v != next) missing = true, seen = v;
+    // Each lane waits for its group's writer's round (its tail, in this
+    // rank's counters).
+    uint32_t* const tail =
+        ptr_array_at(counters_ptr_array, counters_ptr_array_size, input_rank) +
+        static_cast<int64_t>(Counter::tail) * counters_stride_kind + at_block +
+        int64_t{input_slot} * counters_stride_peer;
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+      const uint32_t seen =
+          __scoped_atomic_load_n(tail, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (__builtin_amdgcn_ballot_w64(seen != next) == 0) break;
+      if ((n & 255u) != 0) continue;
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(
+              status_ptr + static_cast<int64_t>(StatusField::abort) *
+                               status_stride_field,
+              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+        continue;
+      if (!aborted)
+        give_up(status_ptr, status_stride_field, status_size_field,
+                Where::start, input_rank, static_cast<uint32_t>(input_slot),
+                seen, next, waited);
+      __builtin_amdgcn_endpgm();
     }
-    if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
-    if ((n & 255u) != 0) continue;
-    const uint64_t waited = wall_clock64() - t0;
-    const bool aborted =
-        __scoped_atomic_load_n(
-            status_ptr +
-                static_cast<int64_t>(StatusField::abort) * status_stride_field,
-            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
-    if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
-      continue;
-    if (!aborted)
-      give_up(status_ptr, status_stride_field, status_size_field, Where::start,
-              owner, kCopies, seen, next, waited);
-    __builtin_amdgcn_endpgm();
-  }
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-  const char* const first =
-      reinterpret_cast<const char*>(input) +
-      int64_t{input_slot} * input_stride_slot * int64_t{sizeof(U)};
-  const uint32_t slot_bytes =
-      static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
-  const uint32_t row_bytes =
-      static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
-#pragma unroll
-  for (int c = 0; c < kCopies; ++c)
-#pragma unroll
-    for (int i = 0; i < kRows; ++i) {
-      const int row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row >= input_size_m)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    // The data from this rank's inbox, at the writer's slot.
+    recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
+                LAYOUT, TAIL>(input_ptr_array, input_ptr_array_size, input_rank,
+                              input_slot, input_stride_slot, input_stride_m,
+                              input_stride_n, input_size_slot, input_size_m,
+                              input_size_n, clip_m, clip_n, output, offs_m,
+                              offs_n, row_step);
+    // The block's reads, then each group's writer told (its head from this
+    // rank), by the group's first lane.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
+    if (static_cast<int>(threadIdx.x) % kLanes == 0)
+      __scoped_atomic_store_n(
+          lane_ptr_array_at<uint32_t, WORLD>(
+              counters_ptr_array, counters_ptr_array_size, input_slot) +
+              static_cast<int64_t>(Counter::head) * counters_stride_kind +
+              at_block + int64_t{input_rank} * counters_stride_peer,
+          next, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    connection[0][0][0] = static_cast<int32_t>(next);
+  } else {
+    static_assert(
+        LAYOUT == Layout::tile && !QUANTIZE_INT4 && TILE_M == 1 && BLOCK_Y == 1,
+        "a simple_write recv is an exact tile of one row, into one "
+        "row of threads");
+    static_assert(BLOCK_X % WAVE_SIZE == 0, "a block is whole waves");
+    static_assert(std::rank_v<OUTPUT> == 4, "a recv here is writers' copies");
+    const auto* const entries =
+        (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    const int owner = __builtin_amdgcn_readfirstlane(input_rank);
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
+      internal::check_failed();
+    const void* const input =
+        ptr_array_at(entries, input_ptr_array_size, owner);
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+    static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
+                  "the compiler's wave is not the one handed");
+#endif
+    constexpr int kCopies = std::extent_v<OUTPUT, 0>;
+    constexpr int kRows = std::extent_v<OUTPUT, 1>;
+    constexpr int kPacks = std::extent_v<OUTPUT, 2>;
+    constexpr int kPackElems = std::extent_v<OUTPUT, 3>;
+    using U = std::remove_all_extents_t<OUTPUT>;
+    static_assert(kCopies <= WORLD, "a read is writers' copies");
+    constexpr int kThreadsM = TILE_M / kRows;
+    constexpr int kThreadsN = BLOCK_X / kThreadsM;
+    static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
+    static_assert(kThreadsM * kThreadsN == BLOCK_X, "the layout is the block");
+    using V = vec<U, kPackElems>;
+    using W = raw_t<sizeof(V)>;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (input_slot < 0 || input_slot + kCopies > input_size_slot))
+      internal::check_failed();
+    const int tid = static_cast<int>(threadIdx.x);
+    const auto row_at = [&](int i) {
+      return offs_m +
+             (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
+    };
+    const auto pack_of = [&](int k) {
+      const int n = offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
+      return n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
+    };
+    // The round: the next after the block's last (CONNECTION).
+    const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
+    const uint32_t next = last == kLastStep ? 3u : last + 1u;
+    const auto offset = [&](Counter kind, int peer) {
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+          (static_cast<int>(blockIdx.x) >= counters_size_block || peer < 0 ||
+           peer >= counters_size_peer))
         internal::check_failed();
+      return static_cast<int64_t>(kind) * counters_stride_kind +
+             int64_t{blockIdx.x} * counters_stride_block +
+             int64_t{peer} * counters_stride_peer;
+    };
+    // Each wave waits for every writer's round (their tails, in this rank's
+    // counters).
+    uint32_t* const mine =
+        ptr_array_at(counters_ptr_array, counters_ptr_array_size, owner);
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+      bool missing = false;
+      uint32_t seen = next;
 #pragma unroll
-      for (int k = 0; k < kPacks; ++k) {
-        uint32_t at = static_cast<uint32_t>(c) * slot_bytes +
-                      static_cast<uint32_t>(row) * row_bytes +
-                      static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
-        asm volatile("" : "+v"(at));
-        const W w = *(const __attribute__((address_space(1))) W*)(first + at);
-        __builtin_memcpy(output[c][i][k], &w, sizeof(V));
+      for (int c = 0; c < kCopies; ++c) {
+        const uint32_t v =
+            __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
+                                   __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        if (v != next) missing = true, seen = v;
       }
+      if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
+      if ((n & 255u) != 0) continue;
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(
+              status_ptr + static_cast<int64_t>(StatusField::abort) *
+                               status_stride_field,
+              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+        continue;
+      if (!aborted)
+        give_up(status_ptr, status_stride_field, status_size_field,
+                Where::start, owner, kCopies, seen, next, waited);
+      __builtin_amdgcn_endpgm();
     }
-  // The block's reads, then each writer told it may write the next round
-  // (its head from this rank, in its counters).
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
-  if (threadIdx.x < kCopies) {
-    const int writer = input_slot + static_cast<int>(threadIdx.x);
-    uint32_t* const theirs = lane_ptr_array_at<uint32_t, WORLD>(
-        counters_ptr_array, counters_ptr_array_size, writer);
-    __scoped_atomic_store_n(theirs + offset(Counter::head, owner), next,
-                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    const char* const first =
+        reinterpret_cast<const char*>(input) +
+        int64_t{input_slot} * input_stride_slot * int64_t{sizeof(U)};
+    const uint32_t slot_bytes =
+        static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
+    const uint32_t row_bytes =
+        static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+#pragma unroll
+    for (int c = 0; c < kCopies; ++c)
+#pragma unroll
+      for (int i = 0; i < kRows; ++i) {
+        const int row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row >= input_size_m)
+          internal::check_failed();
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k) {
+          uint32_t at = static_cast<uint32_t>(c) * slot_bytes +
+                        static_cast<uint32_t>(row) * row_bytes +
+                        static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+          asm volatile("" : "+v"(at));
+          const W w = *(const __attribute__((address_space(1))) W*)(first + at);
+          __builtin_memcpy(output[c][i][k], &w, sizeof(V));
+        }
+      }
+    // The block's reads, then each writer told it may write the next round
+    // (its head from this rank, in its counters).
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
+    if (threadIdx.x < kCopies) {
+      const int writer = input_slot + static_cast<int>(threadIdx.x);
+      uint32_t* const theirs = lane_ptr_array_at<uint32_t, WORLD>(
+          counters_ptr_array, counters_ptr_array_size, writer);
+      __scoped_atomic_store_n(theirs + offset(Counter::head, owner), next,
+                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    // The block's next tile starts from this one's step (CONNECTION).
+    connection[0][0][0] = static_cast<int32_t>(next);
   }
-  // The block's next tile starts from this one's step (CONNECTION).
-  connection[0][0][0] = static_cast<int32_t>(next);
 }
 
 // A simple_read recv: each writer's round waited for (its tail), each copy
@@ -1516,128 +1582,193 @@ DINLINE void recv_simple_read(
     int64_t counters_stride_peer, int counters_size_block,
     int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
     int status_size_field, uint64_t timeout_ticks) {
-  static_assert(
-      LAYOUT == Layout::tile && !QUANTIZE_INT4 && TILE_M == 1 && BLOCK_Y == 1,
-      "a simple_read recv is an exact tile of one row, into one "
-      "row of threads");
-  static_assert(BLOCK_X % WAVE_SIZE == 0, "a block is whole waves");
-  static_assert(std::rank_v<OUTPUT> == 4, "a recv here is writers' copies");
-  const auto* const entries =
-      (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-  const int owner = __builtin_amdgcn_readfirstlane(input_rank);
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
-    internal::check_failed();
-#if defined(__AMDGCN_WAVEFRONT_SIZE)
-  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
-                "the compiler's wave is not the one handed");
-#endif
-  constexpr int kCopies = std::extent_v<OUTPUT, 0>;
-  constexpr int kRows = std::extent_v<OUTPUT, 1>;
-  constexpr int kPacks = std::extent_v<OUTPUT, 2>;
-  constexpr int kPackElems = std::extent_v<OUTPUT, 3>;
-  using U = std::remove_all_extents_t<OUTPUT>;
-  static_assert(kCopies <= WORLD, "a read is writers' copies");
-  constexpr int kThreadsM = TILE_M / kRows;
-  constexpr int kThreadsN = BLOCK_X / kThreadsM;
-  static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
-  static_assert(kThreadsM * kThreadsN == BLOCK_X, "the layout is the block");
-  using V = vec<U, kPackElems>;
-  using W = raw_t<sizeof(V)>;
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      (input_slot < 0 || input_slot + kCopies > input_size_slot))
-    internal::check_failed();
-  const int tid = static_cast<int>(threadIdx.x);
-  const auto row_at = [&](int i) {
-    return offs_m +
-           (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
-  };
-  const auto pack_of = [&](int k) {
-    const int n = offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
-    return n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
-  };
-  // The round: the next after the block's last (CONNECTION).
-  const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
-  const uint32_t next = last == kLastStep ? 3u : last + 1u;
-  const auto offset = [&](Counter kind, int peer) {
+  if constexpr (LAYOUT != Layout::tile) {
+    // A flat walk: a peer a lane group, this lane's input_slot its group's
+    // writer; this rank is input_rank.
+    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat,
+                  "a flat walk here is exact: run or flat");
+    static_assert(!QUANTIZE_INT4 && BLOCK_Y == 1, "an exact walk, one row");
+    constexpr int kLanes = BLOCK_X / WORLD;
+    static_assert(kLanes * WORLD == BLOCK_X,
+                  "a block is a group of threads a rank");
+    // The round: the next after the block's last (CONNECTION).
+    const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
+    const uint32_t next = last == kLastStep ? 3u : last + 1u;
+    const int64_t at_block = int64_t{blockIdx.x} * counters_stride_block;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-        (static_cast<int>(blockIdx.x) >= counters_size_block || peer < 0 ||
-         peer >= counters_size_peer))
+        (static_cast<int>(blockIdx.x) >= counters_size_block ||
+         input_slot < 0 || input_slot >= counters_size_peer))
       internal::check_failed();
-    return static_cast<int64_t>(kind) * counters_stride_kind +
-           int64_t{blockIdx.x} * counters_stride_block +
-           int64_t{peer} * counters_stride_peer;
-  };
-  // Each wave waits for every writer's round (their tails, in this rank's
-  // counters).
-  uint32_t* const mine =
-      ptr_array_at(counters_ptr_array, counters_ptr_array_size, owner);
-  const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1;; ++n) {
-    bool missing = false;
-    uint32_t seen = next;
+    // Each lane waits for its group's writer's round (its tail, in this
+    // rank's counters).
+    uint32_t* const tail =
+        ptr_array_at(counters_ptr_array, counters_ptr_array_size, input_rank) +
+        static_cast<int64_t>(Counter::tail) * counters_stride_kind + at_block +
+        int64_t{input_slot} * counters_stride_peer;
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+      const uint32_t seen =
+          __scoped_atomic_load_n(tail, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (__builtin_amdgcn_ballot_w64(seen != next) == 0) break;
+      if ((n & 255u) != 0) continue;
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(
+              status_ptr + static_cast<int64_t>(StatusField::abort) *
+                               status_stride_field,
+              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+        continue;
+      if (!aborted)
+        give_up(status_ptr, status_stride_field, status_size_field,
+                Where::start, input_rank, static_cast<uint32_t>(input_slot),
+                seen, next, waited);
+      __builtin_amdgcn_endpgm();
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    // The data from the writer's own inbox, at this rank's slot.
+    recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
+                LAYOUT, TAIL>(input_ptr_array, input_ptr_array_size, input_slot,
+                              input_rank, input_stride_slot, input_stride_m,
+                              input_stride_n, input_size_slot, input_size_m,
+                              input_size_n, clip_m, clip_n, output, offs_m,
+                              offs_n, row_step);
+    // The block's reads, then each group's writer told (its head from this
+    // rank), by the group's first lane.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
+    if (static_cast<int>(threadIdx.x) % kLanes == 0)
+      __scoped_atomic_store_n(
+          lane_ptr_array_at<uint32_t, WORLD>(
+              counters_ptr_array, counters_ptr_array_size, input_slot) +
+              static_cast<int64_t>(Counter::head) * counters_stride_kind +
+              at_block + int64_t{input_rank} * counters_stride_peer,
+          next, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    connection[0][0][0] = static_cast<int32_t>(next);
+  } else {
+    static_assert(
+        LAYOUT == Layout::tile && !QUANTIZE_INT4 && TILE_M == 1 && BLOCK_Y == 1,
+        "a simple_read recv is an exact tile of one row, into one "
+        "row of threads");
+    static_assert(BLOCK_X % WAVE_SIZE == 0, "a block is whole waves");
+    static_assert(std::rank_v<OUTPUT> == 4, "a recv here is writers' copies");
+    const auto* const entries =
+        (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    const int owner = __builtin_amdgcn_readfirstlane(input_rank);
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
+      internal::check_failed();
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+    static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
+                  "the compiler's wave is not the one handed");
+#endif
+    constexpr int kCopies = std::extent_v<OUTPUT, 0>;
+    constexpr int kRows = std::extent_v<OUTPUT, 1>;
+    constexpr int kPacks = std::extent_v<OUTPUT, 2>;
+    constexpr int kPackElems = std::extent_v<OUTPUT, 3>;
+    using U = std::remove_all_extents_t<OUTPUT>;
+    static_assert(kCopies <= WORLD, "a read is writers' copies");
+    constexpr int kThreadsM = TILE_M / kRows;
+    constexpr int kThreadsN = BLOCK_X / kThreadsM;
+    static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
+    static_assert(kThreadsM * kThreadsN == BLOCK_X, "the layout is the block");
+    using V = vec<U, kPackElems>;
+    using W = raw_t<sizeof(V)>;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (input_slot < 0 || input_slot + kCopies > input_size_slot))
+      internal::check_failed();
+    const int tid = static_cast<int>(threadIdx.x);
+    const auto row_at = [&](int i) {
+      return offs_m +
+             (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
+    };
+    const auto pack_of = [&](int k) {
+      const int n = offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
+      return n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
+    };
+    // The round: the next after the block's last (CONNECTION).
+    const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
+    const uint32_t next = last == kLastStep ? 3u : last + 1u;
+    const auto offset = [&](Counter kind, int peer) {
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+          (static_cast<int>(blockIdx.x) >= counters_size_block || peer < 0 ||
+           peer >= counters_size_peer))
+        internal::check_failed();
+      return static_cast<int64_t>(kind) * counters_stride_kind +
+             int64_t{blockIdx.x} * counters_stride_block +
+             int64_t{peer} * counters_stride_peer;
+    };
+    // Each wave waits for every writer's round (their tails, in this rank's
+    // counters).
+    uint32_t* const mine =
+        ptr_array_at(counters_ptr_array, counters_ptr_array_size, owner);
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+      bool missing = false;
+      uint32_t seen = next;
+#pragma unroll
+      for (int c = 0; c < kCopies; ++c) {
+        const uint32_t v =
+            __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
+                                   __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        if (v != next) missing = true, seen = v;
+      }
+      if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
+      if ((n & 255u) != 0) continue;
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(
+              status_ptr + static_cast<int64_t>(StatusField::abort) *
+                               status_stride_field,
+              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+        continue;
+      if (!aborted)
+        give_up(status_ptr, status_stride_field, status_size_field,
+                Where::start, owner, kCopies, seen, next, waited);
+      __builtin_amdgcn_endpgm();
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    const uint32_t slot_bytes =
+        static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
+    const uint32_t row_bytes =
+        static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
 #pragma unroll
     for (int c = 0; c < kCopies; ++c) {
-      const uint32_t v =
-          __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
-                                 __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      if (v != next) missing = true, seen = v;
-    }
-    if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
-    if ((n & 255u) != 0) continue;
-    const uint64_t waited = wall_clock64() - t0;
-    const bool aborted =
-        __scoped_atomic_load_n(
-            status_ptr +
-                static_cast<int64_t>(StatusField::abort) * status_stride_field,
-            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
-    if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
-      continue;
-    if (!aborted)
-      give_up(status_ptr, status_stride_field, status_size_field, Where::start,
-              owner, kCopies, seen, next, waited);
-    __builtin_amdgcn_endpgm();
-  }
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-  const uint32_t slot_bytes =
-      static_cast<uint32_t>(input_stride_slot * int64_t{sizeof(U)});
-  const uint32_t row_bytes =
-      static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+      // Writer input_slot + c's copy, in its own inbox, at this rank's slot.
+      const char* const first =
+          reinterpret_cast<const char*>(
+              ptr_array_at(entries, input_ptr_array_size, input_slot + c)) +
+          static_cast<int64_t>(owner) * slot_bytes;
 #pragma unroll
-  for (int c = 0; c < kCopies; ++c) {
-    // Writer input_slot + c's copy, in its own inbox, at this rank's slot.
-    const char* const first =
-        reinterpret_cast<const char*>(
-            ptr_array_at(entries, input_ptr_array_size, input_slot + c)) +
-        static_cast<int64_t>(owner) * slot_bytes;
+      for (int i = 0; i < kRows; ++i) {
+        const int row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row >= input_size_m)
+          internal::check_failed();
 #pragma unroll
-    for (int i = 0; i < kRows; ++i) {
-      const int row = row_at(i) < clip_m ? row_at(i) : clip_m - 1;
-      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row >= input_size_m)
-        internal::check_failed();
-#pragma unroll
-      for (int k = 0; k < kPacks; ++k) {
-        uint32_t at = static_cast<uint32_t>(row) * row_bytes +
-                      static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
-        asm volatile("" : "+v"(at));
-        const W w = *(const __attribute__((address_space(1))) W*)(first + at);
-        __builtin_memcpy(output[c][i][k], &w, sizeof(V));
+        for (int k = 0; k < kPacks; ++k) {
+          uint32_t at = static_cast<uint32_t>(row) * row_bytes +
+                        static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+          asm volatile("" : "+v"(at));
+          const W w = *(const __attribute__((address_space(1))) W*)(first + at);
+          __builtin_memcpy(output[c][i][k], &w, sizeof(V));
+        }
       }
     }
+    // The block's reads, then each writer told it may write the next round
+    // (its head from this rank, in its counters).
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
+    if (threadIdx.x < kCopies) {
+      const int writer = input_slot + static_cast<int>(threadIdx.x);
+      uint32_t* const theirs = lane_ptr_array_at<uint32_t, WORLD>(
+          counters_ptr_array, counters_ptr_array_size, writer);
+      __scoped_atomic_store_n(theirs + offset(Counter::head, owner), next,
+                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    // The block's next tile starts from this one's step (CONNECTION).
+    connection[0][0][0] = static_cast<int32_t>(next);
   }
-  // The block's reads, then each writer told it may write the next round
-  // (its head from this rank, in its counters).
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
-  if (threadIdx.x < kCopies) {
-    const int writer = input_slot + static_cast<int>(threadIdx.x);
-    uint32_t* const theirs = lane_ptr_array_at<uint32_t, WORLD>(
-        counters_ptr_array, counters_ptr_array_size, writer);
-    __scoped_atomic_store_n(theirs + offset(Counter::head, owner), next,
-                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-  }
-  // The block's next tile starts from this one's step (CONNECTION).
-  connection[0][0][0] = static_cast<int32_t>(next);
 }
 
 }  // namespace internal

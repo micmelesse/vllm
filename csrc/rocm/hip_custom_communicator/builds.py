@@ -216,11 +216,11 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     )
                 if build.block_z != 1:
                     raise SystemExit(f"{path}: {arch}: {build}: no block_z")
-                # simple_write and simple_read are the exact one-shot's so far,
-                # an exact tile of one row from one row of whole waves.
+                # simple_write and simple_read are the exact one-shot's and
+                # two-shot's so far, one row of whole waves.
                 if build.protocol in ("simple_write", "simple_read") and (
                     build.kernel != "all_reduce"
-                    or build.algorithm != "one_shot_push"
+                    or build.algorithm not in ("one_shot_push", "two_shot_push")
                     or build.quantization != "exact"
                     or build.block_y != 1
                     or build.tile_m != 1
@@ -228,7 +228,7 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                 ):
                     raise SystemExit(
                         f"{path}: {arch}: {build}: {build.protocol} is the "
-                        "exact one-shot push's, one row"
+                        "exact one-shot and two-shot push's, one row"
                     )
                 if build not in builds:
                     builds.append(build)

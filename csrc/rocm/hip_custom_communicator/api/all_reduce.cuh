@@ -194,6 +194,22 @@ ErrorCode hip_custom_communicator_all_reduce(
   switch (algorithm) {
     case AllReduceAlgorithm::two_shot_pull:
     case AllReduceAlgorithm::two_shot_push:
+      // The Simple protocols' two-shot: a slot a pair of ranks, a row a
+      // block, each a chunk.
+      if (protocol == Protocol::simple_write ||
+          protocol == Protocol::simple_read) {
+        const int64_t elems = pack_bytes / e;
+        const int64_t row = (tile_n + elems - 1) / elems * elems;
+        if (s.world * grid_x * row * e > s.symmetric.inbox_bytes ||
+            grid_x > s.symmetric.max_blocks)
+          return error_code(Error::unfenced_too_small);
+        unfenced_stride_slot = grid_x * row, unfenced_stride_m = row,
+        unfenced_stride_n = 1;
+        unfenced_size_slot = s.world, unfenced_size_m = grid_x,
+        unfenced_size_n = row;
+        staging_need = 0, partials_need = 0;
+        break;
+      }
       staging_need = m * n * e, partials_need = m * slice_bytes;
       if (quantize_int4) {
         partials_stride_m = share, partials_size_m = 1, partials_size_n = share;

@@ -8,14 +8,18 @@ namespace hip_custom_communicator {
 
 namespace ReduceAxis {
 constexpr int all = 0;
+// m: the rows (groups of threads) summed, the sum in the first row's threads.
 constexpr int m = 1;
+// m_all: the rows summed, the sum in every row's threads.
+constexpr int m_all = 2;
 }  // namespace ReduceAxis
 
 template <int TILE_M, int BLOCK_X, int WAVE_SIZE, int AXIS, typename T,
           typename U, int K, int P>
 DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
-  static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m,
-                "AXIS is all or m");
+  static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m ||
+                    AXIS == ReduceAxis::m_all,
+                "AXIS is all, m or m_all");
 
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
   static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
@@ -84,7 +88,8 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
           sizeof(V));
     __syncthreads();
 
-    if (kThreadsM == 1 || static_cast<int>(threadIdx.x) < kThreadsN) {
+    if (AXIS == ReduceAxis::m_all || kThreadsM == 1 ||
+        static_cast<int>(threadIdx.x) < kThreadsN) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         float x[P];
