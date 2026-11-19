@@ -144,13 +144,15 @@ enum class Layout { tile, run, flat, group_run, group_flat, block };
 // How a receiver knows a peer's data has arrived. simple: the data, then a
 // barrier (the Simple stages not yet moved). ll: a flag in every line, half
 // the line payload. lamport: the data, its sentinel gone. simple_write: the
-// data in the receiver's staging, then a counter (COUNTERS).
-enum class Protocol { simple, ll, lamport, simple_write };
+// data in the receiver's staging, then a counter (COUNTERS). simple_read: the
+// data in the sender's own staging, then a counter; the receiver loads it.
+enum class Protocol { simple, ll, lamport, simple_write, simple_read };
 
 // COUNTERS: simple_write's head and tail, a pair a block and peer in each
 // rank's signals (after the barrier's flags), polled where they live. A
 // block's tail[peer] is the last round peer sent it; its head[peer] the last
 // round peer read from it. A round is a tile, named by the connection's step.
+// simple_read uses the same counters, its data in the sender's staging.
 enum class Counter : int { tail, head };
 
 namespace internal {

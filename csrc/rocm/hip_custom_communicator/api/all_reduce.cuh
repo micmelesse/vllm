@@ -70,6 +70,8 @@ ErrorCode hip_custom_communicator_all_reduce(
     protocol = Protocol::lamport;
   else if (protocol_name == "simple_write")
     protocol = Protocol::simple_write;
+  else if (protocol_name == "simple_read")
+    protocol = Protocol::simple_read;
   else
     return error_code(Error::no_such_protocol);
   if (quantization_name != "exact" && quantization_name != "int4")
@@ -219,8 +221,10 @@ ErrorCode hip_custom_communicator_all_reduce(
       }
       break;
     case AllReduceAlgorithm::one_shot_push:
-      // simple_write's inbox is the staging: a row a block, each the tile.
-      if (protocol == Protocol::simple_write) {
+      // simple_write's and simple_read's inbox is the staging: a row a block,
+      // each the tile (simple_read's writer keeps its own slot in its own).
+      if (protocol == Protocol::simple_write ||
+          protocol == Protocol::simple_read) {
         if (grid_x * tile_m > s.connection_blocks)
           return error_code(Error::launch_out_of_range);
         const int64_t rows = grid_x * tile_m;
@@ -310,9 +314,10 @@ ErrorCode hip_custom_communicator_all_reduce(
   }
 
   char* const* const inbox_ptr_array =
-      protocol == Protocol::lamport        ? s.symmetric.lamport_ptr_array
-      : protocol == Protocol::simple_write ? s.symmetric.staging_ptr_array
-                                           : s.symmetric.unfenced_ptr_array;
+      protocol == Protocol::lamport ? s.symmetric.lamport_ptr_array
+      : protocol == Protocol::simple_write || protocol == Protocol::simple_read
+          ? s.symmetric.staging_ptr_array
+          : s.symmetric.unfenced_ptr_array;
   // This protocol's connections (CONNECTION).
   int32_t* const connections = s.connections + static_cast<int>(protocol) *
                                                    s.connection_blocks *

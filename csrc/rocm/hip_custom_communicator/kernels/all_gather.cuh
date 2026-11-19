@@ -329,8 +329,10 @@ DINLINE void all_gather_tile_push(
                    Until::read, 1);
   } else {
     static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
-                      PROTOCOL == Protocol::simple_write,
-                  "a tile push is simple, LL, Lamport or simple_write");
+                      PROTOCOL == Protocol::simple_write ||
+                      PROTOCOL == Protocol::simple_read,
+                  "a tile push is simple, LL, Lamport, simple_write or "
+                  "simple_read");
     // The block's row of the inbox (CONNECTION).
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
     const int lines_m = first_row + clip_m;

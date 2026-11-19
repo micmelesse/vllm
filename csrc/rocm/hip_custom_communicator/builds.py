@@ -33,6 +33,7 @@ PROTOCOLS = {
     "ll": "Protocol::ll",
     "lamport": "Protocol::lamport",
     "simple_write": "Protocol::simple_write",
+    "simple_read": "Protocol::simple_read",
 }
 ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
@@ -215,9 +216,9 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     )
                 if build.block_z != 1:
                     raise SystemExit(f"{path}: {arch}: {build}: no block_z")
-                # simple_write is the exact one-shot push's so far, an exact
-                # tile of one row from one row of whole waves.
-                if build.protocol == "simple_write" and (
+                # simple_write and simple_read are the exact one-shot's so far,
+                # an exact tile of one row from one row of whole waves.
+                if build.protocol in ("simple_write", "simple_read") and (
                     build.kernel != "all_reduce"
                     or build.algorithm != "one_shot_push"
                     or build.quantization != "exact"
@@ -226,8 +227,8 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     or build.block_x % WAVE_SIZE != 0
                 ):
                     raise SystemExit(
-                        f"{path}: {arch}: {build}: simple_write is the exact "
-                        "one-shot push's, one row"
+                        f"{path}: {arch}: {build}: {build.protocol} is the "
+                        "exact one-shot push's, one row"
                     )
                 if build not in builds:
                     builds.append(build)
