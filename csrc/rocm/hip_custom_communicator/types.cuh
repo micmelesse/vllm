@@ -149,7 +149,7 @@ struct SymmetricMemory {
 
   int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
           scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0,
-          simple_bytes = 0;
+          inbox_bytes = 0;
 
   uint32_t* signals = nullptr;
   char* staging = nullptr;
@@ -159,20 +159,25 @@ struct SymmetricMemory {
   // Lamport's inbox, LL's rows but lamport_blocks of them a bank, all data;
   // its every position is the sentinel until its data arrives.
   char* lamport = nullptr;
-  // simple_write's and simple_read's inbox, Lamport's rows but one bank: its
-  // own while the barrier-synchronized Simple stages still share staging.
-  char* simple = nullptr;
+  // simple_write's inbox and simple_read's, each Lamport's rows in one bank.
+  // A protocol owns its buffers, counters and connections and touches no
+  // other protocol's, so any order of calls across protocols is safe.
+  char* simple_write_inbox = nullptr;
+  char* simple_read_inbox = nullptr;
 
   uint32_t* const* signals_ptr_array = nullptr;
-  // Each rank's simple_write counters (COUNTERS, kernels/common/types.cuh),
-  // in its signals after the barrier's flags: [tail, head][block][peer].
-  uint32_t* const* counters_ptr_array = nullptr;
+  // Each rank's simple_write counters and its simple_read counters (COUNTERS,
+  // kernels/common/types.cuh), in its signals after the barrier's flags, a
+  // region each: [tail, head][block][peer].
+  uint32_t* const* simple_write_counters_ptr_array = nullptr;
+  uint32_t* const* simple_read_counters_ptr_array = nullptr;
   char* const* staging_ptr_array = nullptr;
   char* const* partials_ptr_array = nullptr;
   float* const* scales_ptr_array = nullptr;
   char* const* unfenced_ptr_array = nullptr;
   char* const* lamport_ptr_array = nullptr;
-  char* const* simple_ptr_array = nullptr;
+  char* const* simple_write_inbox_ptr_array = nullptr;
+  char* const* simple_read_inbox_ptr_array = nullptr;
 
   std::vector<char*> peers;
 };

@@ -315,16 +315,19 @@ ErrorCode hip_custom_communicator_all_reduce(
 
   char* const* const inbox_ptr_array =
       protocol == Protocol::lamport ? s.symmetric.lamport_ptr_array
-      : protocol == Protocol::simple_write || protocol == Protocol::simple_read
-          ? s.symmetric.simple_ptr_array
+      : protocol == Protocol::simple_write
+          ? s.symmetric.simple_write_inbox_ptr_array
+      : protocol == Protocol::simple_read
+          ? s.symmetric.simple_read_inbox_ptr_array
           : s.symmetric.unfenced_ptr_array;
-  // The connections of the buffer this protocol coordinates (CONNECTION):
-  // simple_read shares simple_write's inbox and counters, so their step.
-  const int region = protocol == Protocol::simple_read
-                         ? static_cast<int>(Protocol::simple_write)
-                         : static_cast<int>(protocol);
-  int32_t* const connections =
-      s.connections + region * s.connection_blocks * s.connection_words;
+  // This protocol's connections and counters (CONNECTION, COUNTERS).
+  int32_t* const connections = s.connections + static_cast<int>(protocol) *
+                                                   s.connection_blocks *
+                                                   s.connection_words;
+  uint32_t* const* const counters_ptr_array =
+      protocol == Protocol::simple_read
+          ? s.symmetric.simple_read_counters_ptr_array
+          : s.symmetric.simple_write_counters_ptr_array;
   const auto launch = [&]<typename T, typename W>() {
     const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
     typed<<<grid, block, shared_memory_bytes, stream>>>(
@@ -343,9 +346,9 @@ ErrorCode hip_custom_communicator_all_reduce(
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
         static_cast<int>(unfenced_size_n), connections, s.connection_words,
         int64_t{1}, static_cast<int>(s.connection_blocks),
-        static_cast<int>(s.connection_words), s.symmetric.counters_ptr_array,
-        s.world, int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world},
-        int64_t{1}, static_cast<int>(s.symmetric.max_blocks), s.world,
+        static_cast<int>(s.connection_words), counters_ptr_array, s.world,
+        int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world}, int64_t{1},
+        static_cast<int>(s.symmetric.max_blocks), s.world,
         s.symmetric.signals_ptr_array, s.world,
         s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
         int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,

@@ -152,7 +152,8 @@ enum class Protocol { simple, ll, lamport, simple_write, simple_read };
 // rank's signals (after the barrier's flags), polled where they live. A
 // block's tail[peer] is the last round peer sent it; its head[peer] the last
 // round peer read from it. A round is a tile, named by the connection's step.
-// simple_read uses the same counters, its data in the sender's staging.
+// simple_read has counters of its own, the same shape; no protocol touches
+// another's.
 enum class Counter : int { tail, head };
 
 namespace internal {
