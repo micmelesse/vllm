@@ -26,7 +26,7 @@ DINLINE void store(const INPUT& input, T* output, int output_slot,
         (output_slot < 0 || output_slot >= output_size_slot || offs_n < 0 ||
          offs_n + kElems > clip_n || clip_n > output_size_n ||
          clip_m > output_size_m))
-      __builtin_trap();
+      internal::check_failed();
     // A row past the clip is not written, as the tile walk's are not.
     if (offs_m >= clip_m) return;
     T* const at = output + int64_t{output_slot} * output_stride_slot +
@@ -76,7 +76,7 @@ DINLINE void store(const INPUT& input, T* output, int output_slot,
     using E = std::conditional_t<!QUANTIZE_INT4, U, uint8_t>;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (output_slot < 0 || output_slot >= output_size_slot))
-      __builtin_trap();
+      internal::check_failed();
     [[maybe_unused]] E* const at_copy =
         reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
     const int tid = static_cast<int>(threadIdx.x);

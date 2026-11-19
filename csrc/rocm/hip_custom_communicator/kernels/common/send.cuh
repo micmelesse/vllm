@@ -74,7 +74,7 @@ DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
       using E = std::conditional_t<!QUANTIZE_INT4, U, uint8_t>;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (output_slot < 0 || output_slot >= output_size_slot))
-        __builtin_trap();
+        internal::check_failed();
       [[maybe_unused]] E* const at_copy =
           reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
       const int tid = static_cast<int>(threadIdx.x);
@@ -340,7 +340,7 @@ DINLINE void send_simple(const INPUT& input, PTR const* output_ptr_array,
       using E = std::conditional_t<!QUANTIZE_INT4, U, uint8_t>;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (output_slot < 0 || output_slot >= output_size_slot))
-        __builtin_trap();
+        internal::check_failed();
       [[maybe_unused]] E* const at_copy =
           reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
       const int tid = static_cast<int>(threadIdx.x);
@@ -607,7 +607,7 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
   const int owner = __builtin_amdgcn_readfirstlane(output_rank);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       __builtin_amdgcn_ballot_w64(output_rank != owner) != 0)
-    __builtin_trap();
+    internal::check_failed();
   void* const output = ptr_array_at(entries, output_ptr_array_size, owner);
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
   static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
@@ -627,7 +627,7 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
   using V = vec<U, kPackElems>;
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       (output_slot < 0 || output_slot >= output_size_slot))
-    __builtin_trap();
+    internal::check_failed();
   const int tid = static_cast<int>(threadIdx.x);
   const auto row_at = [&](int i) {
     return offs_m +
@@ -690,7 +690,7 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
           row_at(i) + static_cast<int>(flags[i] % kLlBanks) * bank_rows;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (row >= output_size_m || flags[i] == 0))
-        __builtin_trap();
+        internal::check_failed();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         constexpr int kElems = kRaw ? kInt4Group / kInt4GroupPacks : kPackElems;
@@ -747,7 +747,7 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
   const int owner = __builtin_amdgcn_readfirstlane(output_rank);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       __builtin_amdgcn_ballot_w64(output_rank != owner) != 0)
-    __builtin_trap();
+    internal::check_failed();
   void* const output = ptr_array_at(entries, output_ptr_array_size, owner);
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
   static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
@@ -767,7 +767,7 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
   using V = vec<U, kPackElems>;
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       (output_slot < 0 || output_slot >= output_size_slot))
-    __builtin_trap();
+    internal::check_failed();
   const int tid = static_cast<int>(threadIdx.x);
   const auto row_at = [&](int i) {
     return offs_m +
@@ -807,7 +807,7 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
           row_at(i) + static_cast<int>(flags[i] % kLamportBanks) * bank_rows;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (row >= output_size_m || flags[i] == 0))
-        __builtin_trap();
+        internal::check_failed();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         if (col_at(k) >= clip_n / kPackElems) continue;
@@ -842,7 +842,7 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
                   Connection* connection = nullptr) {
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
       connection == nullptr)
-    __builtin_trap();
+    internal::check_failed();
   if constexpr (PROTOCOL == Protocol::simple) {
     internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(

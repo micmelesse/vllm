@@ -27,7 +27,7 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
         (input_slot < 0 || input_slot >= input_size_slot || offs_n < 0 ||
          offs_n + kElems > clip_n || clip_n > input_size_n || clip_m < 1 ||
          clip_m > input_size_m))
-      __builtin_trap();
+      internal::check_failed();
     // A row past the clip reads the last, as the tile walk's do.
     const int row = offs_m < clip_m ? offs_m : clip_m - 1;
     const T* const at = input + int64_t{input_slot} * input_stride_slot +
@@ -88,7 +88,7 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
       const int slot = kSlots ? (input_slot + c) % WORLD : input_slot;
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (slot < 0 || slot >= input_size_slot))
-        __builtin_trap();
+        internal::check_failed();
       return reinterpret_cast<E*>(input) + slot * input_stride_slot;
     };
     const int tid = static_cast<int>(threadIdx.x);
@@ -336,7 +336,7 @@ DINLINE void load(const T* input, int input_slot, int64_t input_stride_slot,
               int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} +
                       input_size_n * int64_t{sizeof(U)} >
                   (int64_t{1} << 32))
-            __builtin_trap();
+            internal::check_failed();
           const uint32_t row_bytes =
               static_cast<uint32_t>(row_of(i)) *
               static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});

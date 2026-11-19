@@ -147,12 +147,30 @@ enum class Protocol { simple, ll, lamport };
 
 namespace internal {
 
+// A checked build's failed check: it says where, from the wave's first active
+// lane, then ends the wave. A trap halts the GPU on some machines (a hang that
+// says nothing); this way the launch finishes, a peer waiting on this rank
+// gives up the same way (give_up), and the results the wave did not write
+// fail the caller's test.
+[[noreturn]] inline __device__ __attribute__((noinline)) void check_failed(
+    const char* file = __builtin_FILE(), int line = __builtin_LINE()) {
+  const uint64_t active = __builtin_amdgcn_read_exec();
+  const uint32_t lane =
+      __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
+  if (lane == static_cast<uint32_t>(__builtin_ctzll(active)))
+    printf(
+        "hip_custom_communicator check failed: %s:%d block %u thread (%u, "
+        "%u)\n",
+        file, line, blockIdx.x, threadIdx.x, threadIdx.y);
+  __builtin_amdgcn_endpgm();
+}
+
 template <typename U = void, typename T>
 DINLINE std::conditional_t<std::is_void_v<U>, T, U>* ptr_array_at(
     T* const* x_ptr_array, int x_ptr_array_size, int r) {
   r = __builtin_amdgcn_readfirstlane(r);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (r < 0 || r >= x_ptr_array_size))
-    __builtin_trap();
+    internal::check_failed();
   typedef T* Entry;
   return reinterpret_cast<std::conditional_t<std::is_void_v<U>, T, U>*>(
       ((const __attribute__((address_space(4))) Entry*)x_ptr_array)[r]);
@@ -164,7 +182,7 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(
   static_assert(WORLD >= 1, "a world has a rank");
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       (WORLD - 1 < 0 || WORLD - 1 >= x_ptr_array_size))
-    __builtin_trap();
+    internal::check_failed();
   const auto scalar = [](T* p) {
     const auto u = reinterpret_cast<uint64_t>(p);
     const uint32_t lo =
@@ -193,7 +211,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field,
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (static_cast<int64_t>(f) < 0 ||
          static_cast<int64_t>(f) >= status_size_field))
-      __builtin_trap();
+      internal::check_failed();
     return status_ptr + static_cast<int64_t>(f) * status_stride_field;
   };
   uint32_t none = static_cast<uint32_t>(FaultState::none);
@@ -222,6 +240,8 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field,
         static_cast<uint32_t>(where), rank, blockIdx.x, threadIdx.x,
         threadIdx.y, peer, count, want,
         static_cast<unsigned long long>(waited));
+  // A checked build's launch finishes (check_failed); a normal build stops.
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG) __builtin_amdgcn_endpgm();
   __builtin_trap();
 }
 

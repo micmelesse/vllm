@@ -19,7 +19,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, int rank, uint64_t timeout_ticks,
                      Until until, uint32_t parity) {
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && parity > 1) __builtin_trap();
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && parity > 1) internal::check_failed();
   const bool ordered = until == Until::launched || until == Until::visible;
   const bool first = until == Until::launched || until == Until::started;
 
@@ -41,7 +41,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
          static_cast<int64_t>(block) >= signals_size_block ||
          static_cast<int64_t>(writer) < 0 ||
          static_cast<int64_t>(writer) >= signals_size_writer))
-      __builtin_trap();
+      internal::check_failed();
     return owner_signals + parity * signals_stride_parity +
            block * signals_stride_block + writer * signals_stride_writer;
   };
@@ -50,7 +50,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
   uint32_t* mine_ptr = nullptr;
   if (threadIdx.x < WORLD) {
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && WORLD > signals_ptr_array_size)
-      __builtin_trap();
+      internal::check_failed();
 
     const uint64_t entry = ((const __attribute__((address_space(1)))
                              uint64_t*)signals_ptr_array)[threadIdx.x];
@@ -78,7 +78,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array,
       if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
           (static_cast<int64_t>(f) < 0 ||
            static_cast<int64_t>(f) >= status_size_field))
-        __builtin_trap();
+        internal::check_failed();
       return status_ptr + static_cast<int64_t>(f) * status_stride_field;
     };
     const uint64_t t0 = wall_clock64();

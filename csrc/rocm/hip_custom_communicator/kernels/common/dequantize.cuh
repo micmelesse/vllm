@@ -16,7 +16,7 @@ DINLINE void dequantize(const uint32_t (&encoded)[2], U (&output)[P]) {
       __builtin_bit_cast(__fp16, static_cast<uint16_t>(encoded[1])));
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       ((encoded[1] >> 16) != 0 || !__builtin_isfinite(scale)))
-    __builtin_trap();
+    internal::check_failed();
   static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2,
                 "fp32 terms or a 16-bit dtype");

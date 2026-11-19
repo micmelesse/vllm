@@ -94,7 +94,7 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
         const int slot = kSlots ? (input_slot + c) % WORLD : input_slot;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (slot < 0 || slot >= input_size_slot))
-          __builtin_trap();
+          internal::check_failed();
         return reinterpret_cast<E*>(input) + slot * input_stride_slot;
       };
       const int tid = static_cast<int>(threadIdx.x);
@@ -345,7 +345,7 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
                 int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} +
                         input_size_n * int64_t{sizeof(U)} >
                     (int64_t{1} << 32))
-              __builtin_trap();
+              internal::check_failed();
             const uint32_t row_bytes =
                 static_cast<uint32_t>(row_of(i)) *
                 static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
@@ -507,7 +507,7 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
         const int slot = kSlots ? (input_slot + c) % WORLD : input_slot;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (slot < 0 || slot >= input_size_slot))
-          __builtin_trap();
+          internal::check_failed();
         return reinterpret_cast<E*>(input) + slot * input_stride_slot;
       };
       const int tid = static_cast<int>(threadIdx.x);
@@ -758,7 +758,7 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
                 int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} +
                         input_size_n * int64_t{sizeof(U)} >
                     (int64_t{1} << 32))
-              __builtin_trap();
+              internal::check_failed();
             const uint32_t row_bytes =
                 static_cast<uint32_t>(row_of(i)) *
                 static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
@@ -930,7 +930,7 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
   const int owner = __builtin_amdgcn_readfirstlane(input_rank);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
-    __builtin_trap();
+    internal::check_failed();
   const void* const input =
       __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
           ? entries[0]
@@ -990,7 +990,7 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
     constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (input_slot < 0 || input_slot + kCopies > input_size_slot))
-      __builtin_trap();
+      internal::check_failed();
 
     const char* const first = reinterpret_cast<const char*>(input) +
                               int64_t{input_slot} * input_stride_slot *
@@ -1011,7 +1011,7 @@ DINLINE void recv_ll(PTR const* input_ptr_array, int input_ptr_array_size,
             row_at(i) + static_cast<int>(flags[i] % kLlBanks) * bank_rows;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (row < 0 || row >= input_size_m || flags[i] == 0))
-          __builtin_trap();
+          internal::check_failed();
         line_at[i][k] =
             static_cast<uint32_t>(row) *
                 static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)}) *
@@ -1171,7 +1171,7 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
   const int owner = __builtin_amdgcn_readfirstlane(input_rank);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
       __builtin_amdgcn_ballot_w64(input_rank != owner) != 0)
-    __builtin_trap();
+    internal::check_failed();
   const void* const input =
       __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
           ? entries[0]
@@ -1224,7 +1224,7 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
     constexpr int kHalves = sizeof(V) / 2;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (input_slot < 0 || input_slot + kCopies > input_size_slot))
-      __builtin_trap();
+      internal::check_failed();
 
     char* const first =
         const_cast<char*>(reinterpret_cast<const char*>(input)) +
@@ -1244,7 +1244,7 @@ DINLINE void recv_lamport(PTR const* input_ptr_array, int input_ptr_array_size,
             row_at(i) + static_cast<int>(flags[i] % kLamportBanks) * bank_rows;
         if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
             (row < 0 || row >= input_size_m || flags[i] == 0))
-          __builtin_trap();
+          internal::check_failed();
         at[i][k] = static_cast<uint32_t>(row) * row_bytes +
                    static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
         waits[i][k] =
@@ -1374,7 +1374,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   uint64_t timeout_ticks = 0) {
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
       connection == nullptr)
-    __builtin_trap();
+    internal::check_failed();
   if constexpr (PROTOCOL == Protocol::simple) {
     internal::recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(
