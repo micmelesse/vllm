@@ -221,20 +221,20 @@ ErrorCode hip_custom_communicator_all_reduce(
       }
       break;
     case AllReduceAlgorithm::one_shot_push:
-      // simple_write's and simple_read's inbox is the staging: a row a block,
-      // each the tile (simple_read's writer keeps its own slot in its own).
+      // simple_write's and simple_read's inbox: a row a block, each the tile
+      // (simple_read's writer keeps its own slot in its own).
       if (protocol == Protocol::simple_write ||
           protocol == Protocol::simple_read) {
-        if (grid_x * tile_m > s.connection_blocks)
-          return error_code(Error::launch_out_of_range);
-        const int64_t rows = grid_x * tile_m;
-        const int64_t row =
-            (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes / e;
-        unfenced_stride_slot = rows * row, unfenced_stride_m = row,
+        if (grid_x * tile_m > s.symmetric.lamport_blocks ||
+            (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
+                s.symmetric.unfenced_slot_bytes)
+          return error_code(Error::unfenced_too_small);
+        const int64_t blocks = s.symmetric.lamport_blocks;
+        unfenced_stride_slot = blocks * (s.symmetric.unfenced_slot_bytes / e);
+        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
         unfenced_stride_n = 1;
-        unfenced_size_slot = s.world, unfenced_size_m = rows,
-        unfenced_size_n = row;
-        staging_need = s.world * rows * row * e;
+        unfenced_size_slot = s.world, unfenced_size_m = blocks,
+        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
         break;
       }
       // LL's and Lamport's inboxes have the same rows; LL's lines are twice
@@ -316,12 +316,15 @@ ErrorCode hip_custom_communicator_all_reduce(
   char* const* const inbox_ptr_array =
       protocol == Protocol::lamport ? s.symmetric.lamport_ptr_array
       : protocol == Protocol::simple_write || protocol == Protocol::simple_read
-          ? s.symmetric.staging_ptr_array
+          ? s.symmetric.simple_ptr_array
           : s.symmetric.unfenced_ptr_array;
-  // This protocol's connections (CONNECTION).
-  int32_t* const connections = s.connections + static_cast<int>(protocol) *
-                                                   s.connection_blocks *
-                                                   s.connection_words;
+  // The connections of the buffer this protocol coordinates (CONNECTION):
+  // simple_read shares simple_write's inbox and counters, so their step.
+  const int region = protocol == Protocol::simple_read
+                         ? static_cast<int>(Protocol::simple_write)
+                         : static_cast<int>(protocol);
+  int32_t* const connections =
+      s.connections + region * s.connection_blocks * s.connection_words;
   const auto launch = [&]<typename T, typename W>() {
     const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
     typed<<<grid, block, shared_memory_bytes, stream>>>(

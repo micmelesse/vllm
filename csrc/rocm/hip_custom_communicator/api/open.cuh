@@ -146,6 +146,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
+  symmetric.simple_bytes = lamport_blocks * world * unfenced_slot_bytes;
   s->connection_blocks = lamport_blocks;
   s->connection_words = kConnectionWords;
   s->input_tables.slots = input_table_slots;
@@ -168,6 +169,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.scales, symmetric.scales_bytes, true);
   allocate(symmetric.unfenced, symmetric.unfenced_bytes, true);
   allocate(symmetric.lamport, symmetric.lamport_bytes, true);
+  allocate(symmetric.simple, symmetric.simple_bytes, true);
   made = made &&
          hipMemset(symmetric.lamport, kLamportEmpty & 0xff,
                    static_cast<size_t>(symmetric.lamport_bytes)) == hipSuccess;
@@ -182,7 +184,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         hipMemset(symmetric.staging, 0xff,
                   static_cast<size_t>(symmetric.staging_bytes)) == hipSuccess &&
         hipMemset(symmetric.partials, 0xff,
-                  static_cast<size_t>(symmetric.partials_bytes)) == hipSuccess;
+                  static_cast<size_t>(symmetric.partials_bytes)) ==
+            hipSuccess &&
+        hipMemset(symmetric.simple, 0xff,
+                  static_cast<size_t>(symmetric.simple_bytes)) == hipSuccess;
   allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.counters_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
@@ -190,14 +195,15 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.simple_ptr_array, ptr_array_bytes, false);
   allocate(s->connections,
-           5 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
+           4 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
            input_table_slots * world * int64_t{sizeof(void*)}, false);
 
-  constexpr int kRegions = 6;
+  constexpr int kRegions = 7;
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
   std::string mine(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
   char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
@@ -205,7 +211,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
                                symmetric.partials,
                                reinterpret_cast<char*>(symmetric.scales),
                                symmetric.unfenced,
-                               symmetric.lamport};
+                               symmetric.lamport,
+                               symmetric.simple};
   for (char* region : own) {
     hipIpcMemHandle_t h{};
     made = made && hipIpcGetMemHandle(&h, region) == hipSuccess;
@@ -242,7 +249,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   const void* const arrays[kRegions] = {
       symmetric.signals_ptr_array,  symmetric.staging_ptr_array,
       symmetric.partials_ptr_array, symmetric.scales_ptr_array,
-      symmetric.unfenced_ptr_array, symmetric.lamport_ptr_array};
+      symmetric.unfenced_ptr_array, symmetric.lamport_ptr_array,
+      symmetric.simple_ptr_array};
   for (int region = 0; region < kRegions && !failed; ++region) {
     std::vector<char*> addresses(world);
     for (int r = 0; r < world && !failed; ++r) {
@@ -314,7 +322,7 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
       torch::from_blob(s.connections,
-                       {5, s.connection_blocks, s.connection_words},
+                       {4, s.connection_blocks, s.connection_words},
                        on.dtype(torch::kInt32)),
   };
 }

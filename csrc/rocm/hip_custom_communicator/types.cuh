@@ -148,7 +148,8 @@ struct SymmetricMemory {
           lamport_blocks = 0;
 
   int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
-          scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0;
+          scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0,
+          simple_bytes = 0;
 
   uint32_t* signals = nullptr;
   char* staging = nullptr;
@@ -158,6 +159,9 @@ struct SymmetricMemory {
   // Lamport's inbox, LL's rows but lamport_blocks of them a bank, all data;
   // its every position is the sentinel until its data arrives.
   char* lamport = nullptr;
+  // simple_write's and simple_read's inbox, Lamport's rows but one bank: its
+  // own while the barrier-synchronized Simple stages still share staging.
+  char* simple = nullptr;
 
   uint32_t* const* signals_ptr_array = nullptr;
   // Each rank's simple_write counters (COUNTERS, kernels/common/types.cuh),
@@ -168,6 +172,7 @@ struct SymmetricMemory {
   float* const* scales_ptr_array = nullptr;
   char* const* unfenced_ptr_array = nullptr;
   char* const* lamport_ptr_array = nullptr;
+  char* const* simple_ptr_array = nullptr;
 
   std::vector<char*> peers;
 };
