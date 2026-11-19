@@ -187,6 +187,15 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field,
                             static_cast<uint32_t>(FaultState::written),
                             __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
   }
+  // A checked build says what it waited for, a line a wave, before it stops:
+  // the trap alone says only that something did.
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (threadIdx.x & 63) == 0)
+    printf(
+        "hip_custom_communicator give_up: where %u rank %d block %u thread "
+        "(%u, %u) peer %u count %u want %u waited %llu ticks\n",
+        static_cast<uint32_t>(where), rank, blockIdx.x, threadIdx.x,
+        threadIdx.y, peer, count, want,
+        static_cast<unsigned long long>(waited));
   __builtin_trap();
 }
 

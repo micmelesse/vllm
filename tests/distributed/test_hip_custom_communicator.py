@@ -110,6 +110,12 @@ def _int4_sum(xs, config):
     return summed
 
 
+def _inspect(comm):
+    """This rank's Lamport inbox and the LL and Lamport epochs, as views.
+    Module-level, so ray ships the test's body without torch.ops."""
+    return torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
+
+
 def _compare(got, want, config, where, exact=False):
     """For an INT4 config, close to the format's own answer, overall and in each
     row; otherwise equal, or close."""
@@ -187,9 +193,7 @@ def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
     def body(comm, group, device, rank):
         world = comm.arguments.world
         q = comm.arguments.quantization
-        inbox, lamport_epochs, ll_epochs = (
-            torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
-        )
+        inbox, lamport_epochs, ll_epochs = _inspect(comm)
         builds: dict[tuple, AllReduceConfig] = {}
         for c in comm.state.tuned_table.configs:
             if (

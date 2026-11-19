@@ -124,6 +124,12 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   s->max_rows = max_rows;
   s->timeout_ticks =
       static_cast<uint64_t>(timeout_seconds * s->device.clock_khz * 1000);
+  // A checked build gives up within seconds, so a hang is a crash that says
+  // where it waited, not a stall until the process is killed.
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG)
+    s->timeout_ticks = std::min<uint64_t>(
+        s->timeout_ticks,
+        static_cast<uint64_t>(5.0 * s->device.clock_khz * 1000));
   s->device.lds_bytes = lds;
   s->device.compute_units = cus;
   s->device.threads_a_cu = threads_a_cu;
