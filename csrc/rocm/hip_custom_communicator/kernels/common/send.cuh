@@ -648,7 +648,9 @@ DINLINE void send_ll(const INPUT& input, PTR const* output_ptr_array,
       __builtin_trap();
     uint32_t last =
         static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
-    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    // Left in a vector register: a readfirstlane is convergent, so a send to
+    // each rank would keep its own, the sends' stores could not share a
+    // branch, and each rank's address load would wait in its own.
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
   {
@@ -791,7 +793,9 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
       __builtin_trap();
     uint32_t last =
         static_cast<uint32_t>(steps_ptr[int64_t{step_row} * steps_stride_m]);
-    if constexpr (kThreadsM == 1) last = __builtin_amdgcn_readfirstlane(last);
+    // Left in a vector register: a readfirstlane is convergent, so a send to
+    // each rank would keep its own, the sends' stores could not share a
+    // branch, and each rank's address load would wait in its own.
     flags[i] = row_at(i) < clip_m ? (last == kLastStep ? 3u : last + 1u) : last;
   }
   {
