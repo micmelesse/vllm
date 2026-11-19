@@ -284,13 +284,16 @@ DINLINE void all_gather_tile_push(
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
     int unfenced_size_n, Connection* connection,
-    uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
-    int64_t signals_stride_parity, int64_t signals_stride_block,
-    int64_t signals_stride_writer, int signals_size_parity,
-    int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
-    int64_t status_stride_field, int status_size_field, int rank,
-    uint64_t timeout_ticks, int input_size_m, int input_size_n, int offs_m,
-    int offs_n, int clip_m, int clip_n,
+    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
+    int64_t counters_stride_kind, int64_t counters_stride_block,
+    int64_t counters_stride_peer, int counters_size_block,
+    int counters_size_peer, uint32_t* const* signals_ptr_array,
+    int signals_ptr_array_size, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
+    int rank, uint64_t timeout_ticks, int input_size_m, int input_size_n,
+    int offs_m, int offs_n, int clip_m, int clip_n,
     DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   if constexpr (PROTOCOL == Protocol::simple) {
     DTYPE mine[ROWS][PACKS][ELEMS];
@@ -327,8 +330,9 @@ DINLINE void all_gather_tile_push(
                    status_stride_field, status_size_field, rank, timeout_ticks,
                    Until::read, 1);
   } else {
-    static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport,
-                  "a tile push is simple, LL or Lamport");
+    static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
+                      PROTOCOL == Protocol::simple_write,
+                  "a tile push is simple, LL, Lamport or simple_write");
     // The block's row of the inbox (CONNECTION).
     const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
     const int lines_m = first_row + clip_m;
@@ -349,28 +353,38 @@ DINLINE void all_gather_tile_push(
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
         send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::tile>(payload, unfenced_ptr_array, unfenced_ptr_array_size,
-                           r, rank, unfenced_stride_slot, unfenced_stride_m,
-                           unfenced_stride_n, unfenced_size_slot,
-                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, connection);
+             Layout::tile>(
+            payload, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+            lines_n, first_row, 0, 1, connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
     } else {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
         send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::tile>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r,
-                           rank, unfenced_stride_slot, unfenced_stride_m,
-                           unfenced_stride_n, unfenced_size_slot,
-                           unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-                           first_row, 0, 1, connection);
+             Layout::tile>(
+            mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m,
+            lines_n, first_row, 0, 1, connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
     }
     recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-         Layout::tile>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
-                       unfenced_stride_slot, unfenced_stride_m,
-                       unfenced_stride_n, unfenced_size_slot, unfenced_size_m,
-                       unfenced_size_n, lines_m, lines_n, copies, first_row, 0,
-                       1, connection, status_ptr, status_stride_field,
-                       status_size_field, timeout_ticks);
+         Layout::tile>(
+        unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
+        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
+        copies, first_row, 0, 1, connection, counters_ptr_array,
+        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+        counters_stride_peer, counters_size_block, counters_size_peer,
+        status_ptr, status_stride_field, status_size_field, timeout_ticks);
   }
 }
 
@@ -395,12 +409,15 @@ DINLINE void all_gather(
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
     int unfenced_size_n, Connection* connection,
-    uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
-    int64_t signals_stride_parity, int64_t signals_stride_block,
-    int64_t signals_stride_writer, int signals_size_parity,
-    int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
-    int64_t status_stride_field, int status_size_field, int rank,
-    uint64_t timeout_ticks) {
+    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
+    int64_t counters_stride_kind, int64_t counters_stride_block,
+    int64_t counters_stride_peer, int counters_size_block,
+    int counters_size_peer, uint32_t* const* signals_ptr_array,
+    int signals_ptr_array_size, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
+    int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::flat_pull)
     internal::all_gather_flat_pull<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
                                    TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE,
@@ -438,10 +455,12 @@ DINLINE void all_gather(
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
         unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection,
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
-        signals_stride_block, signals_stride_writer, signals_size_parity,
-        signals_size_block, signals_size_writer, status_ptr,
-        status_stride_field, status_size_field, rank, timeout_ticks,
+        counters_ptr_array, counters_ptr_array_size, counters_stride_kind,
+        counters_stride_block, counters_stride_peer, counters_size_block,
+        counters_size_peer, signals_ptr_array, signals_ptr_array_size,
+        signals_stride_parity, signals_stride_block, signals_stride_writer,
+        signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
         input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 

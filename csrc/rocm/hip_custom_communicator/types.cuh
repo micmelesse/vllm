@@ -160,6 +160,9 @@ struct SymmetricMemory {
   char* lamport = nullptr;
 
   uint32_t* const* signals_ptr_array = nullptr;
+  // Each rank's simple_write counters (COUNTERS, kernels/common/types.cuh),
+  // in its signals after the barrier's flags: [tail, head][block][peer].
+  uint32_t* const* counters_ptr_array = nullptr;
   char* const* staging_ptr_array = nullptr;
   char* const* partials_ptr_array = nullptr;
   float* const* scales_ptr_array = nullptr;

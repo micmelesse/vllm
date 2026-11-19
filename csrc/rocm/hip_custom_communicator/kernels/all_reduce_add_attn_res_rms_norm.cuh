@@ -192,7 +192,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot_pull(
           entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
           QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
           0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+          nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, rank, 0);
       DTYPE sum[TILE_M][kPacks][kPackElems];
 #pragma unroll
       for (int i = 0; i < TILE_M; ++i)
@@ -303,7 +304,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_rows(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+          nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, rank, 0);
 
       if constexpr (CHUNKED)
         store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
@@ -395,7 +397,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_pull_columns(
           partials_ptr_array, partials_ptr_array_size, partials_stride_m,
           partials_stride_n, partials_size_m, partials_size_n, sum, 0, 0, m, n,
           row, c, 0, 0, slice, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
+          nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+          nullptr, 0, 0, rank, 0);
 
       if constexpr (CHUNKED)
         store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(

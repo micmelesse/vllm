@@ -68,6 +68,8 @@ ErrorCode hip_custom_communicator_all_reduce(
     protocol = Protocol::ll;
   else if (protocol_name == "lamport")
     protocol = Protocol::lamport;
+  else if (protocol_name == "simple_write")
+    protocol = Protocol::simple_write;
   else
     return error_code(Error::no_such_protocol);
   if (quantization_name != "exact" && quantization_name != "int4")
@@ -217,6 +219,20 @@ ErrorCode hip_custom_communicator_all_reduce(
       }
       break;
     case AllReduceAlgorithm::one_shot_push:
+      // simple_write's inbox is the staging: a row a block, each the tile.
+      if (protocol == Protocol::simple_write) {
+        if (grid_x * tile_m > s.connection_blocks)
+          return error_code(Error::launch_out_of_range);
+        const int64_t rows = grid_x * tile_m;
+        const int64_t row =
+            (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes / e;
+        unfenced_stride_slot = rows * row, unfenced_stride_m = row,
+        unfenced_stride_n = 1;
+        unfenced_size_slot = s.world, unfenced_size_m = rows,
+        unfenced_size_n = row;
+        staging_need = s.world * rows * row * e;
+        break;
+      }
       // LL's and Lamport's inboxes have the same rows; LL's lines are twice
       // as wide, half data.
       if (protocol != Protocol::simple) {
@@ -293,8 +309,9 @@ ErrorCode hip_custom_communicator_all_reduce(
     peer_inputs_size = s.world, peer_inputs_stride_n = 1;
   }
 
-  char* const* const inbox_ptr_array = protocol == Protocol::lamport
-                                           ? s.symmetric.lamport_ptr_array
+  char* const* const inbox_ptr_array =
+      protocol == Protocol::lamport        ? s.symmetric.lamport_ptr_array
+      : protocol == Protocol::simple_write ? s.symmetric.staging_ptr_array
                                            : s.symmetric.unfenced_ptr_array;
   // This protocol's connections (CONNECTION).
   int32_t* const connections = s.connections + static_cast<int>(protocol) *
@@ -318,8 +335,11 @@ ErrorCode hip_custom_communicator_all_reduce(
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
         static_cast<int>(unfenced_size_n), connections, s.connection_words,
         int64_t{1}, static_cast<int>(s.connection_blocks),
-        static_cast<int>(s.connection_words), s.symmetric.signals_ptr_array,
-        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        static_cast<int>(s.connection_words), s.symmetric.counters_ptr_array,
+        s.world, int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world},
+        int64_t{1}, static_cast<int>(s.symmetric.max_blocks), s.world,
+        s.symmetric.signals_ptr_array, s.world,
+        s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
         int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
         int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
   };

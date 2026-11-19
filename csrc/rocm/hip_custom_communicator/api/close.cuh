@@ -34,6 +34,7 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
         static_cast<const void*>(s->symmetric.unfenced),
         static_cast<const void*>(s->symmetric.lamport),
         static_cast<const void*>(s->symmetric.signals_ptr_array),
+        static_cast<const void*>(s->symmetric.counters_ptr_array),
         static_cast<const void*>(s->symmetric.staging_ptr_array),
         static_cast<const void*>(s->symmetric.partials_ptr_array),
         static_cast<const void*>(s->symmetric.scales_ptr_array),

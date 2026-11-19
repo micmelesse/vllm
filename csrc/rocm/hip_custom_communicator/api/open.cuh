@@ -94,8 +94,9 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   staging_bytes = whole(staging_bytes);
 
   const int64_t max_blocks = int64_t{cus} * (threads_a_cu / wave);
+  // The barrier's flags, then simple_write's counters, the same shape.
   const int64_t signals_bytes =
-      2 * max_blocks * world * int64_t{sizeof(uint32_t)};
+      2 * 2 * max_blocks * world * int64_t{sizeof(uint32_t)};
 
   const int64_t unfenced_blocks = 128, unfenced_slot_bytes = 2048;
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
@@ -183,13 +184,14 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         hipMemset(symmetric.partials, 0xff,
                   static_cast<size_t>(symmetric.partials_bytes)) == hipSuccess;
   allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
+  allocate(symmetric.counters_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.partials_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
   allocate(s->connections,
-           3 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
+           4 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
@@ -265,6 +267,16 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         hipMemcpy(const_cast<void*>(arrays[region]), addresses.data(),
                   world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
       failed = Error::hip_failed;
+    if (!failed && region == 0) {
+      std::vector<uint32_t*> counters(world);
+      for (int r = 0; r < world; ++r)
+        counters[r] =
+            reinterpret_cast<uint32_t*>(addresses[r]) + 2 * max_blocks * world;
+      if (hipMemcpy(const_cast<uint32_t**>(symmetric.counters_ptr_array),
+                    counters.data(), world * sizeof(uint32_t*),
+                    hipMemcpyHostToDevice) != hipSuccess)
+        failed = Error::hip_failed;
+    }
     if (!failed && region == 1 &&
         hipMemcpy(s->input_tables.device, addresses.data(),
                   world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
@@ -302,7 +314,7 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
       torch::from_blob(s.connections,
-                       {3, s.connection_blocks, s.connection_words},
+                       {4, s.connection_blocks, s.connection_words},
                        on.dtype(torch::kInt32)),
   };
 }

@@ -182,10 +182,10 @@ def test_all_reduce_correctness(monkeypatch, tp_size, quantization):
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("quantization", QUANTIZATIONS)
 def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
-    """Every one-shot push the table builds on LL and Lamport, picked or not
-    (rows of threads too), at a grid where a block pushes several tiles and one
-    where it pushes one: right, the same bits as every other build at the shape,
-    and after each call the state LL and Lamport keep from launch to launch as
+    """Every one-shot push the table builds on LL, Lamport and simple_write,
+    picked or not (rows of threads too), at a grid where a block pushes several
+    tiles and one where it pushes one: right, the same bits as every other build
+    at the shape, and after each call the state kept from launch to launch as
     every launch must leave it: this rank's Lamport inbox all the sentinel
     (whatever was written was read and re-armed), the connections equal on
     every rank."""
@@ -199,7 +199,7 @@ def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
             if (
                 c.kernel == "all_reduce"
                 and c.algorithm == "one_shot_push"
-                and c.protocol in ("ll", "lamport")
+                and c.protocol in ("ll", "lamport", "simple_write")
                 and c.quantization == q
             ):
                 builds.setdefault(

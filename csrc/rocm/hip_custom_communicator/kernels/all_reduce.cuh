@@ -94,8 +94,8 @@ DINLINE void all_reduce_one_shot_pull(
         QUANTIZE_INT4 ? int64_t{input_size_n} : input_ptr_array_stride_m,
         QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, input_size_m,
         input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, 0, clip_n, 0, nullptr,
-        0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0,
-        nullptr, 0, 0, rank, 0);
+        0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
+        nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
     for (int i = 0; i < kRows; ++i)
@@ -161,7 +161,7 @@ DINLINE void all_reduce_two_shot_pull(
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,
       output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
       0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0,
-      0, 0, 0, nullptr, 0, 0, rank, 0);
+      0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
@@ -178,12 +178,15 @@ DINLINE void all_reduce_one_shot_push(
     int unfenced_size_n, int32_t* connection_ptr,
     int64_t connection_stride_block, int64_t connection_stride_word,
     int connection_size_block, int connection_size_word,
-    uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
-    int64_t signals_stride_parity, int64_t signals_stride_block,
-    int64_t signals_stride_writer, int signals_size_parity,
-    int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
-    int64_t status_stride_field, int status_size_field, int rank,
-    uint64_t timeout_ticks) {
+    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
+    int64_t counters_stride_kind, int64_t counters_stride_block,
+    int64_t counters_stride_peer, int counters_size_block,
+    int counters_size_peer, uint32_t* const* signals_ptr_array,
+    int signals_ptr_array_size, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
+    int rank, uint64_t timeout_ticks) {
   constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
   constexpr int kThreadsN = BLOCK_X / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
@@ -221,11 +224,13 @@ DINLINE void all_reduce_one_shot_push(
         staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
         unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
         unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        &connection, signals_ptr_array, signals_ptr_array_size,
-        signals_stride_parity, signals_stride_block, signals_stride_writer,
-        signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, rank,
-        timeout_ticks);
+        &connection, counters_ptr_array, counters_ptr_array_size,
+        counters_stride_kind, counters_stride_block, counters_stride_peer,
+        counters_size_block, counters_size_peer, signals_ptr_array,
+        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks);
 
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
@@ -289,7 +294,7 @@ DINLINE void all_reduce_two_shot_push(
       partials_stride_n, partials_size_m, partials_size_n, output_ptr,
       output_stride_m, output_stride_n, input_size_m, input_size_n, 0, 0, 0, 0,
       0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr, 0, 0, 0, 0,
-      0, 0, 0, nullptr, 0, 0, rank, 0);
+      0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, rank, 0);
 }
 
 template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
@@ -314,6 +319,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
     int unfenced_size_n, int32_t* __restrict__ connection_ptr,
     int64_t connection_stride_block, int64_t connection_stride_word,
     int connection_size_block, int connection_size_word,
+    uint32_t* const* __restrict__ counters_ptr_array,
+    int counters_ptr_array_size, int64_t counters_stride_kind,
+    int64_t counters_stride_block, int64_t counters_stride_peer,
+    int counters_size_block, int counters_size_peer,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
     int64_t signals_stride_parity, int64_t signals_stride_block,
     int64_t signals_stride_writer, int signals_size_parity,
@@ -357,11 +366,13 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
         unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection_ptr,
         connection_stride_block, connection_stride_word, connection_size_block,
-        connection_size_word, signals_ptr_array, signals_ptr_array_size,
-        signals_stride_parity, signals_stride_block, signals_stride_writer,
-        signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, rank,
-        timeout_ticks);
+        connection_size_word, counters_ptr_array, counters_ptr_array_size,
+        counters_stride_kind, counters_stride_block, counters_stride_peer,
+        counters_size_block, counters_size_peer, signals_ptr_array,
+        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_push)
     all_reduce_two_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                              TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,

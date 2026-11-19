@@ -724,8 +724,11 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
         static_cast<int>(unfenced_size_n), connections, s.connection_words,
         int64_t{1}, static_cast<int>(s.connection_blocks),
-        static_cast<int>(s.connection_words), s.symmetric.signals_ptr_array,
-        s.world, s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+        static_cast<int>(s.connection_words), s.symmetric.counters_ptr_array,
+        s.world, int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world},
+        int64_t{1}, static_cast<int>(s.symmetric.max_blocks), s.world,
+        s.symmetric.signals_ptr_array, s.world,
+        s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
         int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
         int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
   };

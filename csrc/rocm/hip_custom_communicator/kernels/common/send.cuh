@@ -828,18 +828,142 @@ DINLINE void send_lamport(const INPUT& input, PTR const* output_ptr_array,
   }
 }
 
+// A simple_write send: once the receiver has read the last round (head), the
+// data into its staging, then the round posted (tail, COUNTERS).
+template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
+          bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename INPUT,
+          typename PTR>
+DINLINE void send_simple_write(
+    const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
+    int output_rank, int output_slot, int64_t output_stride_slot,
+    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
+    int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
+    int offs_n, int row_step, Connection& connection,
+    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
+    int64_t counters_stride_kind, int64_t counters_stride_block,
+    int64_t counters_stride_peer, int counters_size_block,
+    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
+    int status_size_field, uint64_t timeout_ticks) {
+  static_assert(
+      LAYOUT == Layout::tile && !QUANTIZE_INT4 && TILE_M == 1 && BLOCK_Y == 1,
+      "a simple_write send is an exact tile of one row, from one "
+      "row of threads");
+  static_assert(BLOCK_X % WAVE_SIZE == 0, "a block is whole waves");
+  const auto* const entries =
+      (decltype(+output_ptr_array[0]) const*)output_ptr_array;
+  const int owner = __builtin_amdgcn_readfirstlane(output_rank);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      __builtin_amdgcn_ballot_w64(output_rank != owner) != 0)
+    internal::check_failed();
+  void* const output = ptr_array_at(entries, output_ptr_array_size, owner);
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE,
+                "the compiler's wave is not the one handed");
+#endif
+  constexpr int kRows = std::extent_v<INPUT, 0>;
+  constexpr int kPacks = std::extent_v<INPUT, 1>;
+  constexpr int kPackElems = std::extent_v<INPUT, 2>;
+  using U = std::remove_all_extents_t<INPUT>;
+  constexpr int kThreadsM = TILE_M / kRows;
+  constexpr int kThreadsN = BLOCK_X / kThreadsM;
+  static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
+  static_assert(kThreadsM * kThreadsN == BLOCK_X, "the layout is the block");
+  using V = vec<U, kPackElems>;
+  using W = raw_t<sizeof(V)>;
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      (output_slot < 0 || output_slot >= output_size_slot))
+    internal::check_failed();
+  const int tid = static_cast<int>(threadIdx.x);
+  const auto row_at = [&](int i) {
+    return offs_m +
+           (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
+  };
+  const auto col_at = [&](int k) {
+    return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
+  };
+  // The round: the next after the block's last (CONNECTION).
+  const uint32_t last = static_cast<uint32_t>(connection[0][0][0]);
+  const uint32_t next = last == kLastStep ? 3u : last + 1u;
+  const auto counter = [&](int at, Counter kind, int peer) {
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (static_cast<int>(blockIdx.x) >= counters_size_block || peer < 0 ||
+         peer >= counters_size_peer))
+      internal::check_failed();
+    return ptr_array_at(counters_ptr_array, counters_ptr_array_size, at) +
+           static_cast<int64_t>(kind) * counters_stride_kind +
+           int64_t{blockIdx.x} * counters_stride_block +
+           int64_t{peer} * counters_stride_peer;
+  };
+  // Each wave waits until the receiver has read the last round (its head
+  // here, in this rank's counters).
+  uint32_t* const head = counter(output_slot, Counter::head, owner);
+  const uint64_t t0 = wall_clock64();
+  for (uint32_t n = 1;; ++n) {
+    const uint32_t seen =
+        __scoped_atomic_load_n(head, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    if (__builtin_amdgcn_ballot_w64(seen != last) == 0) break;
+    if ((n & 255u) != 0) continue;
+    const uint64_t waited = wall_clock64() - t0;
+    const bool aborted =
+        __scoped_atomic_load_n(
+            status_ptr +
+                static_cast<int64_t>(StatusField::abort) * status_stride_field,
+            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+    if (__builtin_amdgcn_ballot_w64(aborted) == 0 && waited <= timeout_ticks)
+      continue;
+    if (!aborted)
+      give_up(status_ptr, status_stride_field, status_size_field, Where::start,
+              output_slot, static_cast<uint32_t>(owner), seen, last, waited);
+    __builtin_amdgcn_endpgm();
+  }
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  char* const slot = reinterpret_cast<char*>(output) + int64_t{output_slot} *
+                                                           output_stride_slot *
+                                                           int64_t{sizeof(U)};
+  const uint32_t row_bytes =
+      static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) {
+    if (!(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m) continue;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && row_at(i) >= output_size_m)
+      internal::check_failed();
+#pragma unroll
+    for (int k = 0; k < kPacks; ++k) {
+      if (col_at(k) >= clip_n / kPackElems) continue;
+      W w;
+      __builtin_memcpy(&w, input[i][k], sizeof(w));
+      uint32_t at = static_cast<uint32_t>(row_at(i)) * row_bytes +
+                    static_cast<uint32_t>(col_at(k)) * uint32_t{sizeof(V)};
+      asm volatile("" : "+v"(at));
+      *(__attribute__((address_space(1))) W*)(slot + at) = w;
+    }
+  }
+  // The block's stores, then the round posted (the receiver's tail from this
+  // rank), as barrier orders them.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  if constexpr (BLOCK_X > WAVE_SIZE) __syncthreads();
+  if (threadIdx.x == 0)
+    __scoped_atomic_store_n(counter(owner, Counter::tail, output_slot), next,
+                            __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+}
+
 }  // namespace internal
 
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
           bool TAIL = false, typename INPUT, typename PTR>
-DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
-                  int output_ptr_array_size, int output_rank, int output_slot,
-                  int64_t output_stride_slot, int64_t output_stride_m,
-                  int64_t output_stride_n, int output_size_slot,
-                  int output_size_m, int output_size_n, int clip_m, int clip_n,
-                  int offs_m, int offs_n, int row_step,
-                  Connection* connection = nullptr) {
+DINLINE void send(
+    const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
+    int output_rank, int output_slot, int64_t output_stride_slot,
+    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
+    int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
+    int offs_n, int row_step, Connection* connection = nullptr,
+    uint32_t* const* counters_ptr_array = nullptr,
+    int counters_ptr_array_size = 0, int64_t counters_stride_kind = 0,
+    int64_t counters_stride_block = 0, int64_t counters_stride_peer = 0,
+    int counters_size_block = 0, int counters_size_peer = 0,
+    uint32_t* status_ptr = nullptr, int64_t status_stride_field = 0,
+    int status_size_field = 0, uint64_t timeout_ticks = 0) {
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
       connection == nullptr)
     internal::check_failed();
@@ -857,6 +981,16 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array,
         output_slot, output_stride_slot, output_stride_m, output_stride_n,
         output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
         offs_n, row_step, *connection);
+  } else if constexpr (PROTOCOL == Protocol::simple_write) {
+    internal::send_simple_write<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                                QUANTIZE_INT4, LAYOUT, TAIL>(
+        input, output_ptr_array, output_ptr_array_size, output_rank,
+        output_slot, output_stride_slot, output_stride_m, output_stride_n,
+        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m,
+        offs_n, row_step, *connection, counters_ptr_array,
+        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+        counters_stride_peer, counters_size_block, counters_size_peer,
+        status_ptr, status_stride_field, status_size_field, timeout_ticks);
   } else {
     internal::send_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
