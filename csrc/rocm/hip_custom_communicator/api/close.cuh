@@ -36,7 +36,7 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
         static_cast<const void*>(s->symmetric.lamport_ptr_array),
         static_cast<const void*>(s->symmetric.simple_write_inbox_ptr_array),
         static_cast<const void*>(s->symmetric.simple_read_inbox_ptr_array),
-        static_cast<const void*>(s->connections),
+        static_cast<const void*>(s->steps),
         static_cast<const void*>(s->status_device)})
     if (p != nullptr && hipFree(const_cast<void*>(p)) != hipSuccess) {
       (void)hipGetLastError();

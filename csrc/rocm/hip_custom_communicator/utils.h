@@ -46,7 +46,7 @@ inline std::optional<std::vector<std::string>> all_gathered(
 // A launch's protocol buffers (ProtocolBuffers, kernels/common/types.cuh): the
 // protocol's inbox laid out for a message of `rows` rows of `row_elems`
 // elements of `elem_bytes` each (a block's rows are its own), its counters and
-// its connections; none when the inbox cannot hold the message. Each protocol
+// its steps; none when the inbox cannot hold the message. Each protocol
 // has one layout. LL's and Lamport's are fixed lines, a row a block, so a row
 // keeps its place from launch to launch (their arrival signal is in the
 // data); the Simple protocols' are packed, a slot a writer, a row a block.
@@ -81,7 +81,7 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
     size_m = banks * blocks, size_n = m.unfenced_slot_bytes / e;
   } else {
     if (s.world * rows * row_elems * e > m.inbox_bytes ||
-        rows > s.connection_blocks || rows > m.max_blocks)
+        rows > s.step_blocks || rows > m.max_blocks)
       return std::nullopt;
     stride_slot = rows * row_elems, stride_m = row_elems;
     size_m = rows, size_n = row_elems;
@@ -94,9 +94,8 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
   uint32_t* const* const counters_ptr_array =
       protocol == Protocol::simple_read ? m.simple_read_counters_ptr_array
                                         : m.simple_write_counters_ptr_array;
-  int32_t* const connections = s.connections + static_cast<int>(protocol) *
-                                                   s.connection_blocks *
-                                                   s.connection_words;
+  uint32_t* const steps =
+      s.steps + static_cast<int>(protocol) * s.step_blocks * s.step_waves;
   return ProtocolBuffers{inbox_ptr_array,
                          s.world,
                          stride_slot,
@@ -112,11 +111,11 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
                          int64_t{1},
                          static_cast<int>(m.max_blocks),
                          s.world,
-                         connections,
-                         s.connection_words,
+                         steps,
+                         s.step_waves,
                          int64_t{1},
-                         static_cast<int>(s.connection_blocks),
-                         static_cast<int>(s.connection_words),
+                         static_cast<int>(s.step_blocks),
+                         static_cast<int>(s.step_waves),
                          s.status_device,
                          int64_t{1},
                          kStatusFields,

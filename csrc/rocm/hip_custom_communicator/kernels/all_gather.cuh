@@ -36,8 +36,8 @@ namespace internal {
 //   simple_write, simple_read: the Simple protocols' head and tail a block and
 //     peer (COUNTERS, common/types.cuh).
 //   ll, lamport: the data is its own signal, sent into the inbox rows the
-//     block owns; send and recv keep the step in the block's connection
-//     (CONNECTION, common/types.cuh) and pick the bank from it. LL's lines are
+//     block owns; send and recv read the block's step from the protocol's
+//     steps (STEPS, common/types.cuh) and pick the bank from it. LL's lines are
 //     half data, half the step, and a reader polls each until it carries the
 //     step. Lamport's are all data, and a reader polls each until no element is
 //     the sentinel, then writes the sentinel back.
@@ -46,10 +46,9 @@ template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
                              int64_t input_stride_n,
-                             const ProtocolBuffers& protocol_buffers,
-                             Connection* connection, int rank, int input_size_m,
-                             int input_size_n, int offs_m, int offs_n,
-                             int clip_m, int clip_n,
+                             const ProtocolBuffers& protocol_buffers, int rank,
+                             int input_size_m, int input_size_n, int offs_m,
+                             int offs_n, int clip_m, int clip_n,
                              DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
                     PROTOCOL == Protocol::simple_write ||
@@ -74,15 +73,15 @@ DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
                  reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
          Layout::tile>(payload, protocol_buffers, 0, WORLD, rank, lines_m,
-                       lines_n, first_row, 0, 1, connection);
+                       lines_n, first_row, 0, 1);
   } else {
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
          Layout::tile>(mine, protocol_buffers, 0, WORLD, rank, lines_m, lines_n,
-                       first_row, 0, 1, connection);
+                       first_row, 0, 1);
   }
   recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
        Layout::tile>(protocol_buffers, rank, 0, lines_m, lines_n, copies,
-                     first_row, 0, 1, connection);
+                     first_row, 0, 1);
 }
 
 }  // namespace internal
@@ -100,14 +99,12 @@ DINLINE void all_gather(INPUT&& input, int64_t input_stride_m,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int clip_m, int clip_n, int slice,
-                        const ProtocolBuffers& protocol_buffers,
-                        Connection* connection, int rank) {
+                        const ProtocolBuffers& protocol_buffers, int rank) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
     internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                               TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
-        input, input_stride_m, input_stride_n, protocol_buffers, connection,
-        rank, input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n,
-        output);
+        input, input_stride_m, input_stride_n, protocol_buffers, rank,
+        input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 
 }  // namespace hip_custom_communicator

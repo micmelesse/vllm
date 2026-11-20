@@ -121,7 +121,7 @@ struct SymmetricMemory {
   // its every position is the sentinel until its data arrives.
   char* lamport = nullptr;
   // simple_write's inbox and simple_read's, each Lamport's rows in one bank.
-  // A protocol owns its buffers, counters and connections and touches no
+  // A protocol owns its buffers, counters and steps and touches no
   // other protocol's, so any order of calls across protocols is safe.
   char* simple_write_inbox = nullptr;
   char* simple_read_inbox = nullptr;
@@ -159,11 +159,11 @@ struct CommsState {
   DeviceProperties device;
   SymmetricMemory symmetric;
 
-  // The blocks' connections (CONNECTION, kernels/common/types.cuh): a region a
+  // The protocols' steps (STEPS, kernels/common/types.cuh): a region a
   // protocol, at its Protocol value (LL, Lamport, simple_write, simple_read),
-  // connection_blocks blocks of connection_words words each.
-  int32_t* connections = nullptr;
-  int64_t connection_blocks = 0, connection_words = 0;
+  // step_blocks blocks of step_waves waves each.
+  uint32_t* steps = nullptr;
+  int64_t step_blocks = 0, step_waves = 0;
   uint32_t* status_device = nullptr;
 };
 

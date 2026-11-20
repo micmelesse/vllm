@@ -1234,8 +1234,8 @@ template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL = false, typename INPUT>
 DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
                   int output_rank, int output_rank_count, int output_slot,
-                  int clip_m, int clip_n, int offs_m, int offs_n, int row_step,
-                  Connection* connection) {
+                  int clip_m, int clip_n, int offs_m, int offs_n,
+                  int row_step) {
   // The protocol's values, as the leaves take them.
   char* const* const output_ptr_array = protocol_buffers.inbox_ptr_array;
   const int output_ptr_array_size = protocol_buffers.inbox_ptr_array_size;
@@ -1262,8 +1262,21 @@ DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
   const int64_t status_stride_field = protocol_buffers.status_stride_field;
   const int status_size_field = protocol_buffers.status_size_field;
   const uint64_t timeout_ticks = protocol_buffers.timeout_ticks;
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && connection == nullptr)
+  // This wave's step (STEPS), as the leaves take it.
+  const int wave = __builtin_amdgcn_readfirstlane(
+      static_cast<int>(threadIdx.y * BLOCK_X + threadIdx.x) / WAVE_SIZE);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      (static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block ||
+       wave >= protocol_buffers.steps_size_wave))
     internal::check_failed();
+  uint32_t* const step_at =
+      protocol_buffers.steps_ptr +
+      int64_t{blockIdx.x} * protocol_buffers.steps_stride_block +
+      int64_t{wave} * protocol_buffers.steps_stride_wave;
+  Connection step{};
+  step[0][0][0] = static_cast<int32_t>(
+      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+  Connection* const connection = &step;
   // simple_read waits on and posts to every receiver at once: the leaf takes
   // the set.
   if constexpr (PROTOCOL == Protocol::simple_read) {

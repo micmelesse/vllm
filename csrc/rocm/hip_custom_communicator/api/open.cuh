@@ -114,8 +114,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
   symmetric.inbox_bytes = lamport_blocks * world * unfenced_slot_bytes;
-  s->connection_blocks = lamport_blocks;
-  s->connection_words = kConnectionWords;
+  s->step_blocks = lamport_blocks;
+  s->step_waves = kStepWaves;
 
   bool made = true;
   const auto allocate = [&](auto*& buffer, int64_t bytes, bool exchanged) {
@@ -140,7 +140,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   // A checked build fills the Simple protocols' inboxes with 0xff, a NaN in
   // bf16 and fp16 and in an INT4 group's scale, where zeros would read as
   // finite data: a read of what no rank wrote fails a check or a test on its
-  // first call. The signals, the connections and the other inboxes keep the
+  // first call. The signals, the steps and the other inboxes keep the
   // start their protocols need.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG)
     made =
@@ -156,9 +156,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_write_inbox_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_read_inbox_ptr_array, ptr_array_bytes, false);
-  allocate(s->connections,
-           4 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
-           false);
+  allocate(s->steps,
+           4 * lamport_blocks * kStepWaves * int64_t{sizeof(uint32_t)}, false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
 
   constexpr int kRegions = 5;
@@ -263,10 +262,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   return {std::nullopt, reinterpret_cast<int64_t>(s), s->device.arch};
 }
 
-// For the tests: views of the state LL and Lamport keep from launch to launch,
-// this rank's Lamport inbox (bytes) and the connections ([protocol][block]
-// [word], CONNECTION), so a test can check what every launch must leave: the
-// inbox all the sentinel, the connections equal on every rank. No copy; the
+// For the tests: views of the state the protocols keep from launch to launch,
+// this rank's Lamport inbox (bytes) and the steps ([protocol][block][wave],
+// STEPS), so a test can check what every launch must leave: the inbox all the
+// sentinel, the steps equal on every rank. No copy; the
 // views live as long as the communicator.
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   using namespace hip_custom_communicator;
@@ -277,8 +276,7 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   return {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
-      torch::from_blob(s.connections,
-                       {4, s.connection_blocks, s.connection_words},
+      torch::from_blob(s.steps, {4, s.step_blocks, s.step_waves},
                        on.dtype(torch::kInt32)),
   };
 }

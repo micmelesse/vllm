@@ -1784,8 +1784,7 @@ template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL = false, typename OUTPUT>
 DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
                   int input_slot, int clip_m, int clip_n, OUTPUT& output,
-                  int offs_m, int offs_n, int row_step,
-                  Connection* connection) {
+                  int offs_m, int offs_n, int row_step) {
   // The protocol's values, as the leaves take them.
   char* const* const input_ptr_array = protocol_buffers.inbox_ptr_array;
   const int input_ptr_array_size = protocol_buffers.inbox_ptr_array_size;
@@ -1812,8 +1811,21 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   const int64_t status_stride_field = protocol_buffers.status_stride_field;
   const int status_size_field = protocol_buffers.status_size_field;
   const uint64_t timeout_ticks = protocol_buffers.timeout_ticks;
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && connection == nullptr)
+  // This wave's step (STEPS), as the leaves take it.
+  const int wave = __builtin_amdgcn_readfirstlane(
+      static_cast<int>(threadIdx.y * BLOCK_X + threadIdx.x) / WAVE_SIZE);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+      (static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block ||
+       wave >= protocol_buffers.steps_size_wave))
     internal::check_failed();
+  uint32_t* const step_at =
+      protocol_buffers.steps_ptr +
+      int64_t{blockIdx.x} * protocol_buffers.steps_stride_block +
+      int64_t{wave} * protocol_buffers.steps_stride_wave;
+  Connection step{};
+  step[0][0][0] = static_cast<int32_t>(
+      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+  Connection* const connection = &step;
   if constexpr (PROTOCOL == Protocol::ll) {
     internal::recv_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                       LAYOUT, TAIL>(
@@ -1851,6 +1863,8 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
         row_step, *connection, status_ptr, status_stride_field,
         status_size_field, timeout_ticks);
   }
+  __scoped_atomic_store_n(step_at, static_cast<uint32_t>(step[0][0][0]),
+                          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
 }
 
 }  // namespace hip_custom_communicator

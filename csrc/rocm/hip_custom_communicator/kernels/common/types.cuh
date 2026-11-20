@@ -40,25 +40,23 @@ using raw_t = std::conditional_t<
 // data never carries it.
 constexpr uint16_t kLamportEmpty = 0xffff;
 
-// CONNECTION (NCCL's word for what a send and a recv coordinate through): a
-// block's few words of state for the peer buffer it talks through, a register
-// array. The stage loads it before its first tile and stores it after its
-// last; send and recv read and advance it, and each protocol decides what the
-// words are. Every wave keeps its own copy and every copy advances the same
-// way, and the next read is the next launch's, so no wave waits for another
-// to save it. Each peer buffer has its own connections (the LL inbox's, the
-// Lamport inbox's, Simple's staging), a block's at its block index.
-// LL and Lamport: word 0 is the step of the block's inbox row (a tile is one
-// row). A tile's step is the next after the last (0 is none): LL writes it in
-// every line and waits for it, Lamport takes its bank from it. LL alternates
-// two banks; Lamport three, so a bank it re-armed is written again only after
-// this rank's sends two tiles later, and the next tile's recv polls before
-// those: a poll that returns has the wave's earlier stores, the re-arm, behind
-// it (recv_lamport), so nothing waits for the re-arm.
-// The wrap skips 0 and keeps consecutive steps in different banks of two and of
-// three (0xfffffffe, then 3).
+// STEPS: a block's step names its rounds, a round a tile: the next after the
+// last (0 is none). LL writes it in every line and waits for it; Lamport takes
+// its bank from it; the Simple protocols post it to their counters. It is the
+// protocol's memory, a slot a block and wave in the protocol's steps (every
+// wave keeps its own and every one advances the same way, so no wave waits
+// for another), kept between calls and launches: send reads its slot, recv
+// reads it, advances it and writes it back. A leaf takes the step as a
+// Connection, its first word.
+// LL alternates two banks; Lamport three, so a bank it re-armed is written
+// again only after this rank's sends two tiles later, and the next tile's recv
+// polls before those: a poll that returns has the wave's earlier stores, the
+// re-arm, behind it (recv_lamport), so nothing waits for the re-arm. The wrap
+// skips 0 and keeps consecutive steps in different banks of two and of three
+// (0xfffffffe, then 3).
 constexpr int kConnectionWords = 4;
 using Connection = int32_t[1][1][kConnectionWords];
+constexpr int kStepWaves = 16;
 constexpr int kLlBanks = 2;
 constexpr int kLamportBanks = 3;
 constexpr uint32_t kLastStep = 0xfffffffeu;
@@ -156,10 +154,9 @@ enum class Protocol { ll, lamport, simple_write, simple_read };
 enum class Counter : int { tail, head };
 
 // A launch's protocol buffers, read-only: the protocol's inbox (every rank's
-// address, and its layout), its counters, where its blocks' connections are
-// kept, and the status record and wait limit a send or recv waits by. The
-// host lays it out and passes it as one kernel argument; stages hand it to
-// send and recv unread. The step itself is the Connection.
+// address, and its layout), its counters, its steps (STEPS), and the status
+// record and wait limit a send or recv waits by. The host lays it out and
+// passes it as one kernel argument; stages hand it to send and recv unread.
 struct ProtocolBuffers {
   char* const* inbox_ptr_array;
   int inbox_ptr_array_size;
@@ -169,9 +166,9 @@ struct ProtocolBuffers {
   int counters_ptr_array_size;
   int64_t counters_stride_kind, counters_stride_block, counters_stride_peer;
   int counters_size_block, counters_size_peer;
-  int32_t* connection_ptr;
-  int64_t connection_stride_block, connection_stride_word;
-  int connection_size_block, connection_size_word;
+  uint32_t* steps_ptr;
+  int64_t steps_stride_block, steps_stride_wave;
+  int steps_size_block, steps_size_wave;
   uint32_t* status_ptr;
   int64_t status_stride_field;
   int status_size_field;
