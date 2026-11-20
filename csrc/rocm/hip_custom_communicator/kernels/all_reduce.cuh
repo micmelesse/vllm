@@ -318,13 +318,16 @@ DINLINE void all_reduce_two_shot_push(
         connection_size_word, connection, row, 0, 1);
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       const int lo = chunk * kChunkN;
-      // A rank's share of the slices: slice long, the last one cut at the end.
-      const auto share = [&](int r) {
-        return static_cast<int>(
-            max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
-      };
-      const int end_w = min(share(w), lo + kChunkN);
-      const int end_me = min(share(rank), lo + kChunkN);
+      // A rank's share of the slices is slice long, the last one cut at the
+      // end; a chunk ends at the share's end.
+      const int end_w =
+          min(static_cast<int>(max(
+                  int64_t{0}, min(int64_t{slice}, total - int64_t{w} * slice))),
+              lo + kChunkN);
+      const int end_me = min(
+          static_cast<int>(max(
+              int64_t{0}, min(int64_t{slice}, total - int64_t{rank} * slice))),
+          lo + kChunkN);
       // A recv reads at least a pack, past the end when the share is empty
       // here: those values go nowhere.
       const int read_w = max(end_w - lo, kPackElems);
