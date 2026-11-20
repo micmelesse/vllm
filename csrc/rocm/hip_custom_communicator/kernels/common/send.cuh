@@ -1262,17 +1262,13 @@ DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
   const int64_t status_stride_field = protocol_buffers.status_stride_field;
   const int status_size_field = protocol_buffers.status_size_field;
   const uint64_t timeout_ticks = protocol_buffers.timeout_ticks;
-  // This wave's step (STEPS), as the leaves take it.
-  const int wave = __builtin_amdgcn_readfirstlane(
-      static_cast<int>(threadIdx.y * BLOCK_X + threadIdx.x) / WAVE_SIZE);
+  // The block's step (STEPS), as the leaves take it.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      (static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block ||
-       wave >= protocol_buffers.steps_size_wave))
+      static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block)
     internal::check_failed();
   uint32_t* const step_at =
       protocol_buffers.steps_ptr +
-      int64_t{blockIdx.x} * protocol_buffers.steps_stride_block +
-      int64_t{wave} * protocol_buffers.steps_stride_wave;
+      int64_t{blockIdx.x} * protocol_buffers.steps_stride_block;
   Connection step{};
   step[0][0][0] = static_cast<int32_t>(
       __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));

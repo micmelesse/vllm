@@ -115,7 +115,6 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.lamport_bytes = lamport_bytes;
   symmetric.inbox_bytes = lamport_blocks * world * unfenced_slot_bytes;
   s->step_blocks = lamport_blocks;
-  s->step_waves = kStepWaves;
 
   bool made = true;
   const auto allocate = [&](auto*& buffer, int64_t bytes, bool exchanged) {
@@ -156,8 +155,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_write_inbox_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_read_inbox_ptr_array, ptr_array_bytes, false);
-  allocate(s->steps,
-           4 * lamport_blocks * kStepWaves * int64_t{sizeof(uint32_t)}, false);
+  allocate(s->steps, 4 * lamport_blocks * int64_t{sizeof(uint32_t)}, false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
 
   constexpr int kRegions = 5;
@@ -263,9 +261,11 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 }
 
 // For the tests: views of the state the protocols keep from launch to launch,
-// this rank's Lamport inbox (bytes) and the steps ([protocol][block][wave],
-// STEPS), so a test can check what every launch must leave: the inbox all the
-// sentinel, the steps equal on every rank. No copy; the
+// this rank's Lamport inbox (bytes), the steps ([protocol][block], STEPS) and
+// the Simple protocols' counters ([simple_write, simple_read][tail, head]
+// [block][peer], COUNTERS), so a test can check what every launch must leave:
+// the inbox all the sentinel, the steps equal on every rank, and every
+// counter of a block at its step (every round posted was read). No copy; the
 // views live as long as the communicator.
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   using namespace hip_custom_communicator;
@@ -276,7 +276,9 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   return {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
-      torch::from_blob(s.steps, {4, s.step_blocks, s.step_waves},
+      torch::from_blob(s.steps, {4, s.step_blocks}, on.dtype(torch::kInt32)),
+      torch::from_blob(s.symmetric.signals,
+                       {2, 2, s.symmetric.max_blocks, int64_t{s.world}},
                        on.dtype(torch::kInt32)),
   };
 }

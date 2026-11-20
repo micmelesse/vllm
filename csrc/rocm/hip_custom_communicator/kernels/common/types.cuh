@@ -43,11 +43,11 @@ constexpr uint16_t kLamportEmpty = 0xffff;
 // STEPS: a block's step names its rounds, a round a tile: the next after the
 // last (0 is none). LL writes it in every line and waits for it; Lamport takes
 // its bank from it; the Simple protocols post it to their counters. It is the
-// protocol's memory, a slot a block and wave in the protocol's steps (every
-// wave keeps its own and every one advances the same way, so no wave waits
-// for another), kept between calls and launches: send reads its slot, recv
-// reads it, advances it and writes it back. A leaf takes the step as a
-// Connection, its first word.
+// protocol's memory, a slot a block in the protocol's steps, kept between
+// calls and launches whatever a launch's block size: send reads it; recv reads
+// it, advances it and writes it back once every wave of the block has read it
+// (after the block's barrier), so every wave writes the same next step. A leaf
+// takes the step as a Connection, its first word.
 // LL alternates two banks; Lamport three, so a bank it re-armed is written
 // again only after this rank's sends two tiles later, and the next tile's recv
 // polls before those: a poll that returns has the wave's earlier stores, the
@@ -56,7 +56,6 @@ constexpr uint16_t kLamportEmpty = 0xffff;
 // (0xfffffffe, then 3).
 constexpr int kConnectionWords = 4;
 using Connection = int32_t[1][1][kConnectionWords];
-constexpr int kStepWaves = 16;
 constexpr int kLlBanks = 2;
 constexpr int kLamportBanks = 3;
 constexpr uint32_t kLastStep = 0xfffffffeu;
@@ -167,8 +166,8 @@ struct ProtocolBuffers {
   int64_t counters_stride_kind, counters_stride_block, counters_stride_peer;
   int counters_size_block, counters_size_peer;
   uint32_t* steps_ptr;
-  int64_t steps_stride_block, steps_stride_wave;
-  int steps_size_block, steps_size_wave;
+  int64_t steps_stride_block;
+  int steps_size_block;
   uint32_t* status_ptr;
   int64_t status_stride_field;
   int status_size_field;
