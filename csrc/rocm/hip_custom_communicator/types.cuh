@@ -43,9 +43,7 @@ enum class Error : int {
   dtype_not_built = 1,
   world_not_built = 2,
   row_not_packs = 3,
-  partials_too_small = 4,
   grid_not_resident = 5,
-  staging_too_small = 6,
   device_not_built = 7,
   weight_not_built = 9,
   no_such_kernel = 10,
@@ -70,7 +68,6 @@ enum class Error : int {
   inputs_overlap_outputs = 31,
   field_out_of_range = 32,
   view_past_region = 33,
-  tables_full = 34,
   ranks_disagree = 35,
   not_open = 36,
   field_missing = 37,
@@ -120,29 +117,14 @@ using AddAttnResRmsNormKernel =
 #include "hip_custom_communicator_instances.inc"
 #include "hip_custom_communicator_builds.inc"
 
-struct InputTables {
-  void** device = nullptr;
-  int64_t slots = 0;
-
-  int64_t next_slot = 1;
-
-  std::vector<std::pair<int64_t, const void*>> pending;
-
-  std::map<std::vector<char>, char*> opened;
-};
-
 struct SymmetricMemory {
   int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0,
           lamport_blocks = 0;
 
-  int64_t signals_bytes = 0, staging_bytes = 0, partials_bytes = 0,
-          scales_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0,
+  int64_t signals_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0,
           inbox_bytes = 0;
 
   uint32_t* signals = nullptr;
-  char* staging = nullptr;
-  char* partials = nullptr;
-  float* scales = nullptr;
   char* unfenced = nullptr;
   // Lamport's inbox, LL's rows but lamport_blocks of them a bank, all data;
   // its every position is the sentinel until its data arrives.
@@ -155,13 +137,10 @@ struct SymmetricMemory {
 
   uint32_t* const* signals_ptr_array = nullptr;
   // Each rank's simple_write counters and its simple_read counters (COUNTERS,
-  // kernels/common/types.cuh), in its signals after the barrier's flags, a
-  // region each: [tail, head][block][peer].
+  // kernels/common/types.cuh), in its signals, a region each:
+  // [tail, head][block][peer].
   uint32_t* const* simple_write_counters_ptr_array = nullptr;
   uint32_t* const* simple_read_counters_ptr_array = nullptr;
-  char* const* staging_ptr_array = nullptr;
-  char* const* partials_ptr_array = nullptr;
-  float* const* scales_ptr_array = nullptr;
   char* const* unfenced_ptr_array = nullptr;
   char* const* lamport_ptr_array = nullptr;
   char* const* simple_write_inbox_ptr_array = nullptr;
@@ -195,7 +174,6 @@ struct CommsState {
   int32_t* connections = nullptr;
   int64_t connection_blocks = 0, connection_words = 0;
   uint32_t* status_device = nullptr;
-  InputTables input_tables;
 };
 
 }  // namespace hip_custom_communicator

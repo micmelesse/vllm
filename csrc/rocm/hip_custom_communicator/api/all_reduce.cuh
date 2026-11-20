@@ -238,21 +238,16 @@ ErrorCode hip_custom_communicator_all_reduce(
     typed<<<grid, block, shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        static_cast<const T* const*>(nullptr), 0, 0, 0,
         static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        s.symmetric.partials_ptr_array, s.world, 0, 0, 0, 0,
-        s.symmetric.staging_ptr_array, s.world, 0, 0, 0, 0, inbox_ptr_array,
-        s.world, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
-        static_cast<int>(unfenced_size_n), connections, s.connection_words,
-        int64_t{1}, static_cast<int>(s.connection_blocks),
+        inbox_ptr_array, s.world, unfenced_stride_slot, unfenced_stride_m,
+        unfenced_stride_n, static_cast<int>(unfenced_size_slot),
+        static_cast<int>(unfenced_size_m), static_cast<int>(unfenced_size_n),
+        connections, s.connection_words, int64_t{1},
+        static_cast<int>(s.connection_blocks),
         static_cast<int>(s.connection_words), counters_ptr_array, s.world,
         int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world}, int64_t{1},
-        static_cast<int>(s.symmetric.max_blocks), s.world,
-        s.symmetric.signals_ptr_array, s.world,
-        s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        static_cast<int>(s.symmetric.max_blocks), s.world, s.status_device,
         int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
   };
   if (dtype == at::ScalarType::BFloat16)

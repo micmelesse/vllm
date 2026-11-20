@@ -16,10 +16,7 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
     first = error_code(Error::exchange_failed);
     alone = true;
   }
-  std::vector<char*> borrowed = s->symmetric.peers;
-  for (const auto& [key, base] : s->input_tables.opened)
-    borrowed.push_back(base);
-  for (char* base : borrowed)
+  for (char* base : s->symmetric.peers)
     if (hipIpcCloseMemHandle(base) != hipSuccess) {
       (void)hipGetLastError();
       if (!first) first = error_code(Error::hip_failed);
@@ -28,9 +25,6 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
     first = error_code(Error::exchange_failed);
   for (const void* p :
        {static_cast<const void*>(s->symmetric.signals),
-        static_cast<const void*>(s->symmetric.staging),
-        static_cast<const void*>(s->symmetric.partials),
-        static_cast<const void*>(s->symmetric.scales),
         static_cast<const void*>(s->symmetric.unfenced),
         static_cast<const void*>(s->symmetric.lamport),
         static_cast<const void*>(s->symmetric.simple_write_inbox),
@@ -38,16 +32,12 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
         static_cast<const void*>(s->symmetric.signals_ptr_array),
         static_cast<const void*>(s->symmetric.simple_write_counters_ptr_array),
         static_cast<const void*>(s->symmetric.simple_read_counters_ptr_array),
-        static_cast<const void*>(s->symmetric.staging_ptr_array),
-        static_cast<const void*>(s->symmetric.partials_ptr_array),
-        static_cast<const void*>(s->symmetric.scales_ptr_array),
         static_cast<const void*>(s->symmetric.unfenced_ptr_array),
         static_cast<const void*>(s->symmetric.lamport_ptr_array),
         static_cast<const void*>(s->symmetric.simple_write_inbox_ptr_array),
         static_cast<const void*>(s->symmetric.simple_read_inbox_ptr_array),
         static_cast<const void*>(s->connections),
-        static_cast<const void*>(s->status_device),
-        static_cast<const void*>(s->input_tables.device)})
+        static_cast<const void*>(s->status_device)})
     if (p != nullptr && hipFree(const_cast<void*>(p)) != hipSuccess) {
       (void)hipGetLastError();
       if (!first) first = error_code(Error::hip_failed);

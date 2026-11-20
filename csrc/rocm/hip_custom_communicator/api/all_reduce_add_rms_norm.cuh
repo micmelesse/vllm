@@ -270,7 +270,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     typed<<<grid, block, shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        static_cast<const T* const*>(nullptr), 0, 0, 0,
         static_cast<const T*>(residual_ptr), residual_stride_m,
         residual_stride_n, static_cast<int>(residual_size_m),
         static_cast<int>(residual_size_n), static_cast<const W*>(weight_ptr),
@@ -279,19 +278,14 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output_ptr), residual_output_stride_m,
         residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n),
-        s.symmetric.partials_ptr_array, s.world, 0, 0, 0, 0,
-        s.symmetric.staging_ptr_array, s.world, 0, 0, 0, 0, inbox_ptr_array,
-        s.world, inbox_stride_slot, inbox_stride_m, int64_t{1}, s.world,
+        static_cast<int>(residual_output_size_n), inbox_ptr_array, s.world,
+        inbox_stride_slot, inbox_stride_m, int64_t{1}, s.world,
         static_cast<int>(inbox_size_m), static_cast<int>(inbox_stride_m),
         connections, s.connection_words, int64_t{1},
         static_cast<int>(s.connection_blocks),
         static_cast<int>(s.connection_words), counters_ptr_array, s.world,
         int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world}, int64_t{1},
-        static_cast<int>(s.symmetric.max_blocks), s.world,
-        s.symmetric.signals_ptr_array, s.world,
-        s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
-        int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+        static_cast<int>(s.symmetric.max_blocks), s.world, s.status_device,
         int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
   };
   if (dtype == at::ScalarType::BFloat16 &&

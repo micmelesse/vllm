@@ -46,7 +46,6 @@ template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-    char* const* staging_ptr_array, int staging_ptr_array_size,
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
@@ -54,13 +53,9 @@ DINLINE void all_gather_tile(
     uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
     int64_t counters_stride_kind, int64_t counters_stride_block,
     int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks, int input_size_m, int input_size_n,
-    int offs_m, int offs_n, int clip_m, int clip_n,
+    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks, int input_size_m,
+    int input_size_n, int offs_m, int offs_n, int clip_m, int clip_n,
     DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
                     PROTOCOL == Protocol::simple_write ||
@@ -124,37 +119,29 @@ template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
           bool TAIL, typename INPUT, typename OUTPUT>
 DINLINE void all_gather(
-    INPUT&& input, int input_ptr_array_size, int64_t input_stride_m,
-    int64_t input_stride_n, int input_size_m, int input_size_n, OUTPUT&& output,
+    INPUT&& input, int64_t input_stride_m, int64_t input_stride_n,
+    int input_size_m, int input_size_n, OUTPUT&& output,
     int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
     int output_size_n, int offs_m, int offs_n, int clip_m, int clip_n,
-    int slice, char* const* staging_ptr_array, int staging_ptr_array_size,
-    char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
+    int slice, char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
     int unfenced_size_n, Connection* connection,
     uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
     int64_t counters_stride_kind, int64_t counters_stride_block,
     int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks) {
+    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
     internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                               TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
-        input, input_stride_m, input_stride_n, staging_ptr_array,
-        staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection,
-        counters_ptr_array, counters_ptr_array_size, counters_stride_kind,
-        counters_stride_block, counters_stride_peer, counters_size_block,
-        counters_size_peer, signals_ptr_array, signals_ptr_array_size,
-        signals_stride_parity, signals_stride_block, signals_stride_writer,
-        signals_size_parity, signals_size_block, signals_size_writer,
-        status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
+        input, input_stride_m, input_stride_n, unfenced_ptr_array,
+        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
+        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        connection, counters_ptr_array, counters_ptr_array_size,
+        counters_stride_kind, counters_stride_block, counters_stride_peer,
+        counters_size_block, counters_size_peer, status_ptr,
+        status_stride_field, status_size_field, rank, timeout_ticks,
         input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 

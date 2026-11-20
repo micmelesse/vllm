@@ -43,8 +43,6 @@ INT4_RELATIVE_RMS = 0.02
 INT4_ROW_RELATIVE_RMS = 0.1
 TP_SIZES = [2, 4, 8]
 REFUSED_AT_SIZE = (
-    "staging_too_small",
-    "partials_too_small",
     "unfenced_too_small",
     "grid_not_resident",
     "launch_out_of_range",

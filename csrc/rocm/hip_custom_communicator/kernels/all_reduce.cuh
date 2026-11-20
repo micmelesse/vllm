@@ -3,7 +3,6 @@
 // All-reduce kernels, one function per algorithm.
 
 #include "all_gather.cuh"
-#include "common/address.cuh"
 #include "common/load.cuh"
 #include "common/recv.cuh"
 #include "common/reduce.cuh"
@@ -25,7 +24,6 @@ DINLINE void all_reduce_one_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
-    char* const* staging_ptr_array, int staging_ptr_array_size,
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
@@ -35,12 +33,8 @@ DINLINE void all_reduce_one_shot(
     uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
     int64_t counters_stride_kind, int64_t counters_stride_block,
     int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks) {
+    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks) {
   constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
   constexpr int kThreadsN = BLOCK_X / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
@@ -73,18 +67,15 @@ DINLINE void all_reduce_one_shot(
     all_gather<AllGatherAlgorithm::tile, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
                TILE_M, kTileN, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
                CONTIGUOUS, TAIL>(
-        input_ptr, 0, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
-        staging_ptr_array, staging_ptr_array_size, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        &connection, counters_ptr_array, counters_ptr_array_size,
-        counters_stride_kind, counters_stride_block, counters_stride_peer,
-        counters_size_block, counters_size_peer, signals_ptr_array,
-        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
+        unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot,
+        unfenced_stride_m, unfenced_stride_n, unfenced_size_slot,
+        unfenced_size_m, unfenced_size_n, &connection, counters_ptr_array,
+        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+        counters_stride_peer, counters_size_block, counters_size_peer,
+        status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks);
 
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
@@ -117,11 +108,6 @@ DINLINE void all_reduce_two_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
-    char* const* partials_ptr_array, int partials_ptr_array_size,
-    int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
-    int partials_size_n, char* const* staging_ptr_array,
-    int staging_ptr_array_size, int64_t staging_stride_m,
-    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
     int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
     int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
@@ -131,12 +117,8 @@ DINLINE void all_reduce_two_shot(
     uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
     int64_t counters_stride_kind, int64_t counters_stride_block,
     int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks) {
+    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks) {
   static_assert(
       PROTOCOL == Protocol::simple_write || PROTOCOL == Protocol::simple_read,
       "the two-shot is simple_write or simple_read");
@@ -358,71 +340,52 @@ template <AllReduceAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
           typename DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU,
           bool CONTIGUOUS, bool TAIL>
-__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
-    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
-    int64_t input_stride_n, int input_size_m, int input_size_n,
-    const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
-    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
-    DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
-    int64_t output_stride_n, int output_size_m, int output_size_n,
-    char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size,
-    int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
-    int partials_size_n, char* const* __restrict__ staging_ptr_array,
-    int staging_ptr_array_size, int64_t staging_stride_m,
-    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
-    char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
-    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
-    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* __restrict__ connection_ptr,
-    int64_t connection_stride_block, int64_t connection_stride_word,
-    int connection_size_block, int connection_size_word,
-    uint32_t* const* __restrict__ counters_ptr_array,
-    int counters_ptr_array_size, int64_t counters_stride_kind,
-    int64_t counters_stride_block, int64_t counters_stride_peer,
-    int counters_size_block, int counters_size_peer,
-    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
-    int64_t signals_stride_parity, int64_t signals_stride_block,
-    int64_t signals_stride_writer, int signals_size_parity,
-    int signals_size_block, int signals_size_writer,
-    uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
-    int status_size_field, int rank, uint64_t timeout_ticks) {
+__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
+    all_reduce(const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+               int64_t input_stride_n, int input_size_m, int input_size_n,
+               DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
+               int64_t output_stride_n, int output_size_m, int output_size_n,
+               char* const* __restrict__ unfenced_ptr_array,
+               int unfenced_ptr_array_size, int64_t unfenced_stride_slot,
+               int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+               int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+               int32_t* __restrict__ connection_ptr,
+               int64_t connection_stride_block, int64_t connection_stride_word,
+               int connection_size_block, int connection_size_word,
+               uint32_t* const* __restrict__ counters_ptr_array,
+               int counters_ptr_array_size, int64_t counters_stride_kind,
+               int64_t counters_stride_block, int64_t counters_stride_peer,
+               int counters_size_block, int counters_size_peer,
+               uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+               int status_size_field, int rank, uint64_t timeout_ticks) {
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot)
     all_reduce_one_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                         BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
                         TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        output_ptr, output_stride_m, output_stride_n, staging_ptr_array,
-        staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, connection_ptr,
-        connection_stride_block, connection_stride_word, connection_size_block,
-        connection_size_word, counters_ptr_array, counters_ptr_array_size,
-        counters_stride_kind, counters_stride_block, counters_stride_peer,
-        counters_size_block, counters_size_peer, signals_ptr_array,
-        signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
-  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot)
-    all_reduce_two_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
-                        BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
-                        TAIL>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        output_ptr, output_stride_m, output_stride_n, partials_ptr_array,
-        partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, staging_ptr_array,
-        staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, unfenced_ptr_array,
+        output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
         unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
         unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
         connection_ptr, connection_stride_block, connection_stride_word,
         connection_size_block, connection_size_word, counters_ptr_array,
         counters_ptr_array_size, counters_stride_kind, counters_stride_block,
         counters_stride_peer, counters_size_block, counters_size_peer,
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
-        signals_stride_block, signals_stride_writer, signals_size_parity,
-        signals_size_block, signals_size_writer, status_ptr,
-        status_stride_field, status_size_field, rank, timeout_ticks);
+        status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks);
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot)
+    all_reduce_two_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
+                        BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                        TAIL>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
+        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
+        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
+        connection_ptr, connection_stride_block, connection_stride_word,
+        connection_size_block, connection_size_word, counters_ptr_array,
+        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
+        counters_stride_peer, counters_size_block, counters_size_peer,
+        status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks);
 }
 
 }  // namespace hip_custom_communicator

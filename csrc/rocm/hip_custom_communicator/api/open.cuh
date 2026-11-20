@@ -65,39 +65,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   if (hipDeviceGetUuid(&uuid, static_cast<int>(device)) != hipSuccess)
     return {error_code(Error::hip_failed), 0, ""};
 
-  const int64_t pack = kPackBytes;
-  const auto whole = [pack](int64_t bytes) {
-    return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
-  };
-  int64_t partials_bytes = 0,
-          staging_bytes = int4_payload_bytes(max_rows, max_cols);
-  for (const at::ScalarType d : kDtypes) {
-    const int64_t e = static_cast<int64_t>(c10::elementSize(d));
-    const int64_t packs = (max_cols * e + pack - 1) / pack;
-
-    const int64_t partials = max_rows * packs * pack;
-    partials_bytes =
-        std::max(partials_bytes,
-                 std::max(partials, int4_payload_bytes(1, partials / e)));
-    staging_bytes = std::max(staging_bytes, max_rows * max_cols * e);
-
-    staging_bytes = std::max(
-        staging_bytes, world * ((max_rows * packs + world - 1) / world) * pack);
-  }
-
-  const int64_t int4_share =
-      ((max_rows * max_cols + kInt4Group - 1) / kInt4Group + world - 1) /
-      world * kInt4Group;
-  staging_bytes =
-      std::max(staging_bytes, int4_payload_bytes(1, world * int4_share));
-  partials_bytes = whole(partials_bytes);
-  staging_bytes = whole(staging_bytes);
-
   const int64_t max_blocks = int64_t{cus} * (threads_a_cu / wave);
-  // The barrier's flags, then simple_write's counters, then simple_read's,
-  // the same shape.
+  // simple_write's counters, then simple_read's, the same shape.
   const int64_t signals_bytes =
-      3 * 2 * max_blocks * world * int64_t{sizeof(uint32_t)};
+      2 * 2 * max_blocks * world * int64_t{sizeof(uint32_t)};
 
   const int64_t unfenced_blocks = 128, unfenced_slot_bytes = 2048;
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
@@ -108,8 +79,6 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   const int64_t lamport_blocks = 1024;
   const int64_t lamport_bytes =
       kLamportBanks * lamport_blocks * world * unfenced_slot_bytes;
-
-  const int64_t input_table_slots = int64_t{1} << 18;
 
   const int64_t scratch_shares = 16;
 
@@ -142,15 +111,11 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.unfenced_slot_bytes = unfenced_slot_bytes;
   symmetric.lamport_blocks = lamport_blocks;
   symmetric.signals_bytes = signals_bytes;
-  symmetric.staging_bytes = staging_bytes;
-  symmetric.partials_bytes = partials_bytes;
-  symmetric.scales_bytes = max_rows * int64_t{sizeof(float)};
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
   symmetric.inbox_bytes = lamport_blocks * world * unfenced_slot_bytes;
   s->connection_blocks = lamport_blocks;
   s->connection_words = kConnectionWords;
-  s->input_tables.slots = input_table_slots;
 
   bool made = true;
   const auto allocate = [&](auto*& buffer, int64_t bytes, bool exchanged) {
@@ -165,9 +130,6 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   };
   const int64_t ptr_array_bytes = world * int64_t{sizeof(char*)};
   allocate(symmetric.signals, symmetric.signals_bytes, true);
-  allocate(symmetric.staging, symmetric.staging_bytes, true);
-  allocate(symmetric.partials, symmetric.partials_bytes, true);
-  allocate(symmetric.scales, symmetric.scales_bytes, true);
   allocate(symmetric.unfenced, symmetric.unfenced_bytes, true);
   allocate(symmetric.lamport, symmetric.lamport_bytes, true);
   allocate(symmetric.simple_write_inbox, symmetric.inbox_bytes, true);
@@ -175,19 +137,14 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   made = made &&
          hipMemset(symmetric.lamport, kLamportEmpty & 0xff,
                    static_cast<size_t>(symmetric.lamport_bytes)) == hipSuccess;
-  // A checked build fills Simple's data buffers with 0xff, a NaN in bf16 and
-  // fp16 and in an INT4 group's scale, where zeros would read as finite data:
-  // a read of what no rank wrote fails a check or a test on its first call.
-  // The signals, the connections and the inboxes keep the start their
-  // protocols need.
+  // A checked build fills the Simple protocols' inboxes with 0xff, a NaN in
+  // bf16 and fp16 and in an INT4 group's scale, where zeros would read as
+  // finite data: a read of what no rank wrote fails a check or a test on its
+  // first call. The signals, the connections and the other inboxes keep the
+  // start their protocols need.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG)
     made =
         made &&
-        hipMemset(symmetric.staging, 0xff,
-                  static_cast<size_t>(symmetric.staging_bytes)) == hipSuccess &&
-        hipMemset(symmetric.partials, 0xff,
-                  static_cast<size_t>(symmetric.partials_bytes)) ==
-            hipSuccess &&
         hipMemset(symmetric.simple_write_inbox, 0xff,
                   static_cast<size_t>(symmetric.inbox_bytes)) == hipSuccess &&
         hipMemset(symmetric.simple_read_inbox, 0xff,
@@ -195,9 +152,6 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_write_counters_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_read_counters_ptr_array, ptr_array_bytes, false);
-  allocate(symmetric.staging_ptr_array, ptr_array_bytes, false);
-  allocate(symmetric.partials_ptr_array, ptr_array_bytes, false);
-  allocate(symmetric.scales_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.lamport_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_write_inbox_ptr_array, ptr_array_bytes, false);
@@ -206,18 +160,12 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
            4 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
-  allocate(s->input_tables.device,
-           input_table_slots * world * int64_t{sizeof(void*)}, false);
 
-  constexpr int kRegions = 8;
+  constexpr int kRegions = 5;
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
   std::string mine(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
   char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
-                               symmetric.staging,
-                               symmetric.partials,
-                               reinterpret_cast<char*>(symmetric.scales),
-                               symmetric.unfenced,
-                               symmetric.lamport,
+                               symmetric.unfenced, symmetric.lamport,
                                symmetric.simple_write_inbox,
                                symmetric.simple_read_inbox};
   for (char* region : own) {
@@ -253,14 +201,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
           reachable == 0)
         failed = Error::peer_not_accessible;
     }
-  const void* const arrays[kRegions] = {symmetric.signals_ptr_array,
-                                        symmetric.staging_ptr_array,
-                                        symmetric.partials_ptr_array,
-                                        symmetric.scales_ptr_array,
-                                        symmetric.unfenced_ptr_array,
-                                        symmetric.lamport_ptr_array,
-                                        symmetric.simple_write_inbox_ptr_array,
-                                        symmetric.simple_read_inbox_ptr_array};
+  const void* const arrays[kRegions] = {
+      symmetric.signals_ptr_array, symmetric.unfenced_ptr_array,
+      symmetric.lamport_ptr_array, symmetric.simple_write_inbox_ptr_array,
+      symmetric.simple_read_inbox_ptr_array};
   for (int region = 0; region < kRegions && !failed; ++region) {
     std::vector<char*> addresses(world);
     for (int r = 0; r < world && !failed; ++r) {
@@ -286,7 +230,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
                   world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
       failed = Error::hip_failed;
     if (!failed && region == 0) {
-      // Each Simple protocol's counters, a region each after the flags.
+      // Each Simple protocol's counters, a region each.
       uint32_t* const* const tables[2] = {
           symmetric.simple_write_counters_ptr_array,
           symmetric.simple_read_counters_ptr_array};
@@ -294,17 +238,13 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         std::vector<uint32_t*> counters(world);
         for (int r = 0; r < world; ++r)
           counters[r] = reinterpret_cast<uint32_t*>(addresses[r]) +
-                        (1 + t) * 2 * max_blocks * world;
+                        t * 2 * max_blocks * world;
         if (hipMemcpy(const_cast<uint32_t**>(tables[t]), counters.data(),
                       world * sizeof(uint32_t*),
                       hipMemcpyHostToDevice) != hipSuccess)
           failed = Error::hip_failed;
       }
     }
-    if (!failed && region == 1 &&
-        hipMemcpy(s->input_tables.device, addresses.data(),
-                  world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
-      failed = Error::hip_failed;
   }
   (void)hipGetLastError();
 

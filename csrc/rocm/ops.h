@@ -93,7 +93,6 @@ std::tuple<std::optional<int64_t>, int64_t, std::string>
 hip_custom_communicator_open(const std::string& group, int64_t device,
                              int64_t max_rows, int64_t max_cols,
                              double timeout_seconds);
-std::optional<int64_t> hip_custom_communicator_register_graph(int64_t state);
 std::optional<int64_t> hip_custom_communicator_close(int64_t state, bool alone);
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state);
 std::optional<int64_t> hip_custom_communicator_all_reduce(

@@ -150,9 +150,7 @@ class Error(IntEnum):
     dtype_not_built = 1
     world_not_built = 2
     row_not_packs = 3
-    partials_too_small = 4
     grid_not_resident = 5
-    staging_too_small = 6
     device_not_built = 7
     weight_not_built = 9
     no_such_kernel = 10
@@ -177,7 +175,6 @@ class Error(IntEnum):
     inputs_overlap_outputs = 31
     field_out_of_range = 32
     view_past_region = 33
-    tables_full = 34
     ranks_disagree = 35
     not_open = 36
     field_missing = 37
@@ -1264,7 +1261,7 @@ class HipCustomCommunicator:
     @final
     @contextmanager
     def capture(self) -> Iterator[None]:
-        """Wrap a CUDA graph capture. Registers its inputs with the peers on exit."""
+        """Wrap a CUDA graph capture."""
         with self.lifecycle.lock:
             if self.lifecycle.status != "open":
                 raise RuntimeError(
@@ -1276,21 +1273,13 @@ class HipCustomCommunicator:
             yield
         except BaseException as e:
             raised = e
-        assert self.state is not None
-        error = torch.ops._rocm_C.hip_custom_communicator_register_graph(
-            state=self.state.handle
-        )
         refused = (
             isinstance(raised, RuntimeError)
             and str(raised).split(":")[0] in Error.__members__
             and not str(raised).startswith(Error.hip_failed.name)
         )
         why = (
-            f"{Error(error).name}: the captured inputs"
-            if error is not None
-            else None
-            if raised is None or refused
-            else f"{type(raised).__name__}: {raised}"
+            None if raised is None or refused else f"{type(raised).__name__}: {raised}"
         )
         life = self.lifecycle
         with life.lock:
@@ -1303,8 +1292,6 @@ class HipCustomCommunicator:
                 life.status = "open"
         if raised is not None:
             raise raised
-        if error is not None:
-            raise RuntimeError(f"{Error(error).name}: the captured inputs")
 
     @final
     def tuned(
