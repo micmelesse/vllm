@@ -46,7 +46,7 @@ template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
                              int64_t input_stride_n,
-                             const ProtocolArgs& protocol_args,
+                             const ProtocolBuffers& protocol_buffers,
                              Connection* connection, int rank, int input_size_m,
                              int input_size_n, int offs_m, int offs_n,
                              int clip_m, int clip_n,
@@ -73,15 +73,15 @@ DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
         quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
                  reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-         Layout::tile>(payload, protocol_args, 0, WORLD, rank, lines_m, lines_n,
-                       first_row, 0, 1, connection);
+         Layout::tile>(payload, protocol_buffers, 0, WORLD, rank, lines_m,
+                       lines_n, first_row, 0, 1, connection);
   } else {
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-         Layout::tile>(mine, protocol_args, 0, WORLD, rank, lines_m, lines_n,
+         Layout::tile>(mine, protocol_buffers, 0, WORLD, rank, lines_m, lines_n,
                        first_row, 0, 1, connection);
   }
   recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-       Layout::tile>(protocol_args, rank, 0, lines_m, lines_n, copies,
+       Layout::tile>(protocol_buffers, rank, 0, lines_m, lines_n, copies,
                      first_row, 0, 1, connection);
 }
 
@@ -100,13 +100,14 @@ DINLINE void all_gather(INPUT&& input, int64_t input_stride_m,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int clip_m, int clip_n, int slice,
-                        const ProtocolArgs& protocol_args,
+                        const ProtocolBuffers& protocol_buffers,
                         Connection* connection, int rank) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
     internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                               TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
-        input, input_stride_m, input_stride_n, protocol_args, connection, rank,
-        input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
+        input, input_stride_m, input_stride_n, protocol_buffers, connection,
+        rank, input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n,
+        output);
 }
 
 }  // namespace hip_custom_communicator

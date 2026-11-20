@@ -117,20 +117,24 @@ ErrorCode hip_custom_communicator_all_reduce(
   const bool tail = quantize_int4 &&
                     (two_shot ? m * n % kInt4Group != 0 : n % kInt4Group != 0);
 
-  if (protocol == Protocol::ll) {
-    const int64_t line_pack = std::min<int64_t>(pack_bytes, kLinePayloadBytes);
-    const int64_t row_lines =
-        quantize_int4 ? (tile_n + kInt4Group - 1) / kInt4Group * kInt4GroupPacks
-                      : (tile_n * e + line_pack - 1) / line_pack;
-    if (row_lines > s.symmetric.unfenced_slot_bytes / kLinePayloadBytes ||
-        grid_x * tile_m > s.symmetric.unfenced_blocks)
-      return error_code(Error::unfenced_too_small);
-  }
-  if (protocol == Protocol::lamport &&
-      ((tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
-           s.symmetric.unfenced_slot_bytes ||
-       grid_x * tile_m > s.symmetric.lamport_blocks))
-    return error_code(Error::unfenced_too_small);
+  // The message a block sends a round, in elements: the two-shot's chunk
+  // (exact, the tile; INT4, a group a lane), the one-shot's tile row.
+  if (two_shot && protocol != Protocol::simple_write &&
+      protocol != Protocol::simple_read)
+    return error_code(Error::not_built);
+  const int64_t elems = pack_bytes / e;
+  const bool simple_protocol =
+      protocol == Protocol::simple_write || protocol == Protocol::simple_read;
+  const int64_t row_elems =
+      two_shot ? (quantize_int4 ? block_x / s.world * kInt4Group
+                                : (tile_n + elems - 1) / elems * elems)
+      : simple_protocol
+          ? (tile_n + elems * block_x - 1) / (elems * block_x) * elems * block_x
+          : tile_n;
+  const std::optional<ProtocolBuffers> protocol_buffers =
+      layout_protocol_buffers(s, protocol, two_shot ? grid_x : grid_x * tile_m,
+                              row_elems, e, pack_bytes, quantize_int4);
+  if (!protocol_buffers) return error_code(Error::unfenced_too_small);
   void* kernel = nullptr;
 
   for (const auto& i : kAllReduceInstances)
@@ -167,96 +171,6 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (grid_x > blocks_a_cu * s.device.compute_units)
     return error_code(Error::grid_not_resident);
 
-  int64_t unfenced_stride_slot = 0, unfenced_stride_m = 0,
-          unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0,
-          unfenced_size_n = 0;
-  if (algorithm == AllReduceAlgorithm::two_shot) {
-    // The two-shot is the Simple protocols': a slot a pair of ranks, a row a
-    // block, each a chunk (exact, the tile; INT4, a group a lane, as the
-    // stage's).
-    if (protocol != Protocol::simple_write && protocol != Protocol::simple_read)
-      return error_code(Error::not_built);
-    const int64_t elems = pack_bytes / e;
-    const int64_t lanes = block_x / s.world;
-    const int64_t row = quantize_int4 ? lanes * kInt4Group
-                                      : (tile_n + elems - 1) / elems * elems;
-    if (s.world * grid_x * row * e > s.symmetric.inbox_bytes ||
-        grid_x > s.symmetric.max_blocks)
-      return error_code(Error::unfenced_too_small);
-    unfenced_stride_slot = grid_x * row, unfenced_stride_m = row,
-    unfenced_stride_n = 1;
-    unfenced_size_slot = s.world, unfenced_size_m = grid_x,
-    unfenced_size_n = row;
-  } else if (protocol == Protocol::simple_write ||
-             protocol == Protocol::simple_read) {
-    // The one-shot's simple_write and simple_read inbox: a slot a pair of
-    // ranks (the writer's in the reader's inbox, or the reader's in the
-    // writer's), a row a block, each the tile.
-    if (grid_x * tile_m > s.symmetric.lamport_blocks ||
-        (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
-            s.symmetric.unfenced_slot_bytes)
-      return error_code(Error::unfenced_too_small);
-    const int64_t blocks = s.symmetric.lamport_blocks;
-    unfenced_stride_slot = blocks * (s.symmetric.unfenced_slot_bytes / e);
-    unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-    unfenced_stride_n = 1;
-    unfenced_size_slot = s.world, unfenced_size_m = blocks,
-    unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-  } else {
-    // LL's and Lamport's inboxes have the same rows; LL's lines are twice
-    // as wide, half data.
-    const int64_t blocks = protocol == Protocol::lamport
-                               ? s.symmetric.lamport_blocks
-                               : s.symmetric.unfenced_blocks;
-    const int64_t banks =
-        protocol == Protocol::lamport ? kLamportBanks : kLlBanks;
-    unfenced_stride_slot =
-        banks * blocks * (s.symmetric.unfenced_slot_bytes / e);
-    unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-    unfenced_stride_n = 1;
-    unfenced_size_slot = s.world, unfenced_size_m = banks * blocks,
-    unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-  }
-
-  char* const* const inbox_ptr_array =
-      protocol == Protocol::lamport ? s.symmetric.lamport_ptr_array
-      : protocol == Protocol::simple_write
-          ? s.symmetric.simple_write_inbox_ptr_array
-      : protocol == Protocol::simple_read
-          ? s.symmetric.simple_read_inbox_ptr_array
-          : s.symmetric.unfenced_ptr_array;
-  // This protocol's connections and counters (CONNECTION, COUNTERS).
-  int32_t* const connections = s.connections + static_cast<int>(protocol) *
-                                                   s.connection_blocks *
-                                                   s.connection_words;
-  uint32_t* const* const counters_ptr_array =
-      protocol == Protocol::simple_read
-          ? s.symmetric.simple_read_counters_ptr_array
-          : s.symmetric.simple_write_counters_ptr_array;
-  const ProtocolArgs protocol_args{inbox_ptr_array,
-                                   s.world,
-                                   unfenced_stride_slot,
-                                   unfenced_stride_m,
-                                   unfenced_stride_n,
-                                   static_cast<int>(unfenced_size_slot),
-                                   static_cast<int>(unfenced_size_m),
-                                   static_cast<int>(unfenced_size_n),
-                                   counters_ptr_array,
-                                   s.world,
-                                   s.symmetric.max_blocks * s.world,
-                                   int64_t{s.world},
-                                   int64_t{1},
-                                   static_cast<int>(s.symmetric.max_blocks),
-                                   s.world,
-                                   connections,
-                                   s.connection_words,
-                                   int64_t{1},
-                                   static_cast<int>(s.connection_blocks),
-                                   static_cast<int>(s.connection_words),
-                                   s.status_device,
-                                   int64_t{1},
-                                   kStatusFields,
-                                   s.timeout_ticks};
   const auto launch = [&]<typename T, typename W>() {
     const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
     typed<<<grid, block, shared_memory_bytes, stream>>>(
@@ -264,7 +178,7 @@ ErrorCode hip_custom_communicator_all_reduce(
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        protocol_args, s.rank);
+        *protocol_buffers, s.rank);
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();

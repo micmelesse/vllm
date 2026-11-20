@@ -219,58 +219,18 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
 
   // The Simple protocols' inbox: a slot a pair of ranks, a row a block, each
   // the tile's span (the one-shot's) or a chunk of a share (the two-shot's).
-  int64_t inbox_stride_slot = 0, inbox_stride_m = 0, inbox_size_m = 0;
-  const bool simple_protocol =
-      protocol == Protocol::simple_write || protocol == Protocol::simple_read;
-  if (simple_protocol) {
-    const int64_t elems = pack_bytes / e;
-    const int64_t span =
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot
-            ? (tile_n + elems * block_x - 1) / (elems * block_x) * elems *
-                  block_x
-        : quantize_int4 ? block_x / s.world * kInt4Group
-                        : (tile_n + elems - 1) / elems * elems;
-    if (s.world * grid_x * span * e > s.symmetric.inbox_bytes ||
-        grid_x > s.connection_blocks || grid_x > s.symmetric.max_blocks)
-      return error_code(Error::unfenced_too_small);
-    inbox_stride_slot = grid_x * span, inbox_stride_m = span,
-    inbox_size_m = grid_x;
-  }
-  char* const* const inbox_ptr_array =
-      protocol == Protocol::simple_read
-          ? s.symmetric.simple_read_inbox_ptr_array
-          : s.symmetric.simple_write_inbox_ptr_array;
-  uint32_t* const* const counters_ptr_array =
-      protocol == Protocol::simple_read
-          ? s.symmetric.simple_read_counters_ptr_array
-          : s.symmetric.simple_write_counters_ptr_array;
-  int32_t* const connections = s.connections + static_cast<int>(protocol) *
-                                                   s.connection_blocks *
-                                                   s.connection_words;
-  const ProtocolArgs protocol_args{inbox_ptr_array,
-                                   s.world,
-                                   inbox_stride_slot,
-                                   inbox_stride_m,
-                                   int64_t{1},
-                                   s.world,
-                                   static_cast<int>(inbox_size_m),
-                                   static_cast<int>(inbox_stride_m),
-                                   counters_ptr_array,
-                                   s.world,
-                                   s.symmetric.max_blocks * s.world,
-                                   int64_t{s.world},
-                                   int64_t{1},
-                                   static_cast<int>(s.symmetric.max_blocks),
-                                   s.world,
-                                   connections,
-                                   s.connection_words,
-                                   int64_t{1},
-                                   static_cast<int>(s.connection_blocks),
-                                   static_cast<int>(s.connection_words),
-                                   s.status_device,
-                                   int64_t{1},
-                                   kStatusFields,
-                                   s.timeout_ticks};
+  // The message a block sends a round, in elements: the one-shot's tile
+  // row, the two-shot's share (exact, the tile; INT4, a group a lane).
+  const int64_t elems = pack_bytes / e;
+  const int64_t span =
+      algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot
+          ? (tile_n + elems * block_x - 1) / (elems * block_x) * elems * block_x
+      : quantize_int4 ? block_x / s.world * kInt4Group
+                      : (tile_n + elems - 1) / elems * elems;
+  const std::optional<ProtocolBuffers> protocol_buffers =
+      layout_protocol_buffers(s, protocol, grid_x, span, e, pack_bytes,
+                              quantize_int4);
+  if (!protocol_buffers) return error_code(Error::unfenced_too_small);
   const auto launch = [&]<typename T, typename W>() {
     const auto typed =
         reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
@@ -285,7 +245,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output_ptr), residual_output_stride_m,
         residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), protocol_args, s.rank, eps);
+        static_cast<int>(residual_output_size_n), *protocol_buffers, s.rank,
+        eps);
   };
   if (dtype == at::ScalarType::BFloat16 &&
       weight_dtype == at::ScalarType::Float)

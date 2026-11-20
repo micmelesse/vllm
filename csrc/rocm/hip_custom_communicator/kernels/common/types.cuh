@@ -155,12 +155,12 @@ enum class Protocol { ll, lamport, simple_write, simple_read };
 // another's.
 enum class Counter : int { tail, head };
 
-// A launch's protocol values, read-only: the protocol's inbox (every rank's
+// A launch's protocol buffers, read-only: the protocol's inbox (every rank's
 // address, and its layout), its counters, where its blocks' connections are
-// kept, the status record and the wait limit. The kernel builds it from its
-// arguments; stages hand it to send and recv unread. The step itself is the
-// Connection.
-struct ProtocolArgs {
+// kept, and the status record and wait limit a send or recv waits by. The
+// host lays it out and passes it as one kernel argument; stages hand it to
+// send and recv unread. The step itself is the Connection.
+struct ProtocolBuffers {
   char* const* inbox_ptr_array;
   int inbox_ptr_array_size;
   int64_t inbox_stride_slot, inbox_stride_m, inbox_stride_n;
