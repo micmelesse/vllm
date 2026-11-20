@@ -39,12 +39,6 @@ ALGORITHM_ENUMS = {
     "all_reduce": "AllReduceAlgorithm",
     "all_reduce_add_rms_norm": "AllReduceAddRmsNormKernelAlgorithm",
     "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormAlgorithm",
-    "add_rms_norm": "AddRmsNormAlgorithm",
-    "add_attn_res_rms_norm": "AddAttnResRmsNormAlgorithm",
-}
-SPLIT_ROWS = {
-    "all_reduce_add_rms_norm": "add_rms_norm",
-    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
 }
 TEMPLATE_ARGS = {
     "all_reduce": "algorithm protocol quantize_int4 T world tile_m tile_n block_x "
@@ -55,10 +49,6 @@ TEMPLATE_ARGS = {
     "all_reduce_add_attn_res_rms_norm": "algorithm protocol quantize_int4 T world "
     "tile_m "
     "tile_n tile_k block_x block_y wave_size pack_bytes waves_per_eu chunked tail",
-    "add_rms_norm": "residual T W tile_m tile_n block_x block_y wave_size pack_bytes "
-    "waves_per_eu chunked",
-    "add_attn_res_rms_norm": "T tile_m tile_n tile_k block_x block_y wave_size "
-    "pack_bytes waves_per_eu chunked",
 }
 HEADERS = (
     "kernels/all_reduce.cuh",
@@ -156,30 +146,7 @@ def parse_args(argv: list[str]) -> Command:
 
 
 def config_builds(config: dict) -> list[Build]:
-    if not str(config["algorithm"]).endswith("_split"):
-        return [Build(config["kernel"], *(config[f] for f in FIELDS))]
-    body = {**config, "algorithm": config["algorithm"].removesuffix("_split")}
-    second = SPLIT_ROWS[config["kernel"]]
-    fields = {
-        f: config.get(f"{second}_{f}", 1)
-        for f in FIELDS
-        if f not in ("algorithm", "protocol", "quantization")
-    }
-    return [
-        Build("all_reduce", *(body[f] for f in FIELDS)),
-        Build(
-            second,
-            *(
-                {
-                    **fields,
-                    "algorithm": "rows",
-                    "protocol": "simple",
-                    "quantization": "exact",
-                }[f]
-                for f in FIELDS
-            ),
-        ),
-    ]
+    return [Build(config["kernel"], *(config[f] for f in FIELDS))]
 
 
 def parse_table(path: Path) -> dict[str, list[Build]]:

@@ -114,29 +114,6 @@ _CONFIG_KEYS = (
     "pack_bytes",
 )
 
-_SPLIT_KERNELS: Mapping[str, str] = {
-    "all_reduce_add_rms_norm": "add_rms_norm",
-    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
-}
-_LAUNCH_KEYS = (
-    "grid_x",
-    "grid_y",
-    "grid_z",
-    "block_x",
-    "block_y",
-    "block_z",
-    "waves_per_eu",
-    "tile_m",
-    "tile_n",
-)
-_SPLIT_KEYS: Mapping[str, tuple[str, ...]] = {
-    "all_reduce_add_rms_norm": tuple(
-        f"add_rms_norm_{k}" for k in (*_LAUNCH_KEYS, "pack_bytes")
-    ),
-    "all_reduce_add_attn_res_rms_norm": tuple(
-        f"add_attn_res_rms_norm_{k}" for k in (*_LAUNCH_KEYS, "tile_k", "pack_bytes")
-    ),
-}
 
 TORCH_COLLECTIVE_TIMEOUT_SECONDS = 600.0
 
@@ -267,20 +244,6 @@ class AllReduceAddRmsNormConfig:
     tile_n: int
     quantization: Quantization
     pack_bytes: int
-    add_rms_norm_grid_x: int | None = None
-    add_rms_norm_grid_y: int | None = None
-    add_rms_norm_grid_z: int | None = None
-    add_rms_norm_block_x: int | None = None
-    add_rms_norm_block_y: int | None = None
-    add_rms_norm_block_z: int | None = None
-    add_rms_norm_waves_per_eu: int | None = None
-    add_rms_norm_tile_m: int | None = None
-    add_rms_norm_tile_n: int | None = None
-    add_rms_norm_pack_bytes: int | None = None
-
-    @property
-    def split(self) -> bool:
-        return self.algorithm.endswith("_split")
 
 
 @dataclass(frozen=True)
@@ -303,21 +266,6 @@ class AllReduceAddAttnResRmsNormConfig:
     tile_k: int
     quantization: Quantization
     pack_bytes: int
-    add_attn_res_rms_norm_grid_x: int | None = None
-    add_attn_res_rms_norm_grid_y: int | None = None
-    add_attn_res_rms_norm_grid_z: int | None = None
-    add_attn_res_rms_norm_block_x: int | None = None
-    add_attn_res_rms_norm_block_y: int | None = None
-    add_attn_res_rms_norm_block_z: int | None = None
-    add_attn_res_rms_norm_waves_per_eu: int | None = None
-    add_attn_res_rms_norm_tile_m: int | None = None
-    add_attn_res_rms_norm_tile_n: int | None = None
-    add_attn_res_rms_norm_tile_k: int | None = None
-    add_attn_res_rms_norm_pack_bytes: int | None = None
-
-    @property
-    def split(self) -> bool:
-        return self.algorithm.endswith("_split")
 
 
 Config = AllReduceConfig | AllReduceAddRmsNormConfig | AllReduceAddAttnResRmsNormConfig
@@ -330,12 +278,6 @@ _CONFIGS: Mapping[str, type[Config]] = {
         AllReduceAddAttnResRmsNormConfig,
     )
 }
-
-
-def _packs(config: Config) -> tuple[int, ...]:
-    second = _SPLIT_KERNELS.get(config.kernel)
-    pack = getattr(config, f"{second}_pack_bytes", None) if second else None
-    return (config.pack_bytes,) if pack is None else (config.pack_bytes, pack)
 
 
 @dataclass(frozen=True)
@@ -381,7 +323,7 @@ class TunedTable:
         fitting = [
             (i, c)
             for i, c in tuned
-            if all(cols * _DTYPE_BYTES[i.dtype] % pack == 0 for pack in _packs(c))
+            if all(cols * _DTYPE_BYTES[i.dtype] % pack == 0 for pack in (c.pack_bytes,))
         ]
         tuned = fitting or tuned
         width = min((i.hidden for i, _ in tuned), key=lambda h: abs(h - cols))
@@ -537,8 +479,7 @@ def _table_of(tables: Any, path: Path, arch: str) -> TunedTable | Error:
             return Error.tuned_table_unsound
         cls = _CONFIGS[c["kernel"]]
         own = {f.name for f in fields(cls)}
-        split_keys = _SPLIT_KEYS.get(kernel, ())
-        keys = ["op", *_CONFIG_KEYS, *split_keys]
+        keys = ["op", *_CONFIG_KEYS]
         if list(c) != keys:
             logger.error(
                 "HipCustomCommunicator open: %s: %s",
@@ -568,17 +509,6 @@ def _table_of(tables: Any, path: Path, arch: str) -> TunedTable | Error:
                     f"{where}: {c['kernel']}'s {k} is {getattr(cls, k)}, not {c[k]}",
                 )
                 return Error.tuned_table_unsound
-        second = [c[k] for k in split_keys]
-        split = str(c["algorithm"]).endswith("_split")
-        if (split and (not second or None in second)) or (
-            not split and second != [None] * len(second)
-        ):
-            logger.error(
-                "HipCustomCommunicator open: %s: %s",
-                Error.tuned_table_unsound.name,
-                f"{where}: {split_keys} are a split's, every one, a split's alone",
-            )
-            return Error.tuned_table_unsound
         config = cls(**{k: c[k] for k in keys if k in own})
         configs.append(config)
     picks: dict[TunedInput, Config] = {}
@@ -1075,16 +1005,6 @@ class HipCustomCommunicator:
             tile_n=config.tile_n,
             quantization=config.quantization,
             pack_bytes=config.pack_bytes,
-            add_rms_norm_grid_x=config.add_rms_norm_grid_x,
-            add_rms_norm_grid_y=config.add_rms_norm_grid_y,
-            add_rms_norm_grid_z=config.add_rms_norm_grid_z,
-            add_rms_norm_block_x=config.add_rms_norm_block_x,
-            add_rms_norm_block_y=config.add_rms_norm_block_y,
-            add_rms_norm_block_z=config.add_rms_norm_block_z,
-            add_rms_norm_waves_per_eu=config.add_rms_norm_waves_per_eu,
-            add_rms_norm_tile_m=config.add_rms_norm_tile_m,
-            add_rms_norm_tile_n=config.add_rms_norm_tile_n,
-            add_rms_norm_pack_bytes=config.add_rms_norm_pack_bytes,
         )
         if error is not None:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -1214,45 +1134,36 @@ class HipCustomCommunicator:
             )
 
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
-            state=self.state.handle,
-            input=input,
-            prefix=prefix,
-            blocks=blocks,
-            norm_weight=norm_weight,
-            qk_weight=qk_weight,
-            output_norm_weight=output_norm_weight,
-            prefix_output=prefix_output,
-            output=output,
-            block_output=block_output,
-            num_blocks=num_blocks,
-            eps=eps,
-            output_eps=output_eps,
-            algorithm=config.algorithm,
-            protocol=config.protocol,
-            grid_x=config.grid_x,
-            grid_y=config.grid_y,
-            grid_z=config.grid_z,
-            block_x=config.block_x,
-            block_y=config.block_y,
-            block_z=config.block_z,
-            waves_per_eu=config.waves_per_eu,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            tile_k=config.tile_k,
-            quantization=config.quantization,
-            pack_bytes=config.pack_bytes,
-            add_attn_res_rms_norm_grid_x=config.add_attn_res_rms_norm_grid_x,
-            add_attn_res_rms_norm_grid_y=config.add_attn_res_rms_norm_grid_y,
-            add_attn_res_rms_norm_grid_z=config.add_attn_res_rms_norm_grid_z,
-            add_attn_res_rms_norm_block_x=config.add_attn_res_rms_norm_block_x,
-            add_attn_res_rms_norm_block_y=config.add_attn_res_rms_norm_block_y,
-            add_attn_res_rms_norm_block_z=config.add_attn_res_rms_norm_block_z,
-            add_attn_res_rms_norm_waves_per_eu=config.add_attn_res_rms_norm_waves_per_eu,
-            add_attn_res_rms_norm_tile_m=config.add_attn_res_rms_norm_tile_m,
-            add_attn_res_rms_norm_tile_n=config.add_attn_res_rms_norm_tile_n,
-            add_attn_res_rms_norm_tile_k=config.add_attn_res_rms_norm_tile_k,
-            add_attn_res_rms_norm_pack_bytes=config.add_attn_res_rms_norm_pack_bytes,
+        error = (
+            torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
+                state=self.state.handle,
+                input=input,
+                prefix=prefix,
+                blocks=blocks,
+                norm_weight=norm_weight,
+                qk_weight=qk_weight,
+                output_norm_weight=output_norm_weight,
+                prefix_output=prefix_output,
+                output=output,
+                block_output=block_output,
+                num_blocks=num_blocks,
+                eps=eps,
+                output_eps=output_eps,
+                algorithm=config.algorithm,
+                protocol=config.protocol,
+                grid_x=config.grid_x,
+                grid_y=config.grid_y,
+                grid_z=config.grid_z,
+                block_x=config.block_x,
+                block_y=config.block_y,
+                block_z=config.block_z,
+                waves_per_eu=config.waves_per_eu,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                tile_k=config.tile_k,
+                quantization=config.quantization,
+                pack_bytes=config.pack_bytes,
+            )
         )
         if error is not None:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")

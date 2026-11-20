@@ -160,12 +160,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "grid_x,"
       " int grid_y, int grid_z, int block_x, int block_y, int block_z,"
       " int waves_per_eu, int tile_m, int tile_n, str quantization,"
-      " int pack_bytes, int? add_rms_norm_grid_x=None,"
-      " int? add_rms_norm_grid_y=None, int? add_rms_norm_grid_z=None,"
-      " int? add_rms_norm_block_x=None, int? add_rms_norm_block_y=None,"
-      " int? add_rms_norm_block_z=None, int? add_rms_norm_waves_per_eu=None,"
-      " int? add_rms_norm_tile_m=None, int? add_rms_norm_tile_n=None,"
-      " int? add_rms_norm_pack_bytes=None) -> int?");
+      " int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
   rocm_ops.def(
@@ -176,18 +171,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       " float output_eps, str algorithm, str protocol, int grid_x, int grid_y, "
       "int grid_z,"
       " int block_x, int block_y, int block_z, int waves_per_eu, int tile_m,"
-      " int tile_n, int tile_k, str quantization, int pack_bytes,"
-      " int? add_attn_res_rms_norm_grid_x=None,"
-      " int? add_attn_res_rms_norm_grid_y=None,"
-      " int? add_attn_res_rms_norm_grid_z=None,"
-      " int? add_attn_res_rms_norm_block_x=None,"
-      " int? add_attn_res_rms_norm_block_y=None,"
-      " int? add_attn_res_rms_norm_block_z=None,"
-      " int? add_attn_res_rms_norm_waves_per_eu=None,"
-      " int? add_attn_res_rms_norm_tile_m=None,"
-      " int? add_attn_res_rms_norm_tile_n=None,"
-      " int? add_attn_res_rms_norm_tile_k=None,"
-      " int? add_attn_res_rms_norm_pack_bytes=None) -> int?");
+      " int tile_n, int tile_k, str quantization, int pack_bytes) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm",
                 torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);

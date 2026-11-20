@@ -20,18 +20,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     const std::string& protocol_name, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z,
     int64_t waves_per_eu, int64_t tile_m, int64_t tile_n, int64_t tile_k,
-    const std::string& quantization_name, int64_t pack_bytes,
-    std::optional<int64_t> add_attn_res_rms_norm_grid_x,
-    std::optional<int64_t> add_attn_res_rms_norm_grid_y,
-    std::optional<int64_t> add_attn_res_rms_norm_grid_z,
-    std::optional<int64_t> add_attn_res_rms_norm_block_x,
-    std::optional<int64_t> add_attn_res_rms_norm_block_y,
-    std::optional<int64_t> add_attn_res_rms_norm_block_z,
-    std::optional<int64_t> add_attn_res_rms_norm_waves_per_eu,
-    std::optional<int64_t> add_attn_res_rms_norm_tile_m,
-    std::optional<int64_t> add_attn_res_rms_norm_tile_n,
-    std::optional<int64_t> add_attn_res_rms_norm_tile_k,
-    std::optional<int64_t> add_attn_res_rms_norm_pack_bytes) {
+    const std::string& quantization_name, int64_t pack_bytes) {
   using namespace hip_custom_communicator;
   using namespace hip_custom_communicator::internal;
 
@@ -136,16 +125,6 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   else
     return error_code(Error::no_such_protocol);
 
-  // The splits' norm-kernel fields: no split is built.
-  for (const std::optional<int64_t>& field :
-       {add_attn_res_rms_norm_grid_x, add_attn_res_rms_norm_grid_y,
-        add_attn_res_rms_norm_grid_z, add_attn_res_rms_norm_block_x,
-        add_attn_res_rms_norm_block_y, add_attn_res_rms_norm_block_z,
-        add_attn_res_rms_norm_waves_per_eu, add_attn_res_rms_norm_tile_m,
-        add_attn_res_rms_norm_tile_n, add_attn_res_rms_norm_tile_k,
-        add_attn_res_rms_norm_pack_bytes}) {
-    if (field) return error_code(Error::field_not_this_templates);
-  }
   CommsState& s = *reinterpret_cast<CommsState*>(state);
   const void* input_ptr = input.data_ptr();
   const int64_t input_stride_m = input.stride(0);

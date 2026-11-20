@@ -160,33 +160,6 @@ DINLINE void add_rms_norm_rows(
   }
 }
 
-template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
-          int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES,
-          int WAVES_PER_EU, bool CHUNKED>
-__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
-    add_rms_norm(const DTYPE* input_ptr, int64_t input_stride_m,
-                 int64_t input_stride_n, int input_size_m, int input_size_n,
-                 const DTYPE* residual_ptr, int64_t residual_stride_m,
-                 int64_t residual_stride_n, int residual_size_m,
-                 int residual_size_n,
-                 const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                 int64_t weight_stride_n, int weight_size_n, DTYPE* output_ptr,
-                 int64_t output_stride_m, int64_t output_stride_n,
-                 int output_size_m, int output_size_n,
-                 DTYPE* residual_output_ptr, int64_t residual_output_stride_m,
-                 int64_t residual_output_stride_n, int residual_output_size_m,
-                 int residual_output_size_n, float eps) {
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x)
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
-                      BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        t * TILE_M, input_ptr, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, residual_ptr, residual_stride_m, residual_stride_n,
-        weight_ptr, weight_stride_n, output_ptr, output_stride_m,
-        output_stride_n, residual_output_ptr, residual_output_stride_m,
-        residual_output_stride_n, eps);
-}
-
 template <Protocol PROTOCOL, bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
           typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>

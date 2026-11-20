@@ -73,46 +73,6 @@ DINLINE void add_attn_res_rms_norm_rows(
       offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
 }
 
-template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int BLOCK_X,
-          int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU,
-          bool CHUNKED>
-__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
-    add_attn_res_rms_norm(
-        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
-        int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
-        int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
-        const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
-        int64_t blocks_stride_r, int64_t blocks_stride_n, int blocks_size_m,
-        int blocks_size_r, int blocks_size_n,
-        const DTYPE* __restrict__ norm_weight_ptr, int64_t norm_weight_stride_n,
-        int norm_weight_size_n, const DTYPE* __restrict__ qk_weight_ptr,
-        int64_t qk_weight_stride_n, int qk_weight_size_n,
-        const DTYPE* __restrict__ output_norm_weight_ptr,
-        int64_t output_norm_weight_stride_n, int output_norm_weight_size_n,
-        DTYPE* __restrict__ prefix_output_ptr, int64_t prefix_output_stride_m,
-        int64_t prefix_output_stride_n, int prefix_output_size_m,
-        int prefix_output_size_n, DTYPE* __restrict__ output_ptr,
-        int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, DTYPE* __restrict__ block_output_ptr,
-        int64_t block_output_stride_m, int64_t block_output_stride_n,
-        int block_output_size_m, int block_output_size_n, int num_blocks,
-        float eps, float output_eps) {
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x)
-    add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X, BLOCK_Y,
-                               WAVE_SIZE, PACK_BYTES, CHUNKED>(
-        t * TILE_M, input_ptr, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
-        blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
-        norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
-        output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
-        prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-        output_stride_m, output_stride_n, block_output_ptr,
-        block_output_stride_m, block_output_stride_n, num_blocks, eps,
-        output_eps);
-}
-
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int TILE_K, int BLOCK_X, int BLOCK_Y,
           int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>

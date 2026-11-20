@@ -78,9 +78,6 @@ enum class Error : int {
   no_such_protocol = 42,
 };
 
-enum class AddRmsNormAlgorithm : int { rows };
-enum class AddAttnResRmsNormAlgorithm : int { rows };
-
 template <typename ALGORITHM>
 struct Instance {
   ALGORITHM algorithm;
@@ -107,12 +104,6 @@ using AllReduceAddAttnResRmsNormKernel =
     decltype(&all_reduce_add_attn_res_rms_norm<
              AllReduceAddAttnResRmsNormAlgorithm{}, Protocol{}, false, T, 2, 1,
              1, 1, 64, 1, 64, 16, 1, false, false>);
-template <typename T, typename W>
-using AddRmsNormKernel =
-    decltype(&add_rms_norm<false, T, W, 1, 1, 64, 1, 64, 16, 1, false>);
-template <typename T, typename W>
-using AddAttnResRmsNormKernel =
-    decltype(&add_attn_res_rms_norm<T, 1, 1, 1, 64, 1, 64, 16, 1, false>);
 
 #include "hip_custom_communicator_instances.inc"
 #include "hip_custom_communicator_builds.inc"
