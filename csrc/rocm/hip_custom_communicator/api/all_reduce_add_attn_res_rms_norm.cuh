@@ -131,6 +131,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     protocol = Protocol::ll;
   else if (protocol_name == "lamport")
     protocol = Protocol::lamport;
+  else if (protocol_name == "simple_write")
+    protocol = Protocol::simple_write;
+  else if (protocol_name == "simple_read")
+    protocol = Protocol::simple_read;
   else
     return error_code(Error::no_such_protocol);
 
@@ -320,7 +324,9 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     const int64_t staging_stride_m = n, staging_stride_n = 1,
                   staging_size_m = m, staging_size_n = n;
 
-    const bool in_place = quantization == Quantization::exact;
+    // The Simple protocols publish in the kernel's sends.
+    const bool in_place =
+        quantization == Quantization::exact && protocol == Protocol::simple;
 
     void* const* table = nullptr;
     int table_size = 0;
@@ -350,6 +356,31 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       table_size = s.world, table_stride_n = 1;
     }
 
+    // The Simple protocols' inbox: a slot a pair of ranks, a row a block, each
+    // the tile's span.
+    int64_t inbox_stride_slot = 0, inbox_stride_m = 0, inbox_size_m = 0;
+    if (protocol == Protocol::simple_write ||
+        protocol == Protocol::simple_read) {
+      const int64_t elems = pack / e;
+      const int64_t span =
+          (tile_n + elems * block_x - 1) / (elems * block_x) * elems * block_x;
+      if (s.world * grid_x * span * e > s.symmetric.inbox_bytes ||
+          grid_x > s.connection_blocks || grid_x > s.symmetric.max_blocks)
+        return error_code(Error::unfenced_too_small);
+      inbox_stride_slot = grid_x * span, inbox_stride_m = span,
+      inbox_size_m = grid_x;
+    }
+    char* const* const inbox_ptr_array =
+        protocol == Protocol::simple_read
+            ? s.symmetric.simple_read_inbox_ptr_array
+            : s.symmetric.simple_write_inbox_ptr_array;
+    uint32_t* const* const counters_ptr_array =
+        protocol == Protocol::simple_read
+            ? s.symmetric.simple_read_counters_ptr_array
+            : s.symmetric.simple_write_counters_ptr_array;
+    int32_t* const connections = s.connections + static_cast<int>(protocol) *
+                                                     s.connection_blocks *
+                                                     s.connection_words;
     const auto launch = [&]<typename T, typename W>() {
       const auto typed =
           reinterpret_cast<AllReduceAddAttnResRmsNormKernel<T, W>>(kernel);
@@ -382,11 +413,19 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
           static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
           s.symmetric.staging_ptr_array, s.world, staging_stride_m,
           staging_stride_n, static_cast<int>(staging_size_m),
-          static_cast<int>(staging_size_n), s.symmetric.signals_ptr_array,
-          s.world, s.symmetric.max_blocks * s.world, int64_t{s.world},
-          int64_t{1}, int64_t{2}, s.symmetric.max_blocks, int64_t{s.world},
-          s.status_device, int64_t{1}, int64_t{kStatusFields}, s.rank,
-          s.timeout_ticks, num_blocks, eps, output_eps);
+          static_cast<int>(staging_size_n), inbox_ptr_array, s.world,
+          inbox_stride_slot, inbox_stride_m, int64_t{1}, s.world,
+          static_cast<int>(inbox_size_m), static_cast<int>(inbox_stride_m),
+          connections, s.connection_words, int64_t{1},
+          static_cast<int>(s.connection_blocks),
+          static_cast<int>(s.connection_words), counters_ptr_array, s.world,
+          int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world},
+          int64_t{1}, static_cast<int>(s.symmetric.max_blocks), s.world,
+          s.symmetric.signals_ptr_array, s.world,
+          s.symmetric.max_blocks * s.world, int64_t{s.world}, int64_t{1},
+          int64_t{2}, s.symmetric.max_blocks, int64_t{s.world}, s.status_device,
+          int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks,
+          num_blocks, eps, output_eps);
     };
     if (dtype == at::ScalarType::BFloat16)
       launch.template operator()<c10::BFloat16, c10::BFloat16>();
