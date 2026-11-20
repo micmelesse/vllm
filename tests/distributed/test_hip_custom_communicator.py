@@ -181,8 +181,8 @@ def test_all_reduce_correctness(monkeypatch, tp_size, quantization):
 
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("quantization", QUANTIZATIONS)
-def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
-    """Every one-shot push the table builds on LL, Lamport, simple_write and
+def test_one_shot_every_build(monkeypatch, tp_size, quantization):
+    """Every one-shot the table builds on LL, Lamport, simple_write and
     simple_read, picked or not (rows of threads too), at a grid where a block
     pushes several tiles and one where it pushes one: right, the same bits as
     every other build at the shape, and after each call the state kept from
@@ -198,14 +198,14 @@ def test_one_shot_push_every_build(monkeypatch, tp_size, quantization):
         for c in comm.state.tuned_table.configs:
             if (
                 c.kernel == "all_reduce"
-                and c.algorithm == "one_shot_push"
+                and c.algorithm == "one_shot"
                 and c.protocol in ("ll", "lamport", "simple_write", "simple_read")
                 and c.quantization == q
             ):
                 builds.setdefault(
                     (c.protocol, c.block_x, c.block_y, c.tile_n, c.pack_bytes), c
                 )
-        assert builds, "the table builds no LL or Lamport one-shot push"
+        assert builds, "the table builds no one-shot"
 
         def same_everywhere(t, where):
             got = [torch.empty_like(t) for _ in range(world)]

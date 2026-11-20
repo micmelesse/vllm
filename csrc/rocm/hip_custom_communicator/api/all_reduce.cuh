@@ -51,10 +51,10 @@ ErrorCode hip_custom_communicator_all_reduce(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   AllReduceAlgorithm algorithm;
-  if (algorithm_name == "one_shot_push")
-    algorithm = AllReduceAlgorithm::one_shot_push;
-  else if (algorithm_name == "two_shot_push")
-    algorithm = AllReduceAlgorithm::two_shot_push;
+  if (algorithm_name == "one_shot")
+    algorithm = AllReduceAlgorithm::one_shot;
+  else if (algorithm_name == "two_shot")
+    algorithm = AllReduceAlgorithm::two_shot;
   else
     return error_code(Error::no_such_kernel);
   Protocol protocol;
@@ -111,7 +111,7 @@ ErrorCode hip_custom_communicator_all_reduce(
 
   const int shared_memory_bytes = 0;
 
-  const bool two_shot = algorithm == AllReduceAlgorithm::two_shot_push;
+  const bool two_shot = algorithm == AllReduceAlgorithm::two_shot;
   const bool contiguous = two_shot && input_stride_m == n * input_stride_n &&
                           output_stride_m == n * output_stride_n;
   const bool tail = quantize_int4 &&
@@ -170,7 +170,7 @@ ErrorCode hip_custom_communicator_all_reduce(
   int64_t unfenced_stride_slot = 0, unfenced_stride_m = 0,
           unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0,
           unfenced_size_n = 0;
-  if (algorithm == AllReduceAlgorithm::two_shot_push) {
+  if (algorithm == AllReduceAlgorithm::two_shot) {
     // The two-shot is the Simple protocols': a slot a pair of ranks, a row a
     // block, each a chunk (exact, the tile; INT4, a group a lane, as the
     // stage's).

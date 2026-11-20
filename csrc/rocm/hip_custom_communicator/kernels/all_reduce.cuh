@@ -14,14 +14,14 @@
 namespace hip_custom_communicator {
 
 enum class AllReduceAlgorithm {
-  one_shot_push,
-  two_shot_push,
+  one_shot,
+  two_shot,
 };
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
-DINLINE void all_reduce_one_shot_push(
+DINLINE void all_reduce_one_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
@@ -46,7 +46,7 @@ DINLINE void all_reduce_one_shot_push(
   constexpr int kRows = TILE_M / kThreadsM;
 
   constexpr int kPackElems =
-      kTilePushPackElems<PROTOCOL, QUANTIZE_INT4, DTYPE, PACK_BYTES>;
+      kTilePackElems<PROTOCOL, QUANTIZE_INT4, DTYPE, PACK_BYTES>;
 
   constexpr int kUnit = QUANTIZE_INT4 ? kInt4Group : kPackElems;
   constexpr int kTileN = (TILE_N + kUnit - 1) / kUnit * kUnit;
@@ -70,8 +70,8 @@ DINLINE void all_reduce_one_shot_push(
         kWhole ? input_size_n : min(input_size_n, offs_n + kTileN);
 
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
-    all_gather<AllGatherAlgorithm::tile_push, PROTOCOL, QUANTIZE_INT4, DTYPE,
-               WORLD, TILE_M, kTileN, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
+    all_gather<AllGatherAlgorithm::tile, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
+               TILE_M, kTileN, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
                CONTIGUOUS, TAIL>(
         input_ptr, 0, input_stride_m, input_stride_n, input_size_m,
         input_size_n, copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
@@ -113,7 +113,7 @@ DINLINE void all_reduce_one_shot_push(
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
-DINLINE void all_reduce_two_shot_push(
+DINLINE void all_reduce_two_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, DTYPE* output_ptr,
     int64_t output_stride_m, int64_t output_stride_n,
@@ -146,8 +146,7 @@ DINLINE void all_reduce_two_shot_push(
   // one peer, w; the inbox row is the block's.
   if constexpr (QUANTIZE_INT4) {
     // INT4: a lane holds a group a round (the sum's shared memory holds no
-    // more at a 512-thread block); the shares are whole
-    // groups, as Simple's, so the groups and their scales are Simple's.
+    // more at a 512-thread block); the shares are whole groups.
     // The parts are quantized to send, the sum is taken in float from the
     // dequantized parts, and the sum is quantized again for the all-gather.
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -387,10 +386,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
     int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks) {
-  if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot_push)
-    all_reduce_one_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+  if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot)
+    all_reduce_one_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
+                        BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                        TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
@@ -404,10 +403,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU) all_reduce(
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
-  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot_push)
-    all_reduce_two_shot_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
-                             TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
-                             CONTIGUOUS, TAIL>(
+  else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot)
+    all_reduce_two_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
+                        BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
+                        TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         output_ptr, output_stride_m, output_stride_n, partials_ptr_array,
         partials_ptr_array_size, partials_stride_m, partials_stride_n,

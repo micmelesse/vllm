@@ -211,11 +211,11 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                 ):
                     raise SystemExit(f"{path}: {arch}: {build}: Simple is gone")
                 # Rows of threads, each a peer's sends and receives, are the
-                # one-shot push's on LL or Lamport, in whole waves; every other
+                # one-shot's on LL or Lamport, in whole waves; every other
                 # kernel is one row.
                 if build.block_y != 1 and (
                     "block_y" not in TEMPLATE_ARGS[build.kernel].split()
-                    or build.algorithm != "one_shot_push"
+                    or build.algorithm != "one_shot"
                     or build.protocol == "simple"
                     or build.block_y not in WORLDS
                     or build.block_x % WAVE_SIZE != 0
@@ -229,21 +229,21 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                 # two-shot's so far and the fused norms' one-shots and columns
                 # two-shots, one row of whole waves.
                 moved = {
-                    "all_reduce": ("one_shot_push", "two_shot_push"),
+                    "all_reduce": ("one_shot", "two_shot"),
                     "all_reduce_add_rms_norm": (
-                        "one_shot_pull",
-                        "two_shot_pull_columns",
+                        "one_shot",
+                        "two_shot",
                     ),
                     "all_reduce_add_attn_res_rms_norm": (
-                        "one_shot_pull",
-                        "two_shot_pull_columns",
+                        "one_shot",
+                        "two_shot",
                     ),
                 }
                 # INT4 so far: the two-shots.
                 moved_int4 = {
-                    ("all_reduce", "two_shot_push"),
-                    ("all_reduce_add_rms_norm", "two_shot_pull_columns"),
-                    ("all_reduce_add_attn_res_rms_norm", "two_shot_pull_columns"),
+                    ("all_reduce", "two_shot"),
+                    ("all_reduce_add_rms_norm", "two_shot"),
+                    ("all_reduce_add_attn_res_rms_norm", "two_shot"),
                 }
                 if build.protocol in ("simple_write", "simple_read") and (
                     build.algorithm not in moved.get(build.kernel, ())

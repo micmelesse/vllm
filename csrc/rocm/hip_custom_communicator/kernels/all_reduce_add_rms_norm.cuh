@@ -13,10 +13,7 @@
 
 namespace hip_custom_communicator {
 
-enum class AllReduceAddRmsNormKernelAlgorithm {
-  one_shot_pull,
-  two_shot_pull_columns
-};
+enum class AllReduceAddRmsNormKernelAlgorithm { one_shot, two_shot };
 
 template <bool RESIDUAL, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           typename DTYPE, typename WEIGHT_DTYPE, int ROWS, int K, int P>
@@ -194,7 +191,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
 template <Protocol PROTOCOL, bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
           typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
-DINLINE void all_reduce_add_rms_norm_one_shot_pull(
+DINLINE void all_reduce_add_rms_norm_one_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
     int input_ptr_array_size, int64_t input_ptr_array_stride_m,
@@ -220,8 +217,8 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     int64_t status_stride_field, int status_size_field, int rank,
     uint64_t timeout_ticks, float eps) {
   // A tile is a round: this rank's tile to every rank, every rank's from
-  // each, through the protocol's inbox (the block's row); the sum and the
-  // norm as the pull's.
+  // each, through the protocol's inbox (the block's row), summed and
+  // normalized.
   static_assert(!QUANTIZE_INT4 && TILE_M == 1,
                 "the Simple protocols' fused one-shot is exact, a row a tile");
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -308,7 +305,7 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
 template <Protocol PROTOCOL, bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
           typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
-DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
+DINLINE void all_reduce_add_rms_norm_two_shot(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const DTYPE* const* input_ptr_array,
     int input_ptr_array_size, int64_t input_ptr_array_stride_m,
@@ -342,8 +339,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot_pull_columns(
   // this rank's from every rank, summed) and the all-gather (the sum to
   // every rank, share w's chunk from rank w). Each lane group talks to one
   // peer, w; the inbox row is the block's. The gathered row is stored and
-  // normalized there, as the chunked pull's.
-  // INT4: a share is whole groups, as Simple's, and a lane holds a group a
+  // normalized there, a chunk at a time.
+  // INT4: a share is whole groups, and a lane holds a group a
   // round; the parts go quantized, are summed in float from their
   // dequantized values, and the sum goes quantized again.
   static_assert(TILE_M == 1,
@@ -569,8 +566,8 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
   static_assert(
       PROTOCOL == Protocol::simple_write || PROTOCOL == Protocol::simple_read,
       "the fused add_rms_norm is simple_write or simple_read");
-  if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)
-    all_reduce_add_rms_norm_one_shot_pull<
+  if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot)
+    all_reduce_add_rms_norm_one_shot<
         PROTOCOL, RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M,
         TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
@@ -590,9 +587,8 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,
         eps);
-  else if constexpr (ALGORITHM ==
-                     AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns)
-    all_reduce_add_rms_norm_two_shot_pull_columns<
+  else if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::two_shot)
+    all_reduce_add_rms_norm_two_shot<
         PROTOCOL, RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M,
         TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,

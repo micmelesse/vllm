@@ -73,10 +73,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
     return error_code(Error::no_such_protocol);
 
   AllReduceAddRmsNormKernelAlgorithm algorithm{};
-  if (algorithm_name == "one_shot_pull")
-    algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot_pull;
-  else if (algorithm_name == "two_shot_pull_columns")
-    algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot_pull_columns;
+  if (algorithm_name == "one_shot")
+    algorithm = AllReduceAddRmsNormKernelAlgorithm::one_shot;
+  else if (algorithm_name == "two_shot")
+    algorithm = AllReduceAddRmsNormKernelAlgorithm::two_shot;
   else
     return error_code(Error::no_such_kernel);
   // The splits' norm-kernel fields: no split is built.
@@ -242,7 +242,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   if (simple_protocol) {
     const int64_t elems = pack_bytes / e;
     const int64_t span =
-        algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull
+        algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot
             ? (tile_n + elems * block_x - 1) / (elems * block_x) * elems *
                   block_x
         : quantize_int4 ? block_x / s.world * kInt4Group

@@ -16,13 +16,13 @@
 
 namespace hip_custom_communicator {
 
-enum class AllGatherAlgorithm { tile_push };
+enum class AllGatherAlgorithm { tile };
 
-// The elements a thread packs per access in a tile push. An LL line is half
+// The elements a thread packs per access in a tile gather. An LL line is half
 // data, so exact LL packs no wider than a line's payload; Lamport's is all
 // data.
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int PACK_BYTES>
-constexpr int kTilePushPackElems =
+constexpr int kTilePackElems =
     QUANTIZE_INT4 || PROTOCOL != Protocol::ll
         ? traits<DTYPE, PACK_BYTES>::N
         : (PACK_BYTES < kLinePayloadBytes ? PACK_BYTES : kLinePayloadBytes) /
@@ -44,7 +44,7 @@ namespace internal {
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
-DINLINE void all_gather_tile_push(
+DINLINE void all_gather_tile(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
     char* const* staging_ptr_array, int staging_ptr_array_size,
     char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
@@ -65,7 +65,7 @@ DINLINE void all_gather_tile_push(
   static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
                     PROTOCOL == Protocol::simple_write ||
                     PROTOCOL == Protocol::simple_read,
-                "a tile push is LL, Lamport, simple_write or simple_read");
+                "a tile gather is LL, Lamport, simple_write or simple_read");
   // The block's row of the inbox (CONNECTION).
   const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
   const int lines_m = first_row + clip_m;
@@ -117,7 +117,7 @@ DINLINE void all_gather_tile_push(
 }  // namespace internal
 
 // Every rank contributes a chunk; every rank ends with every rank's chunk.
-// tile_push gathers each rank's copy of one tile into output[WORLD], for the
+// tile gathers each rank's copy of one tile into output[WORLD], for the
 // caller to sum, from this rank's input.
 template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
           typename DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
@@ -142,10 +142,9 @@ DINLINE void all_gather(
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
     int rank, uint64_t timeout_ticks) {
-  if constexpr (ALGORITHM == AllGatherAlgorithm::tile_push)
-    internal::all_gather_tile_push<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
-                                   TILE_M, TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                                   TAIL>(
+  if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
+    internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
+                              TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
         input, input_stride_m, input_stride_n, staging_ptr_array,
         staging_ptr_array_size, unfenced_ptr_array, unfenced_ptr_array_size,
         unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,

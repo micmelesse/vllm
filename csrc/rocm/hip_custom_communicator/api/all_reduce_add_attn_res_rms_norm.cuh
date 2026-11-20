@@ -201,10 +201,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
                    static_cast<unsigned>(block_z));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   AllReduceAddAttnResRmsNormAlgorithm algorithm;
-  if (algorithm_name == "one_shot_pull")
-    algorithm = AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull;
-  else if (algorithm_name == "two_shot_pull_columns")
-    algorithm = AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns;
+  if (algorithm_name == "one_shot")
+    algorithm = AllReduceAddAttnResRmsNormAlgorithm::one_shot;
+  else if (algorithm_name == "two_shot")
+    algorithm = AllReduceAddAttnResRmsNormAlgorithm::two_shot;
   else
     return error_code(Error::no_such_kernel);
   if (quantization_name != "exact" && quantization_name != "int4")
@@ -254,7 +254,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
   const bool simple_two_shot =
       (protocol == Protocol::simple_write ||
        protocol == Protocol::simple_read) &&
-      algorithm == AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns;
+      algorithm == AllReduceAddAttnResRmsNormAlgorithm::two_shot;
   const int shared_memory_bytes =
       n > tile_n || simple_two_shot
           ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float))
