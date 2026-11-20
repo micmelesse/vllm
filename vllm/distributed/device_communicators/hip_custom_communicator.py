@@ -47,45 +47,25 @@ Protocol = Literal["ll", "lamport", "simple_write", "simple_read"]
 
 
 AllReduceAlgorithm = Literal[
-    "one_shot_pull",
     "one_shot_push",
-    "two_shot_pull",
     "two_shot_push",
 ]
 
 AllReduceAddRmsNormAlgorithm = Literal[
     "one_shot_pull",
-    "two_shot_pull_rows",
     "two_shot_pull_columns",
-    "two_shot_push",
-    "one_shot_pull_split",
-    "one_shot_push_split",
-    "two_shot_pull_split",
-    "two_shot_push_split",
 ]
 
 AllReduceAddAttnResRmsNormAlgorithm = Literal[
     "one_shot_pull",
-    "two_shot_pull_rows",
     "two_shot_pull_columns",
-    "two_shot_push",
-    "one_shot_pull_split",
-    "one_shot_push_split",
-    "two_shot_pull_split",
-    "two_shot_push_split",
 ]
 
 Algorithm = Literal[
     "one_shot_pull",
     "one_shot_push",
-    "two_shot_pull",
-    "two_shot_pull_rows",
     "two_shot_pull_columns",
     "two_shot_push",
-    "one_shot_pull_split",
-    "one_shot_push_split",
-    "two_shot_pull_split",
-    "two_shot_push_split",
 ]
 
 ABANDON_WAIT_S = 2.0

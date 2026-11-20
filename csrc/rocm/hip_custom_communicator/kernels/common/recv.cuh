@@ -1,7 +1,7 @@
 #pragma once
 
-// recv: a peer's data into registers, by its protocol (recv_simple, recv_ll,
-// recv_lamport).
+// recv: a peer's data into registers, by its protocol (recv_ll, recv_lamport,
+// recv_simple_write, recv_simple_read; recv_simple moves their data).
 
 #include "dequantize.cuh"
 #include "types.cuh"
@@ -1796,17 +1796,9 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
                   int counters_size_peer = 0, uint32_t* status_ptr = nullptr,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
-      connection == nullptr)
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && connection == nullptr)
     internal::check_failed();
-  if constexpr (PROTOCOL == Protocol::simple) {
-    internal::recv_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                          QUANTIZE_INT4, LAYOUT, TAIL>(
-        input_ptr_array, input_ptr_array_size, input_rank, input_slot,
-        input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
-        input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step);
-  } else if constexpr (PROTOCOL == Protocol::ll) {
+  if constexpr (PROTOCOL == Protocol::ll) {
     internal::recv_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                       LAYOUT, TAIL>(
         input_ptr_array, input_ptr_array_size, input_rank, input_slot,

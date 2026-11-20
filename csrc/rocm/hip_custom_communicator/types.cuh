@@ -25,7 +25,6 @@
 #include "kernels/all_reduce_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_add_rms_norm.cuh"
 #include "kernels/common/types.cuh"
-#include "kernels/reduce_scatter.cuh"
 
 namespace hip_custom_communicator {
 
@@ -80,17 +79,6 @@ enum class Error : int {
   peer_not_accessible = 40,
   peers_not_opened = 41,
   no_such_protocol = 42,
-};
-
-enum class AllReduceAddRmsNormAlgorithm : int {
-  one_shot_pull,
-  two_shot_pull_rows,
-  two_shot_pull_columns,
-  two_shot_push,
-  one_shot_pull_split,
-  one_shot_push_split,
-  two_shot_pull_split,
-  two_shot_push_split,
 };
 
 enum class AddRmsNormAlgorithm : int { rows };
@@ -202,8 +190,8 @@ struct CommsState {
   SymmetricMemory symmetric;
 
   // The blocks' connections (CONNECTION, kernels/common/types.cuh): a region a
-  // protocol, at its Protocol value (simple, LL, Lamport), connection_blocks
-  // blocks of connection_words words each.
+  // protocol, at its Protocol value (LL, Lamport, simple_write, simple_read),
+  // connection_blocks blocks of connection_words words each.
   int32_t* connections = nullptr;
   int64_t connection_blocks = 0, connection_words = 0;
   uint32_t* status_device = nullptr;

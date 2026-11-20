@@ -203,7 +203,7 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   allocate(symmetric.simple_write_inbox_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_read_inbox_ptr_array, ptr_array_bytes, false);
   allocate(s->connections,
-           5 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
+           4 * lamport_blocks * kConnectionWords * int64_t{sizeof(int32_t)},
            false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
   allocate(s->input_tables.device,
@@ -338,7 +338,7 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
       torch::from_blob(s.symmetric.lamport, {s.symmetric.lamport_bytes},
                        on.dtype(torch::kUInt8)),
       torch::from_blob(s.connections,
-                       {5, s.connection_blocks, s.connection_words},
+                       {4, s.connection_blocks, s.connection_words},
                        on.dtype(torch::kInt32)),
   };
 }

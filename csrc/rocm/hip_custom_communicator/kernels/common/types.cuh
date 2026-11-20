@@ -141,12 +141,11 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 // wait behind no vector store (a block's connection, CONNECTION).
 enum class Layout { tile, run, flat, group_run, group_flat, block };
 
-// How a receiver knows a peer's data has arrived. simple: the data, then a
-// barrier (the Simple stages not yet moved). ll: a flag in every line, half
-// the line payload. lamport: the data, its sentinel gone. simple_write: the
-// data in the receiver's staging, then a counter (COUNTERS). simple_read: the
-// data in the sender's own staging, then a counter; the receiver loads it.
-enum class Protocol { simple, ll, lamport, simple_write, simple_read };
+// How a receiver knows a peer's data has arrived. ll: a flag in every line,
+// half the line payload. lamport: the data, its sentinel gone. simple_write:
+// the data in the receiver's inbox, then a counter (COUNTERS). simple_read:
+// the data in the sender's own inbox, then a counter; the receiver loads it.
+enum class Protocol { ll, lamport, simple_write, simple_read };
 
 // COUNTERS: simple_write's head and tail, a pair a block and peer in each
 // rank's signals (after the barrier's flags), polled where they live. A

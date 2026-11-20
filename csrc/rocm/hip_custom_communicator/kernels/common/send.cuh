@@ -1,7 +1,7 @@
 #pragma once
 
-// send: registers into a peer's memory, by its protocol (send_simple, send_ll,
-// send_lamport).
+// send: registers into a peer's memory, by its protocol (send_ll, send_lamport,
+// send_simple_write, send_simple_read; send_simple moves their data).
 
 #include "quantize.cuh"
 #include "types.cuh"
@@ -1245,8 +1245,7 @@ DINLINE void send(
     int counters_size_block = 0, int counters_size_peer = 0,
     uint32_t* status_ptr = nullptr, int64_t status_stride_field = 0,
     int status_size_field = 0, uint64_t timeout_ticks = 0) {
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && PROTOCOL != Protocol::simple &&
-      connection == nullptr)
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && connection == nullptr)
     internal::check_failed();
   // simple_read waits on and posts to every receiver at once: the leaf takes
   // the set.
@@ -1265,14 +1264,7 @@ DINLINE void send(
 #pragma unroll
     for (int j = 0; j < output_rank_count; ++j) {
       const int r = j == 0 ? output_rank : (output_rank + j) % WORLD;
-      if constexpr (PROTOCOL == Protocol::simple) {
-        internal::send_simple<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                              QUANTIZE_INT4, LAYOUT, TAIL>(
-            input, output_ptr_array, output_ptr_array_size, r, output_slot,
-            output_stride_slot, output_stride_m, output_stride_n,
-            output_size_slot, output_size_m, output_size_n, clip_m, clip_n,
-            offs_m, offs_n, row_step);
-      } else if constexpr (PROTOCOL == Protocol::ll) {
+      if constexpr (PROTOCOL == Protocol::ll) {
         internal::send_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                           QUANTIZE_INT4, LAYOUT, TAIL>(
             input, output_ptr_array, output_ptr_array_size, r, output_slot,

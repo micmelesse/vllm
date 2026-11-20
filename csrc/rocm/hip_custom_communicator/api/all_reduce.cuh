@@ -51,20 +51,14 @@ ErrorCode hip_custom_communicator_all_reduce(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   AllReduceAlgorithm algorithm;
-  if (algorithm_name == "one_shot_pull")
-    algorithm = AllReduceAlgorithm::one_shot_pull;
-  else if (algorithm_name == "one_shot_push")
+  if (algorithm_name == "one_shot_push")
     algorithm = AllReduceAlgorithm::one_shot_push;
-  else if (algorithm_name == "two_shot_pull")
-    algorithm = AllReduceAlgorithm::two_shot_pull;
   else if (algorithm_name == "two_shot_push")
     algorithm = AllReduceAlgorithm::two_shot_push;
   else
     return error_code(Error::no_such_kernel);
   Protocol protocol;
-  if (protocol_name == "simple")
-    protocol = Protocol::simple;
-  else if (protocol_name == "ll")
+  if (protocol_name == "ll")
     protocol = Protocol::ll;
   else if (protocol_name == "lamport")
     protocol = Protocol::lamport;
@@ -115,13 +109,9 @@ ErrorCode hip_custom_communicator_all_reduce(
 
   const bool quantize_int4 = int4_config;
 
-  const bool in_place = (algorithm == AllReduceAlgorithm::one_shot_pull ||
-                         algorithm == AllReduceAlgorithm::two_shot_pull) &&
-                        !quantize_int4;
   const int shared_memory_bytes = 0;
 
-  const bool two_shot = algorithm == AllReduceAlgorithm::two_shot_pull ||
-                        algorithm == AllReduceAlgorithm::two_shot_push;
+  const bool two_shot = algorithm == AllReduceAlgorithm::two_shot_push;
   const bool contiguous = two_shot && input_stride_m == n * input_stride_n &&
                           output_stride_m == n * output_stride_n;
   const bool tail = quantize_int4 &&
@@ -177,161 +167,55 @@ ErrorCode hip_custom_communicator_all_reduce(
   if (grid_x > blocks_a_cu * s.device.compute_units)
     return error_code(Error::grid_not_resident);
 
-  const int64_t packs = n * e / pack_bytes;
-  const int64_t slice_bytes = (packs + s.world - 1) / s.world * pack_bytes;
-  const int64_t slot = (m * packs + s.world - 1) / s.world * pack_bytes / e;
-
-  const int64_t share = ((m * n + kInt4Group - 1) / kInt4Group + s.world - 1) /
-                        s.world * kInt4Group;
-  int64_t staging_need = quantize_int4 ? 0 : m * n * e, partials_need = 0;
-  int64_t partials_stride_m = slice_bytes / e, partials_stride_n = 1,
-          partials_size_m = 0, partials_size_n = slice_bytes / e;
-  int64_t staging_stride_m = 0, staging_stride_n = 0, staging_size_m = 0,
-          staging_size_n = 0;
   int64_t unfenced_stride_slot = 0, unfenced_stride_m = 0,
           unfenced_stride_n = 0, unfenced_size_slot = 0, unfenced_size_m = 0,
           unfenced_size_n = 0;
-  switch (algorithm) {
-    case AllReduceAlgorithm::two_shot_pull:
-    case AllReduceAlgorithm::two_shot_push:
-      // The Simple protocols' two-shot: a slot a pair of ranks, a row a
-      // block, each a chunk.
-      if (protocol == Protocol::simple_write ||
-          protocol == Protocol::simple_read) {
-        // Exact, a chunk is the tile; INT4, a group a lane, as the stage's.
-        const int64_t elems = pack_bytes / e;
-        const int64_t lanes = block_x / s.world;
-        const int64_t row = quantize_int4
-                                ? lanes * kInt4Group
-                                : (tile_n + elems - 1) / elems * elems;
-        if (s.world * grid_x * row * e > s.symmetric.inbox_bytes ||
-            grid_x > s.symmetric.max_blocks)
-          return error_code(Error::unfenced_too_small);
-        unfenced_stride_slot = grid_x * row, unfenced_stride_m = row,
-        unfenced_stride_n = 1;
-        unfenced_size_slot = s.world, unfenced_size_m = grid_x,
-        unfenced_size_n = row;
-        staging_need = 0, partials_need = 0;
-        break;
-      }
-      staging_need = m * n * e, partials_need = m * slice_bytes;
-      if (quantize_int4) {
-        partials_stride_m = share, partials_size_m = 1, partials_size_n = share;
-        staging_stride_m = s.world * share, staging_stride_n = 1,
-        staging_size_m = 1, staging_size_n = s.world * share;
-        staging_need =
-            std::max(staging_need, int4_payload_bytes(1, s.world * share));
-        partials_need = std::max(partials_need, int4_payload_bytes(1, share));
-      } else {
-        partials_size_m = m;
-        if (algorithm == AllReduceAlgorithm::two_shot_push) {
-          staging_stride_m = slot, staging_stride_n = 1,
-          staging_size_m = s.world, staging_size_n = slot;
-          staging_need = std::max(staging_need, s.world * slot * e);
-        }
-      }
-      break;
-    case AllReduceAlgorithm::one_shot_pull:
-
-      if (quantize_int4) {
-        partials_stride_m = 0, partials_size_n = 0;
-        staging_stride_n = 1, staging_size_m = 1,
-        staging_size_n = (int4_payload_bytes(m, n) + e - 1) / e;
-        staging_need = int4_payload_bytes(m, n);
-      }
-      break;
-    case AllReduceAlgorithm::one_shot_push:
-      // simple_write's and simple_read's inbox: a slot a pair of ranks (the
-      // writer's in the reader's inbox, or the reader's in the writer's), a
-      // row a block, each the tile.
-      if (protocol == Protocol::simple_write ||
-          protocol == Protocol::simple_read) {
-        if (grid_x * tile_m > s.symmetric.lamport_blocks ||
-            (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
-                s.symmetric.unfenced_slot_bytes)
-          return error_code(Error::unfenced_too_small);
-        const int64_t blocks = s.symmetric.lamport_blocks;
-        unfenced_stride_slot = blocks * (s.symmetric.unfenced_slot_bytes / e);
-        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-        unfenced_stride_n = 1;
-        unfenced_size_slot = s.world, unfenced_size_m = blocks,
-        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-        break;
-      }
-      // LL's and Lamport's inboxes have the same rows; LL's lines are twice
-      // as wide, half data.
-      if (protocol != Protocol::simple) {
-        const int64_t blocks = protocol == Protocol::lamport
-                                   ? s.symmetric.lamport_blocks
-                                   : s.symmetric.unfenced_blocks;
-        const int64_t banks =
-            protocol == Protocol::lamport ? kLamportBanks : kLlBanks;
-        unfenced_stride_slot =
-            banks * blocks * (s.symmetric.unfenced_slot_bytes / e);
-        unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
-        unfenced_stride_n = 1;
-        unfenced_size_slot = s.world, unfenced_size_m = banks * blocks,
-        unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
-        break;
-      }
-      {
-        const int64_t payload =
-            quantize_int4 ? int4_payload_bytes(m, n) : m * n * e;
-        const int64_t slot_bytes = quantize_int4
-                                       ? (payload + kInt4ScalesAlign - 1) /
-                                             kInt4ScalesAlign * kInt4ScalesAlign
-                                       : payload;
-        partials_stride_m = 0, partials_size_n = 0;
-        staging_stride_n = 1, staging_size_m = 1,
-        staging_size_n = (s.world * slot_bytes + e - 1) / e;
-        staging_need = s.world * slot_bytes;
-        break;
-      }
-  }
-
-  const int64_t staging_end =
-      staging_size_m == 0 || staging_size_n == 0
-          ? 0
-          : ((staging_size_m - 1) * staging_stride_m +
-             (staging_size_n - 1) * staging_stride_n + 1) *
-                e;
-  const int64_t partials_end =
-      partials_size_m == 0 || partials_size_n == 0
-          ? 0
-          : ((partials_size_m - 1) * partials_stride_m +
-             (partials_size_n - 1) * partials_stride_n + 1) *
-                e;
-  if (std::max(staging_need, staging_end) > s.symmetric.staging_bytes)
-    return error_code(Error::staging_too_small);
-  if (std::max(partials_need, partials_end) > s.symmetric.partials_bytes)
-    return error_code(Error::partials_too_small);
-
-  void* const* peer_inputs = nullptr;
-  int peer_inputs_size = 0;
-  int64_t peer_inputs_stride_m = staging_stride_m,
-          peer_inputs_stride_n = staging_stride_n;
-  if (in_place) {
-    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-    if (hipStreamIsCapturing(stream, &capture) != hipSuccess)
-      return error_code(Error::hip_failed);
-    InputTables& tables = s.input_tables;
-    if (capture == hipStreamCaptureStatusActive) {
-      if (tables.next_slot >= tables.slots)
-        return error_code(Error::tables_full);
-      tables.pending.emplace_back(tables.next_slot, input_ptr);
-      peer_inputs = tables.device + tables.next_slot * s.world;
-      peer_inputs_stride_m = input_stride_m;
-      ++tables.next_slot;
-    } else {
-      if (hipMemcpy2DAsync(s.symmetric.staging, static_cast<size_t>(n * e),
-                           input_ptr, static_cast<size_t>(input_stride_m * e),
-                           static_cast<size_t>(n * e), static_cast<size_t>(m),
-                           hipMemcpyDeviceToDevice, stream) != hipSuccess)
-        return error_code(Error::hip_failed);
-      peer_inputs = tables.device;
-      peer_inputs_stride_m = n;
-    }
-    peer_inputs_size = s.world, peer_inputs_stride_n = 1;
+  if (algorithm == AllReduceAlgorithm::two_shot_push) {
+    // The two-shot is the Simple protocols': a slot a pair of ranks, a row a
+    // block, each a chunk (exact, the tile; INT4, a group a lane, as the
+    // stage's).
+    if (protocol != Protocol::simple_write && protocol != Protocol::simple_read)
+      return error_code(Error::not_built);
+    const int64_t elems = pack_bytes / e;
+    const int64_t lanes = block_x / s.world;
+    const int64_t row = quantize_int4 ? lanes * kInt4Group
+                                      : (tile_n + elems - 1) / elems * elems;
+    if (s.world * grid_x * row * e > s.symmetric.inbox_bytes ||
+        grid_x > s.symmetric.max_blocks)
+      return error_code(Error::unfenced_too_small);
+    unfenced_stride_slot = grid_x * row, unfenced_stride_m = row,
+    unfenced_stride_n = 1;
+    unfenced_size_slot = s.world, unfenced_size_m = grid_x,
+    unfenced_size_n = row;
+  } else if (protocol == Protocol::simple_write ||
+             protocol == Protocol::simple_read) {
+    // The one-shot's simple_write and simple_read inbox: a slot a pair of
+    // ranks (the writer's in the reader's inbox, or the reader's in the
+    // writer's), a row a block, each the tile.
+    if (grid_x * tile_m > s.symmetric.lamport_blocks ||
+        (tile_n * e + pack_bytes - 1) / pack_bytes * pack_bytes >
+            s.symmetric.unfenced_slot_bytes)
+      return error_code(Error::unfenced_too_small);
+    const int64_t blocks = s.symmetric.lamport_blocks;
+    unfenced_stride_slot = blocks * (s.symmetric.unfenced_slot_bytes / e);
+    unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+    unfenced_stride_n = 1;
+    unfenced_size_slot = s.world, unfenced_size_m = blocks,
+    unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
+  } else {
+    // LL's and Lamport's inboxes have the same rows; LL's lines are twice
+    // as wide, half data.
+    const int64_t blocks = protocol == Protocol::lamport
+                               ? s.symmetric.lamport_blocks
+                               : s.symmetric.unfenced_blocks;
+    const int64_t banks =
+        protocol == Protocol::lamport ? kLamportBanks : kLlBanks;
+    unfenced_stride_slot =
+        banks * blocks * (s.symmetric.unfenced_slot_bytes / e);
+    unfenced_stride_m = s.symmetric.unfenced_slot_bytes / e,
+    unfenced_stride_n = 1;
+    unfenced_size_slot = s.world, unfenced_size_m = banks * blocks,
+    unfenced_size_n = s.symmetric.unfenced_slot_bytes / e;
   }
 
   char* const* const inbox_ptr_array =
@@ -354,16 +238,12 @@ ErrorCode hip_custom_communicator_all_reduce(
     typed<<<grid, block, shared_memory_bytes, stream>>>(
         static_cast<const T*>(input_ptr), input_stride_m, input_stride_n,
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
-        reinterpret_cast<const T* const*>(peer_inputs), peer_inputs_size,
-        peer_inputs_stride_m, peer_inputs_stride_n, static_cast<T*>(output_ptr),
-        output_stride_m, output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), s.symmetric.partials_ptr_array,
-        s.world, partials_stride_m, partials_stride_n,
-        static_cast<int>(partials_size_m), static_cast<int>(partials_size_n),
-        s.symmetric.staging_ptr_array, s.world, staging_stride_m,
-        staging_stride_n, static_cast<int>(staging_size_m),
-        static_cast<int>(staging_size_n), inbox_ptr_array, s.world,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+        static_cast<const T* const*>(nullptr), 0, 0, 0,
+        static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
+        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+        s.symmetric.partials_ptr_array, s.world, 0, 0, 0, 0,
+        s.symmetric.staging_ptr_array, s.world, 0, 0, 0, 0, inbox_ptr_array,
+        s.world, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
         static_cast<int>(unfenced_size_slot), static_cast<int>(unfenced_size_m),
         static_cast<int>(unfenced_size_n), connections, s.connection_words,
         int64_t{1}, static_cast<int>(s.connection_blocks),
