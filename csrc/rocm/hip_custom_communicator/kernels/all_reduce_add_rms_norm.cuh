@@ -16,16 +16,14 @@ enum class AllReduceAddRmsNormKernelAlgorithm { one_shot, two_shot };
 
 template <bool RESIDUAL, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           typename DTYPE, typename WEIGHT_DTYPE, int ROWS, int K, int P>
-DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
-                               const WEIGHT_DTYPE (&w)[1][K][P],
-                               int input_size_m, int input_size_n,
-                               const DTYPE* residual_ptr,
-                               int64_t residual_stride_m,
-                               int64_t residual_stride_n, DTYPE* output_ptr,
-                               int64_t output_stride_m, int64_t output_stride_n,
-                               DTYPE* residual_output_ptr,
-                               int64_t residual_output_stride_m,
-                               int64_t residual_output_stride_n, float eps) {
+DINLINE void all_reduce_add_rms_norm_rows(
+    int offs_m, const DTYPE (&sum)[ROWS][K][P],
+    const WEIGHT_DTYPE (&w)[1][K][P], int input_size_m, int input_size_n,
+    const DTYPE* residual_ptr, int64_t residual_stride_m,
+    int64_t residual_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
+    int64_t output_stride_n, DTYPE* residual_output_ptr,
+    int64_t residual_output_stride_m, int64_t residual_output_stride_n,
+    float eps) {
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   DTYPE res[ROWS][K][P];
@@ -62,7 +60,7 @@ DINLINE void add_rms_norm_rows(int offs_m, const DTYPE (&sum)[ROWS][K][P],
 template <bool RESIDUAL, typename DTYPE, typename WEIGHT_DTYPE, int TILE_M,
           int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES,
           bool CHUNKED>
-DINLINE void add_rms_norm_rows(
+DINLINE void all_reduce_add_rms_norm_rows(
     int offs_m, const DTYPE* input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
@@ -153,7 +151,7 @@ DINLINE void add_rms_norm_rows(
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
         weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
-    add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+    all_reduce_add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
         offs_m, x, w, m, n, residual_ptr, residual_stride_m, residual_stride_n,
         output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
         residual_output_stride_m, residual_output_stride_n, eps);
@@ -246,15 +244,16 @@ DINLINE void all_reduce_add_rms_norm_one_shot(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+        all_reduce_add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
             row, sum, w, m, n, residual_ptr, residual_stride_m,
             residual_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
     if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
-                        BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      all_reduce_add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M,
+                                   TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                                   PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
           residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
           output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
@@ -461,8 +460,8 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
     // The row is in output, each share stored by its lane group; the norm
     // reads it a tile at a time.
     __syncthreads();
-    add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N, BLOCK_X,
-                      BLOCK_Y, WAVE_SIZE, PACK_BYTES, true>(
+    all_reduce_add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, 1, TILE_N,
+                                 BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, true>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
         residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
         output_ptr, output_stride_m, output_stride_n, residual_output_ptr,

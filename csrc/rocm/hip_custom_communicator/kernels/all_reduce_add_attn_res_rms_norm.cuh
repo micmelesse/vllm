@@ -16,7 +16,7 @@ enum class AllReduceAddAttnResRmsNormAlgorithm { one_shot, two_shot };
 
 template <int TILE_K, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, typename DTYPE,
           int ROWS, int K, int P>
-DINLINE void add_attn_res_rms_norm_rows(
+DINLINE void all_reduce_add_attn_res_rms_norm_rows(
     int offs_m, const DTYPE (&sum)[ROWS][K][P], int input_size_m,
     int input_size_n, const DTYPE* prefix_ptr, int64_t prefix_stride_m,
     int64_t prefix_stride_n, const DTYPE* blocks_ptr, int64_t blocks_stride_m,
@@ -43,7 +43,7 @@ DINLINE void add_attn_res_rms_norm_rows(
 
 template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED>
-DINLINE void add_attn_res_rms_norm_rows(
+DINLINE void all_reduce_add_attn_res_rms_norm_rows(
     int offs_m, const DTYPE* input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
@@ -160,7 +160,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot(
             sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
             n, row, c, 1);
       else
-        add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+        all_reduce_add_attn_res_rms_norm_rows<TILE_K, BLOCK_X, BLOCK_Y,
+                                              WAVE_SIZE>(
             row, sum, m, n, prefix_ptr, prefix_stride_m, prefix_stride_n,
             blocks_ptr, blocks_stride_m, blocks_stride_r, blocks_stride_n,
             norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
@@ -172,8 +173,9 @@ DINLINE void all_reduce_add_attn_res_rms_norm_one_shot(
             output_eps);
     }
     if constexpr (CHUNKED)
-      add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K, BLOCK_X,
-                                 BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+      all_reduce_add_attn_res_rms_norm_rows<DTYPE, TILE_M, TILE_N, TILE_K,
+                                            BLOCK_X, BLOCK_Y, WAVE_SIZE,
+                                            PACK_BYTES, CHUNKED>(
           row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
           prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -390,8 +392,8 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot(
     // The row is in output, each share stored by its lane group; the norm
     // reads it a tile at a time.
     __syncthreads();
-    add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, BLOCK_X, BLOCK_Y,
-                               WAVE_SIZE, PACK_BYTES, true>(
+    all_reduce_add_attn_res_rms_norm_rows<DTYPE, 1, TILE_N, TILE_K, BLOCK_X,
+                                          BLOCK_Y, WAVE_SIZE, PACK_BYTES, true>(
         row, output_ptr, output_stride_m, output_stride_n, m, n, prefix_ptr,
         prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
         blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
