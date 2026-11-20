@@ -1279,7 +1279,7 @@ DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
       block_steps + int64_t{wave} * protocol_buffers.steps_stride_wave;
   Connection step{};
   step[0][0][0] = static_cast<int32_t>(
-      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM));
   Connection* const connection = &step;
   // simple_read waits on and posts to every receiver at once: the leaf takes
   // the set.

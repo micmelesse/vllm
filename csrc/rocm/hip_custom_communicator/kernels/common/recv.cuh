@@ -1828,7 +1828,7 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
       block_steps + int64_t{wave} * protocol_buffers.steps_stride_wave;
   Connection step{};
   step[0][0][0] = static_cast<int32_t>(
-      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+      __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM));
   Connection* const connection = &step;
   if constexpr (PROTOCOL == Protocol::ll) {
     internal::recv_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
@@ -1871,16 +1871,14 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   // have (a lane each: no wave reads them in this launch).
   const uint32_t advanced = static_cast<uint32_t>(step[0][0][0]);
   __scoped_atomic_store_n(step_at, advanced, __ATOMIC_RELAXED,
-                          __MEMORY_SCOPE_DEVICE);
+                          __MEMORY_SCOPE_SYSTEM);
   if constexpr (kWaves < kStepWaves) {
     const int lane = static_cast<int>(threadIdx.x) % WAVE_SIZE;
     if (wave == 0 && lane >= kWaves && lane < kStepWaves)
       __scoped_atomic_store_n(
           block_steps + int64_t{lane} * protocol_buffers.steps_stride_wave,
-          advanced, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+          advanced, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
-  // The step's stores land before this wave's next send or recv reads it.
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
 }  // namespace hip_custom_communicator
