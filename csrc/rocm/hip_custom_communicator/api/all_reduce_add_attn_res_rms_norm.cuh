@@ -211,7 +211,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     return error_code(Error::no_such_quantization);
   const int quantization =
       quantization_name == "int4" ? Quantization::int4 : Quantization::exact;
-  const int64_t m = input_size_m, n = input_size_n;
+  const int64_t n = input_size_n;
   const int64_t e = input.element_size();
   const int64_t pack = pack_bytes;
 
