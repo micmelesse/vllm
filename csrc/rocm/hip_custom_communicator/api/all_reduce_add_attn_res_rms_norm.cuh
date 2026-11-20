@@ -274,9 +274,16 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     if (block_output_ptr != nullptr && block_output_stride_m * e % pack != 0)
       return error_code(Error::row_stride_not_packs);
 
+    // The Simple protocols' columns two-shot always normalizes the row
+    // chunked, from the output.
+    const bool simple_two_shot =
+        (protocol == Protocol::simple_write ||
+         protocol == Protocol::simple_read) &&
+        algorithm == AllReduceAddAttnResRmsNormAlgorithm::two_shot_pull_columns;
     const int shared_memory_bytes =
-        n > tile_n ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float))
-                   : 0;
+        n > tile_n || simple_two_shot
+            ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float))
+            : 0;
 
     const bool chunked = n > tile_n;
 
@@ -357,13 +364,15 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     }
 
     // The Simple protocols' inbox: a slot a pair of ranks, a row a block, each
-    // the tile's span.
+    // the tile's span (the one-shot's) or a chunk of a share (the two-shot's).
     int64_t inbox_stride_slot = 0, inbox_stride_m = 0, inbox_size_m = 0;
     if (protocol == Protocol::simple_write ||
         protocol == Protocol::simple_read) {
       const int64_t elems = pack / e;
-      const int64_t span =
-          (tile_n + elems * block_x - 1) / (elems * block_x) * elems * block_x;
+      const int64_t span = simple_two_shot
+                               ? (tile_n + elems - 1) / elems * elems
+                               : (tile_n + elems * block_x - 1) /
+                                     (elems * block_x) * elems * block_x;
       if (s.world * grid_x * span * e > s.symmetric.inbox_bytes ||
           grid_x > s.connection_blocks || grid_x > s.symmetric.max_blocks)
         return error_code(Error::unfenced_too_small);

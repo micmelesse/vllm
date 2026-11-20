@@ -219,15 +219,18 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                 if build.block_z != 1:
                     raise SystemExit(f"{path}: {arch}: {build}: no block_z")
                 # simple_write and simple_read are the exact one-shot's and
-                # two-shot's so far, the fused norms' one-shots and
-                # add_rms_norm's columns two-shot, one row of whole waves.
+                # two-shot's so far and the fused norms' one-shots and columns
+                # two-shots, one row of whole waves.
                 moved = {
                     "all_reduce": ("one_shot_push", "two_shot_push"),
                     "all_reduce_add_rms_norm": (
                         "one_shot_pull",
                         "two_shot_pull_columns",
                     ),
-                    "all_reduce_add_attn_res_rms_norm": ("one_shot_pull",),
+                    "all_reduce_add_attn_res_rms_norm": (
+                        "one_shot_pull",
+                        "two_shot_pull_columns",
+                    ),
                 }
                 if build.protocol in ("simple_write", "simple_read") and (
                     build.algorithm not in moved.get(build.kernel, ())
