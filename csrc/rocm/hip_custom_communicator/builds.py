@@ -232,8 +232,12 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                         "two_shot_pull_columns",
                     ),
                 }
-                # INT4 so far: all_reduce's two-shot.
-                moved_int4 = {("all_reduce", "two_shot_push")}
+                # INT4 so far: the two-shots.
+                moved_int4 = {
+                    ("all_reduce", "two_shot_push"),
+                    ("all_reduce_add_rms_norm", "two_shot_pull_columns"),
+                    ("all_reduce_add_attn_res_rms_norm", "two_shot_pull_columns"),
+                }
                 if build.protocol in ("simple_write", "simple_read") and (
                     build.algorithm not in moved.get(build.kernel, ())
                     or (

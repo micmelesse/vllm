@@ -369,10 +369,12 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     if (protocol == Protocol::simple_write ||
         protocol == Protocol::simple_read) {
       const int64_t elems = pack / e;
-      const int64_t span = simple_two_shot
-                               ? (tile_n + elems - 1) / elems * elems
-                               : (tile_n + elems * block_x - 1) /
-                                     (elems * block_x) * elems * block_x;
+      const int64_t span = !simple_two_shot
+                               ? (tile_n + elems * block_x - 1) /
+                                     (elems * block_x) * elems * block_x
+                           : quantization == Quantization::int4
+                               ? block_x / s.world * kInt4Group
+                               : (tile_n + elems - 1) / elems * elems;
       if (s.world * grid_x * span * e > s.symmetric.inbox_bytes ||
           grid_x > s.connection_blocks || grid_x > s.symmetric.max_blocks)
         return error_code(Error::unfenced_too_small);
