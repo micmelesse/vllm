@@ -626,14 +626,17 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
       launch_add_rms_norm.template operator()<c10::Half, c10::Half>();
   } else {
     // The Simple protocols' inbox: a slot a pair of ranks, a row a block, each
-    // the tile's span.
+    // the tile's span (the one-shot's) or a chunk of a share (the two-shot's).
     int64_t inbox_stride_slot = 0, inbox_stride_m = 0, inbox_size_m = 0;
     const bool simple_protocol =
         protocol == Protocol::simple_write || protocol == Protocol::simple_read;
     if (simple_protocol) {
       const int64_t elems = pack_bytes / e;
       const int64_t span =
-          (tile_n + elems * block_x - 1) / (elems * block_x) * elems * block_x;
+          algorithm == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull
+              ? (tile_n + elems * block_x - 1) / (elems * block_x) * elems *
+                    block_x
+              : (tile_n + elems - 1) / elems * elems;
       if (s.world * grid_x * span * e > s.symmetric.inbox_bytes ||
           grid_x > s.connection_blocks || grid_x > s.symmetric.max_blocks)
         return error_code(Error::unfenced_too_small);
