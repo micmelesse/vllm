@@ -203,6 +203,13 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                     raise SystemExit(
                         f"{path}: {arch}: {build}: its kernel runs only simple"
                     )
+                # Simple is gone from the kernels that take a protocol: their
+                # stages synchronize in send and recv.
+                if (
+                    "protocol" in TEMPLATE_ARGS[build.kernel].split()
+                    and build.protocol == "simple"
+                ):
+                    raise SystemExit(f"{path}: {arch}: {build}: Simple is gone")
                 # Rows of threads, each a peer's sends and receives, are the
                 # one-shot push's on LL or Lamport, in whole waves; every other
                 # kernel is one row.
@@ -324,7 +331,20 @@ def emit(generated: list[Generated], out: Path) -> None:
         "// Each kernel's instance table, a row for every compiled instance.",
         "",
     ]
+    # A kernel the table builds nothing of still has its (empty) table, for
+    # the API's lookup.
+    for kernel in ALGORITHM_ENUMS:
+        if not rows.get(kernel):
+            name = (
+                "k" + "".join(w.capitalize() for w in kernel.split("_")) + "Instances"
+            )
+            tables.append(
+                f"inline const std::array<Instance<{ALGORITHM_ENUMS[kernel]}>, 0> "
+                f"{name}{{}};"
+            )
     for kernel, kernel_rows in rows.items():
+        if not kernel_rows:
+            continue
         name = "k" + "".join(w.capitalize() for w in kernel.split("_")) + "Instances"
         tables.append(f"inline const Instance<{ALGORITHM_ENUMS[kernel]}> {name}[] = {{")
         for i in kernel_rows:
