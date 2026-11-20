@@ -198,8 +198,12 @@ ErrorCode hip_custom_communicator_all_reduce(
       // block, each a chunk.
       if (protocol == Protocol::simple_write ||
           protocol == Protocol::simple_read) {
+        // Exact, a chunk is the tile; INT4, a group a lane, as the stage's.
         const int64_t elems = pack_bytes / e;
-        const int64_t row = (tile_n + elems - 1) / elems * elems;
+        const int64_t lanes = block_x / s.world;
+        const int64_t row = quantize_int4
+                                ? lanes * kInt4Group
+                                : (tile_n + elems - 1) / elems * elems;
         if (s.world * grid_x * row * e > s.symmetric.inbox_bytes ||
             grid_x > s.symmetric.max_blocks)
           return error_code(Error::unfenced_too_small);

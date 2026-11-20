@@ -232,9 +232,14 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                         "two_shot_pull_columns",
                     ),
                 }
+                # INT4 so far: all_reduce's two-shot.
+                moved_int4 = {("all_reduce", "two_shot_push")}
                 if build.protocol in ("simple_write", "simple_read") and (
                     build.algorithm not in moved.get(build.kernel, ())
-                    or build.quantization != "exact"
+                    or (
+                        build.quantization != "exact"
+                        and (build.kernel, build.algorithm) not in moved_int4
+                    )
                     or build.block_y != 1
                     or build.tile_m != 1
                     or build.block_x % WAVE_SIZE != 0

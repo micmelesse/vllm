@@ -296,7 +296,8 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
           for (int c = 0; c < kCopies; ++c) {
             const int64_t slot =
                 int64_t{kSlots ? (input_slot + c) % WORLD : input_slot} *
-                input_stride_slot;
+                    input_stride_slot +
+                int64_t{offs_m} * input_stride_m;
             values[c] = reinterpret_cast<const uint8_t*>(input) + slot / 2;
             scales[c] =
                 reinterpret_cast<const __fp16*>(
@@ -709,7 +710,8 @@ DINLINE void recv_simple(PTR const* input_ptr_array, int input_ptr_array_size,
           for (int c = 0; c < kCopies; ++c) {
             const int64_t slot =
                 int64_t{kSlots ? (input_slot + c) % WORLD : input_slot} *
-                input_stride_slot;
+                    input_stride_slot +
+                int64_t{offs_m} * input_stride_m;
             values[c] = reinterpret_cast<const uint8_t*>(input) + slot / 2;
             scales[c] =
                 reinterpret_cast<const __fp16*>(
@@ -1379,9 +1381,11 @@ DINLINE void recv_simple_write(
   if constexpr (LAYOUT != Layout::tile) {
     // A flat walk: a peer a lane group, this lane's input_slot its group's
     // writer; this rank is input_rank.
-    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat,
-                  "a flat walk here is exact: run or flat");
-    static_assert(!QUANTIZE_INT4 && BLOCK_Y == 1, "an exact walk, one row");
+    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat ||
+                      LAYOUT == Layout::group_run ||
+                      LAYOUT == Layout::group_flat,
+                  "a flat walk: run or flat, or their INT4 groups");
+    static_assert(BLOCK_Y == 1, "a flat walk is one row of threads");
     constexpr int kLanes = BLOCK_X / WORLD;
     static_assert(kLanes * WORLD == BLOCK_X,
                   "a block is a group of threads a rank");
@@ -1585,9 +1589,11 @@ DINLINE void recv_simple_read(
   if constexpr (LAYOUT != Layout::tile) {
     // A flat walk: a peer a lane group, this lane's input_slot its group's
     // writer; this rank is input_rank.
-    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat,
-                  "a flat walk here is exact: run or flat");
-    static_assert(!QUANTIZE_INT4 && BLOCK_Y == 1, "an exact walk, one row");
+    static_assert(LAYOUT == Layout::run || LAYOUT == Layout::flat ||
+                      LAYOUT == Layout::group_run ||
+                      LAYOUT == Layout::group_flat,
+                  "a flat walk: run or flat, or their INT4 groups");
+    static_assert(BLOCK_Y == 1, "a flat walk is one row of threads");
     constexpr int kLanes = BLOCK_X / WORLD;
     static_assert(kLanes * WORLD == BLOCK_X,
                   "a block is a group of threads a rank");

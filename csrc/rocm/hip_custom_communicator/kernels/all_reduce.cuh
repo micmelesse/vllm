@@ -291,98 +291,232 @@ DINLINE void all_reduce_two_shot_push(
     // this rank's chunk from every rank, summed) and the all-gather (the sum
     // to every rank, slice w's chunk from rank w). Each lane group talks to
     // one peer, w; the inbox row is the block's.
-    static_assert(!QUANTIZE_INT4, "the Simple protocols' two-shot is exact");
-    constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-    const int64_t total = int64_t{input_size_m} * input_size_n;
-    const int64_t units =
-        TAIL ? (total + kPackElems - 1) / kPackElems : total / kPackElems;
-    const int slice =
-        static_cast<int>((units + WORLD - 1) / WORLD * kPackElems);
-    constexpr Layout kTensor = CONTIGUOUS ? Layout::run : Layout::flat;
-    constexpr int kLanes = BLOCK_X / WORLD;
-    static_assert(kLanes * WORLD == BLOCK_X,
-                  "a block is a group of threads a rank");
-    constexpr int kChunkN = (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
-    constexpr int kPacks =
-        (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
-    const int chunks = (slice + kChunkN - 1) / kChunkN;
-    const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
-    const int row = static_cast<int>(blockIdx.x);
+    if constexpr (QUANTIZE_INT4) {
+      // INT4: a lane holds a group a round (the sum's shared memory holds no
+      // more at a 512-thread block); the shares are whole
+      // groups, as Simple's, so the groups and their scales are Simple's.
+      // The parts are quantized to send, the sum is taken in float from the
+      // dequantized parts, and the sum is quantized again for the all-gather.
+      constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
+      static_assert(kPackElems * kInt4GroupPacks == kInt4Group,
+                    "a group is kInt4GroupPacks packs");
+      constexpr int kLanes = BLOCK_X / WORLD;
+      static_assert(kLanes * WORLD == BLOCK_X,
+                    "a block is a group of threads a rank");
+      constexpr int kGroups = 1;
+      constexpr int kChunkN = kGroups * kLanes * kInt4Group;
+      constexpr int kK = kGroups * kInt4GroupPacks;
+      constexpr Layout kTensor =
+          CONTIGUOUS ? Layout::group_run : Layout::group_flat;
+      const int64_t total = int64_t{input_size_m} * input_size_n;
+      const int64_t units =
+          TAIL ? (total + kInt4Group - 1) / kInt4Group : total / kInt4Group;
+      const int slice =
+          static_cast<int>((units + WORLD - 1) / WORLD * kInt4Group);
+      const int chunks = (slice + kChunkN - 1) / kChunkN;
+      const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+      const int row = static_cast<int>(blockIdx.x);
+      const int share_w = static_cast<int>(
+          max(int64_t{0}, min(int64_t{slice}, total - int64_t{w} * slice)));
+      const int share_me = static_cast<int>(
+          max(int64_t{0}, min(int64_t{slice}, total - int64_t{rank} * slice)));
+      // The payload's scales follow every slot's and row's values.
+      const int payload_m = unfenced_size_slot * unfenced_size_m;
 
-    // The block's connection, a line of its own: loaded before the first
-    // chunk, stored after the last (CONNECTION, common/types.cuh).
-    Connection connection;
-    load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
-        1, connection_size_block, connection_size_word, connection_size_block,
-        connection_size_word, connection, row, 0, 1);
-    for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-      const int lo = chunk * kChunkN;
-      // A rank's share of the slices is slice long, the last one cut at the
-      // end; a chunk ends at the share's end.
-      const int end_w =
-          min(static_cast<int>(max(
-                  int64_t{0}, min(int64_t{slice}, total - int64_t{w} * slice))),
-              lo + kChunkN);
-      const int end_me = min(
-          static_cast<int>(max(
-              int64_t{0}, min(int64_t{slice}, total - int64_t{rank} * slice))),
-          lo + kChunkN);
-      // A recv reads at least a pack, past the end when the share is empty
-      // here: those values go nowhere.
-      const int read_w = max(end_w - lo, kPackElems);
-      const int read_me = max(end_me - lo, kPackElems);
+      Connection connection;
+      load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+          connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
+          1, connection_size_block, connection_size_word, connection_size_block,
+          connection_size_word, connection, row, 0, 1);
+      for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
+        const int lo = chunk * kChunkN;
+        const int end_w = min(share_w, lo + kChunkN);
+        const int end_me = min(share_me, lo + kChunkN);
+        // A recv reads at least a group, past the end when the share is
+        // empty here: those values go nowhere.
+        const int read_w = max(end_w - lo, kInt4Group);
+        const int read_me = max(end_me - lo, kInt4Group);
 
-      DTYPE part[1][kPacks][kPackElems] = {};
-      if (end_w > lo)
-        load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
-            input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
-            input_size_m, input_size_n, input_size_m, end_w, part, 0, lo, 1);
-      send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          part, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          max(end_w - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      DTYPE got[1][kPacks][kPackElems];
-      recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          read_me, got, row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      DTYPE sum[1][kPacks][kPackElems];
-      reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(got[0], sum[0]);
+        DTYPE part[1][kK][kPackElems] = {};
+        if (end_w > lo)
+          load<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
+              input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
+              input_size_m, input_size_n, input_size_m, end_w, part, 0, lo, 1);
+        send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+             Layout::group_run, TAIL>(
+            part, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, payload_m, unfenced_size_n, row + 1,
+            max(end_w - lo, 0), row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        uint32_t got[1][1][kK][2];
+        recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+             Layout::group_run, TAIL>(
+            unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, payload_m, unfenced_size_n, row + 1, read_me,
+            got, row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE parts[kK][kPackElems];
+#pragma unroll
+        for (int k = 0; k < kK; ++k) {
+          const uint32_t pack[2] = {
+              got[0][0][k][0],
+              got[0][0][k / kInt4GroupPacks * kInt4GroupPacks][1]};
+          dequantize(pack, parts[k]);
+        }
+        float sum[1][kK][kPackElems];
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(parts, sum[0]);
 
-      send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          sum, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          max(end_me - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      DTYPE out[1][kPacks][kPackElems];
-      recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1, read_w,
-          out, row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
-      store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
-          out, output_ptr, w, slice, output_stride_m, output_stride_n, WORLD,
-          input_size_m, input_size_n, 1, end_w, 0, lo, 1);
+        send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+             Layout::group_run, TAIL>(
+            sum, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, payload_m, unfenced_size_n, row + 1,
+            max(end_me - lo, 0), row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        uint32_t words[1][1][kK][2];
+        recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
+             Layout::group_run, TAIL>(
+            unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, payload_m, unfenced_size_n, row + 1, read_w,
+            words, row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE out[1][kK][kPackElems];
+#pragma unroll
+        for (int k = 0; k < kK; ++k) {
+          const uint32_t pack[2] = {
+              words[0][0][k][0],
+              words[0][0][k / kInt4GroupPacks * kInt4GroupPacks][1]};
+          dequantize(pack, out[0][k]);
+        }
+        store<WORLD, WORLD, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
+            out, output_ptr, w, slice, output_stride_m, output_stride_n, WORLD,
+            input_size_m, input_size_n, 1, end_w, 0, lo, 1);
+      }
+      store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+          connection, connection_ptr, 0, 0, connection_stride_block,
+          connection_stride_word, 1, connection_size_block,
+          connection_size_word, connection_size_block, connection_size_word,
+          row, 0, 1);
+    } else {
+      constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
+      const int64_t total = int64_t{input_size_m} * input_size_n;
+      const int64_t units =
+          TAIL ? (total + kPackElems - 1) / kPackElems : total / kPackElems;
+      const int slice =
+          static_cast<int>((units + WORLD - 1) / WORLD * kPackElems);
+      constexpr Layout kTensor = CONTIGUOUS ? Layout::run : Layout::flat;
+      constexpr int kLanes = BLOCK_X / WORLD;
+      static_assert(kLanes * WORLD == BLOCK_X,
+                    "a block is a group of threads a rank");
+      constexpr int kChunkN =
+          (TILE_N + kPackElems - 1) / kPackElems * kPackElems;
+      constexpr int kPacks =
+          (kChunkN + kPackElems * kLanes - 1) / (kPackElems * kLanes);
+      const int chunks = (slice + kChunkN - 1) / kChunkN;
+      const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+      const int row = static_cast<int>(blockIdx.x);
+
+      // The block's connection, a line of its own: loaded before the first
+      // chunk, stored after the last (CONNECTION, common/types.cuh).
+      Connection connection;
+      load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+          connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
+          1, connection_size_block, connection_size_word, connection_size_block,
+          connection_size_word, connection, row, 0, 1);
+      for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
+        const int lo = chunk * kChunkN;
+        // A rank's share of the slices is slice long, the last one cut at the
+        // end; a chunk ends at the share's end.
+        const int end_w = min(
+            static_cast<int>(max(
+                int64_t{0}, min(int64_t{slice}, total - int64_t{w} * slice))),
+            lo + kChunkN);
+        const int end_me =
+            min(static_cast<int>(
+                    max(int64_t{0},
+                        min(int64_t{slice}, total - int64_t{rank} * slice))),
+                lo + kChunkN);
+        // A recv reads at least a pack, past the end when the share is empty
+        // here: those values go nowhere.
+        const int read_w = max(end_w - lo, kPackElems);
+        const int read_me = max(end_me - lo, kPackElems);
+
+        DTYPE part[1][kPacks][kPackElems] = {};
+        if (end_w > lo)
+          load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
+              input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
+              input_size_m, input_size_n, input_size_m, end_w, part, 0, lo, 1);
+        send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::run>(
+            part, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
+            max(end_w - lo, 0), row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE got[1][kPacks][kPackElems];
+        recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::run>(
+            unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
+            read_me, got, row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE sum[1][kPacks][kPackElems];
+        reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(got[0], sum[0]);
+
+        send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::run>(
+            sum, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
+            max(end_me - lo, 0), row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE out[1][kPacks][kPackElems];
+        recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::run>(
+            unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
+            unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
+            unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
+            read_w, out, row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
+            out, output_ptr, w, slice, output_stride_m, output_stride_n, WORLD,
+            input_size_m, input_size_n, 1, end_w, 0, lo, 1);
+      }
+      store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+          connection, connection_ptr, 0, 0, connection_stride_block,
+          connection_stride_word, 1, connection_size_block,
+          connection_size_word, connection_size_block, connection_size_word,
+          row, 0, 1);
     }
-    store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection, connection_ptr, 0, 0, connection_stride_block,
-        connection_stride_word, 1, connection_size_block, connection_size_word,
-        connection_size_block, connection_size_word, row, 0, 1);
+
   } else {
     reduce_scatter<ReduceScatterAlgorithm::flat_push, PROTOCOL, QUANTIZE_INT4,
                    WORLD, TILE_M, TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE,
