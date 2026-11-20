@@ -20,21 +20,12 @@ enum class AllReduceAlgorithm {
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
-DINLINE void all_reduce_one_shot(
-    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, DTYPE* output_ptr,
-    int64_t output_stride_m, int64_t output_stride_n,
-    char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
-    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
-    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* connection_ptr,
-    int64_t connection_stride_block, int64_t connection_stride_word,
-    int connection_size_block, int connection_size_word,
-    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
-    int64_t counters_stride_kind, int64_t counters_stride_block,
-    int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
-    int status_size_field, int rank, uint64_t timeout_ticks) {
+DINLINE void all_reduce_one_shot(const DTYPE* input_ptr, int64_t input_stride_m,
+                                 int64_t input_stride_n, int input_size_m,
+                                 int input_size_n, DTYPE* output_ptr,
+                                 int64_t output_stride_m,
+                                 int64_t output_stride_n,
+                                 const ProtocolArgs& protocol_args, int rank) {
   constexpr int kThreadsM = BLOCK_X % TILE_M == 0 ? TILE_M : 1;
   constexpr int kThreadsN = BLOCK_X / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
@@ -54,9 +45,11 @@ DINLINE void all_reduce_one_shot(
   // stored after the last (CONNECTION, common/types.cuh).
   Connection connection;
   load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-      connection_ptr, 0, 0, connection_stride_block, connection_stride_word, 1,
-      connection_size_block, connection_size_word, connection_size_block,
-      connection_size_word, connection, static_cast<int>(blockIdx.x), 0, 1);
+      protocol_args.connection_ptr, 0, 0, protocol_args.connection_stride_block,
+      protocol_args.connection_stride_word, 1,
+      protocol_args.connection_size_block, protocol_args.connection_size_word,
+      protocol_args.connection_size_block, protocol_args.connection_size_word,
+      connection, static_cast<int>(blockIdx.x), 0, 1);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t / tiles_n * TILE_M, offs_n = t % tiles_n * kTileN;
     const int clip_m = min(TILE_M, input_size_m - offs_m);
@@ -66,16 +59,10 @@ DINLINE void all_reduce_one_shot(
     DTYPE copies[WORLD][kRows][kPacks][kPackElems];
     all_gather<AllGatherAlgorithm::tile, PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD,
                TILE_M, kTileN, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES,
-               CONTIGUOUS, TAIL>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        copies, 0, 0, 0, 0, offs_m, offs_n, clip_m, clip_n, 0,
-        unfenced_ptr_array, unfenced_ptr_array_size, unfenced_stride_slot,
-        unfenced_stride_m, unfenced_stride_n, unfenced_size_slot,
-        unfenced_size_m, unfenced_size_n, &connection, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, rank,
-        timeout_ticks);
+               CONTIGUOUS, TAIL>(input_ptr, input_stride_m, input_stride_n,
+                                 input_size_m, input_size_n, copies, 0, 0, 0, 0,
+                                 offs_m, offs_n, clip_m, clip_n, 0,
+                                 protocol_args, &connection, rank);
 
     DTYPE rounded[kRows][kPacks][kPackElems];
 #pragma unroll
@@ -95,30 +82,23 @@ DINLINE void all_reduce_one_shot(
         input_size_m, input_size_n, input_size_m, clip_n, offs_m, offs_n, 1);
   }
   store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-      connection, connection_ptr, 0, 0, connection_stride_block,
-      connection_stride_word, 1, connection_size_block, connection_size_word,
-      connection_size_block, connection_size_word, static_cast<int>(blockIdx.x),
-      0, 1);
+      connection, protocol_args.connection_ptr, 0, 0,
+      protocol_args.connection_stride_block,
+      protocol_args.connection_stride_word, 1,
+      protocol_args.connection_size_block, protocol_args.connection_size_word,
+      protocol_args.connection_size_block, protocol_args.connection_size_word,
+      static_cast<int>(blockIdx.x), 0, 1);
 }
 
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           int PACK_BYTES, bool CONTIGUOUS, bool TAIL>
-DINLINE void all_reduce_two_shot(
-    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, DTYPE* output_ptr,
-    int64_t output_stride_m, int64_t output_stride_n,
-    char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
-    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
-    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, int32_t* connection_ptr,
-    int64_t connection_stride_block, int64_t connection_stride_word,
-    int connection_size_block, int connection_size_word,
-    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
-    int64_t counters_stride_kind, int64_t counters_stride_block,
-    int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
-    int status_size_field, int rank, uint64_t timeout_ticks) {
+DINLINE void all_reduce_two_shot(const DTYPE* input_ptr, int64_t input_stride_m,
+                                 int64_t input_stride_n, int input_size_m,
+                                 int input_size_n, DTYPE* output_ptr,
+                                 int64_t output_stride_m,
+                                 int64_t output_stride_n,
+                                 const ProtocolArgs& protocol_args, int rank) {
   static_assert(
       PROTOCOL == Protocol::simple_write || PROTOCOL == Protocol::simple_read,
       "the two-shot is simple_write or simple_read");
@@ -155,13 +135,15 @@ DINLINE void all_reduce_two_shot(
     const int share_me = static_cast<int>(
         max(int64_t{0}, min(int64_t{slice}, total - int64_t{rank} * slice)));
     // The payload's scales follow every slot's and row's values.
-    const int payload_m = unfenced_size_slot * unfenced_size_m;
 
     Connection connection;
     load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
-        1, connection_size_block, connection_size_word, connection_size_block,
-        connection_size_word, connection, row, 0, 1);
+        protocol_args.connection_ptr, 0, 0,
+        protocol_args.connection_stride_block,
+        protocol_args.connection_stride_word, 1,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        connection, row, 0, 1);
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       const int lo = chunk * kChunkN;
       const int end_w = min(share_w, lo + kChunkN);
@@ -177,24 +159,12 @@ DINLINE void all_reduce_two_shot(
             input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
             input_size_m, input_size_n, input_size_m, end_w, part, 0, lo, 1);
       send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-           Layout::group_run, TAIL>(
-          part, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, payload_m, unfenced_size_n, row + 1,
-          max(end_w - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+           Layout::group_run, TAIL>(part, protocol_args, w, 1, rank, row + 1,
+                                    max(end_w - lo, 0), row, 0, 1, &connection);
       uint32_t got[1][1][kK][2];
       recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-           Layout::group_run, TAIL>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, payload_m, unfenced_size_n, row + 1, read_me, got,
-          row, 0, 1, &connection, counters_ptr_array, counters_ptr_array_size,
-          counters_stride_kind, counters_stride_block, counters_stride_peer,
-          counters_size_block, counters_size_peer, status_ptr,
-          status_stride_field, status_size_field, timeout_ticks);
+           Layout::group_run, TAIL>(protocol_args, rank, w, row + 1, read_me,
+                                    got, row, 0, 1, &connection);
       DTYPE parts[kK][kPackElems];
 #pragma unroll
       for (int k = 0; k < kK; ++k) {
@@ -207,24 +177,13 @@ DINLINE void all_reduce_two_shot(
       reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(parts, sum[0]);
 
       send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-           Layout::group_run, TAIL>(
-          sum, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, payload_m, unfenced_size_n, row + 1,
-          max(end_me - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+           Layout::group_run, TAIL>(sum, protocol_args, w, 1, rank, row + 1,
+                                    max(end_me - lo, 0), row, 0, 1,
+                                    &connection);
       uint32_t words[1][1][kK][2];
       recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-           Layout::group_run, TAIL>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, payload_m, unfenced_size_n, row + 1, read_w,
-          words, row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+           Layout::group_run, TAIL>(protocol_args, rank, w, row + 1, read_w,
+                                    words, row, 0, 1, &connection);
       DTYPE out[1][kK][kPackElems];
 #pragma unroll
       for (int k = 0; k < kK; ++k) {
@@ -238,9 +197,12 @@ DINLINE void all_reduce_two_shot(
           input_size_m, input_size_n, 1, end_w, 0, lo, 1);
     }
     store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection, connection_ptr, 0, 0, connection_stride_block,
-        connection_stride_word, 1, connection_size_block, connection_size_word,
-        connection_size_block, connection_size_word, row, 0, 1);
+        connection, protocol_args.connection_ptr, 0, 0,
+        protocol_args.connection_stride_block,
+        protocol_args.connection_stride_word, 1,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        row, 0, 1);
   } else {
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     const int64_t total = int64_t{input_size_m} * input_size_n;
@@ -263,9 +225,12 @@ DINLINE void all_reduce_two_shot(
     // chunk, stored after the last (CONNECTION, common/types.cuh).
     Connection connection;
     load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
-        1, connection_size_block, connection_size_word, connection_size_block,
-        connection_size_word, connection, row, 0, 1);
+        protocol_args.connection_ptr, 0, 0,
+        protocol_args.connection_stride_block,
+        protocol_args.connection_stride_word, 1,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        connection, row, 0, 1);
     for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
       const int lo = chunk * kChunkN;
       // A rank's share of the slices is slice long, the last one cut at the
@@ -289,50 +254,32 @@ DINLINE void all_reduce_two_shot(
             input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
             input_size_m, input_size_n, input_size_m, end_w, part, 0, lo, 1);
       send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          part, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          max(end_w - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+          part, protocol_args, w, 1, rank, row + 1, max(end_w - lo, 0), row, 0,
+          1, &connection);
       DTYPE got[1][kPacks][kPackElems];
       recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          read_me, got, row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+          protocol_args, rank, w, row + 1, read_me, got, row, 0, 1,
+          &connection);
       DTYPE sum[1][kPacks][kPackElems];
       reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(got[0], sum[0]);
 
       send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          sum, unfenced_ptr_array, unfenced_ptr_array_size, w, 1, rank,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1,
-          max(end_me - lo, 0), row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+          sum, protocol_args, w, 1, rank, row + 1, max(end_me - lo, 0), row, 0,
+          1, &connection);
       DTYPE out[1][kPacks][kPackElems];
       recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL, Layout::run>(
-          unfenced_ptr_array, unfenced_ptr_array_size, rank, w,
-          unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-          unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + 1, read_w,
-          out, row, 0, 1, &connection, counters_ptr_array,
-          counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-          counters_stride_peer, counters_size_block, counters_size_peer,
-          status_ptr, status_stride_field, status_size_field, timeout_ticks);
+          protocol_args, rank, w, row + 1, read_w, out, row, 0, 1, &connection);
       store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, kTensor, TAIL>(
           out, output_ptr, w, slice, output_stride_m, output_stride_n, WORLD,
           input_size_m, input_size_n, 1, end_w, 0, lo, 1);
     }
     store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
-        connection, connection_ptr, 0, 0, connection_stride_block,
-        connection_stride_word, 1, connection_size_block, connection_size_word,
-        connection_size_block, connection_size_word, row, 0, 1);
+        connection, protocol_args.connection_ptr, 0, 0,
+        protocol_args.connection_stride_block,
+        protocol_args.connection_stride_word, 1,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        protocol_args.connection_size_block, protocol_args.connection_size_word,
+        row, 0, 1);
   }
 }
 
@@ -345,47 +292,19 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
                int64_t input_stride_n, int input_size_m, int input_size_n,
                DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
                int64_t output_stride_n, int output_size_m, int output_size_n,
-               char* const* __restrict__ unfenced_ptr_array,
-               int unfenced_ptr_array_size, int64_t unfenced_stride_slot,
-               int64_t unfenced_stride_m, int64_t unfenced_stride_n,
-               int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
-               int32_t* __restrict__ connection_ptr,
-               int64_t connection_stride_block, int64_t connection_stride_word,
-               int connection_size_block, int connection_size_word,
-               uint32_t* const* __restrict__ counters_ptr_array,
-               int counters_ptr_array_size, int64_t counters_stride_kind,
-               int64_t counters_stride_block, int64_t counters_stride_peer,
-               int counters_size_block, int counters_size_peer,
-               uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
-               int status_size_field, int rank, uint64_t timeout_ticks) {
+               const ProtocolArgs protocol_args, int rank) {
   if constexpr (ALGORITHM == AllReduceAlgorithm::one_shot)
     all_reduce_one_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                         BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
                         TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        connection_ptr, connection_stride_block, connection_stride_word,
-        connection_size_block, connection_size_word, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, rank,
-        timeout_ticks);
+        output_ptr, output_stride_m, output_stride_n, protocol_args, rank);
   else if constexpr (ALGORITHM == AllReduceAlgorithm::two_shot)
     all_reduce_two_shot<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N,
                         BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CONTIGUOUS,
                         TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        output_ptr, output_stride_m, output_stride_n, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        connection_ptr, connection_stride_block, connection_stride_word,
-        connection_size_block, connection_size_word, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, rank,
-        timeout_ticks);
+        output_ptr, output_stride_m, output_stride_n, protocol_args, rank);
 }
 
 }  // namespace hip_custom_communicator

@@ -1781,21 +1781,36 @@ DINLINE void recv_simple_read(
 
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
-          bool TAIL = false, typename PTR, typename OUTPUT>
-DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size,
-                  int input_rank, int input_slot, int64_t input_stride_slot,
-                  int64_t input_stride_m, int64_t input_stride_n,
-                  int input_size_slot, int input_size_m, int input_size_n,
-                  int clip_m, int clip_n, OUTPUT& output, int offs_m,
-                  int offs_n, int row_step, Connection* connection = nullptr,
-                  uint32_t* const* counters_ptr_array = nullptr,
-                  int counters_ptr_array_size = 0,
-                  int64_t counters_stride_kind = 0,
-                  int64_t counters_stride_block = 0,
-                  int64_t counters_stride_peer = 0, int counters_size_block = 0,
-                  int counters_size_peer = 0, uint32_t* status_ptr = nullptr,
-                  int64_t status_stride_field = 0, int status_size_field = 0,
-                  uint64_t timeout_ticks = 0) {
+          bool TAIL = false, typename OUTPUT>
+DINLINE void recv(const ProtocolArgs& protocol_args, int input_rank,
+                  int input_slot, int clip_m, int clip_n, OUTPUT& output,
+                  int offs_m, int offs_n, int row_step,
+                  Connection* connection) {
+  // The protocol's values, as the leaves take them.
+  char* const* const input_ptr_array = protocol_args.inbox_ptr_array;
+  const int input_ptr_array_size = protocol_args.inbox_ptr_array_size;
+  const int64_t input_stride_slot = protocol_args.inbox_stride_slot,
+                input_stride_m = protocol_args.inbox_stride_m,
+                input_stride_n = protocol_args.inbox_stride_n;
+  // An INT4 group walk's rows are every slot's: its scales follow them all.
+  constexpr bool kGroups =
+      LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat;
+  const int input_size_slot = protocol_args.inbox_size_slot,
+            input_size_m = kGroups ? protocol_args.inbox_size_slot *
+                                         protocol_args.inbox_size_m
+                                   : protocol_args.inbox_size_m,
+            input_size_n = protocol_args.inbox_size_n;
+  uint32_t* const* const counters_ptr_array = protocol_args.counters_ptr_array;
+  const int counters_ptr_array_size = protocol_args.counters_ptr_array_size;
+  const int64_t counters_stride_kind = protocol_args.counters_stride_kind,
+                counters_stride_block = protocol_args.counters_stride_block,
+                counters_stride_peer = protocol_args.counters_stride_peer;
+  const int counters_size_block = protocol_args.counters_size_block,
+            counters_size_peer = protocol_args.counters_size_peer;
+  uint32_t* const status_ptr = protocol_args.status_ptr;
+  const int64_t status_stride_field = protocol_args.status_stride_field;
+  const int status_size_field = protocol_args.status_size_field;
+  const uint64_t timeout_ticks = protocol_args.timeout_ticks;
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && connection == nullptr)
     internal::check_failed();
   if constexpr (PROTOCOL == Protocol::ll) {

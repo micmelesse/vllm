@@ -247,6 +247,30 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
   int32_t* const connections = s.connections + static_cast<int>(protocol) *
                                                    s.connection_blocks *
                                                    s.connection_words;
+  const ProtocolArgs protocol_args{inbox_ptr_array,
+                                   s.world,
+                                   inbox_stride_slot,
+                                   inbox_stride_m,
+                                   int64_t{1},
+                                   s.world,
+                                   static_cast<int>(inbox_size_m),
+                                   static_cast<int>(inbox_stride_m),
+                                   counters_ptr_array,
+                                   s.world,
+                                   s.symmetric.max_blocks * s.world,
+                                   int64_t{s.world},
+                                   int64_t{1},
+                                   static_cast<int>(s.symmetric.max_blocks),
+                                   s.world,
+                                   connections,
+                                   s.connection_words,
+                                   int64_t{1},
+                                   static_cast<int>(s.connection_blocks),
+                                   static_cast<int>(s.connection_words),
+                                   s.status_device,
+                                   int64_t{1},
+                                   kStatusFields,
+                                   s.timeout_ticks};
   const auto launch = [&]<typename T, typename W>() {
     const auto typed =
         reinterpret_cast<AllReduceAddRmsNormKernel<T, W>>(kernel);
@@ -261,15 +285,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output_ptr), residual_output_stride_m,
         residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), inbox_ptr_array, s.world,
-        inbox_stride_slot, inbox_stride_m, int64_t{1}, s.world,
-        static_cast<int>(inbox_size_m), static_cast<int>(inbox_stride_m),
-        connections, s.connection_words, int64_t{1},
-        static_cast<int>(s.connection_blocks),
-        static_cast<int>(s.connection_words), counters_ptr_array, s.world,
-        int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world}, int64_t{1},
-        static_cast<int>(s.symmetric.max_blocks), s.world, s.status_device,
-        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks, eps);
+        static_cast<int>(residual_output_size_n), protocol_args, s.rank, eps);
   };
   if (dtype == at::ScalarType::BFloat16 &&
       weight_dtype == at::ScalarType::Float)

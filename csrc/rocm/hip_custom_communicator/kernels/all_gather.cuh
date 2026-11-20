@@ -44,19 +44,13 @@ namespace internal {
 template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           int TILE_M, int TILE_N, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
-DINLINE void all_gather_tile(
-    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-    char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
-    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
-    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, Connection* connection,
-    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
-    int64_t counters_stride_kind, int64_t counters_stride_block,
-    int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
-    int status_size_field, int rank, uint64_t timeout_ticks, int input_size_m,
-    int input_size_n, int offs_m, int offs_n, int clip_m, int clip_n,
-    DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
+DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
+                             int64_t input_stride_n,
+                             const ProtocolArgs& protocol_args,
+                             Connection* connection, int rank, int input_size_m,
+                             int input_size_n, int offs_m, int offs_n,
+                             int clip_m, int clip_n,
+                             DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
   static_assert(PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport ||
                     PROTOCOL == Protocol::simple_write ||
                     PROTOCOL == Protocol::simple_read,
@@ -79,34 +73,16 @@ DINLINE void all_gather_tile(
         quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
                  reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-         Layout::tile>(
-        payload, unfenced_ptr_array, unfenced_ptr_array_size, 0, WORLD, rank,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-        first_row, 0, 1, connection, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, timeout_ticks);
+         Layout::tile>(payload, protocol_args, 0, WORLD, rank, lines_m, lines_n,
+                       first_row, 0, 1, connection);
   } else {
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-         Layout::tile>(
-        mine, unfenced_ptr_array, unfenced_ptr_array_size, 0, WORLD, rank,
-        unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-        unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-        first_row, 0, 1, connection, counters_ptr_array,
-        counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-        counters_stride_peer, counters_size_block, counters_size_peer,
-        status_ptr, status_stride_field, status_size_field, timeout_ticks);
+         Layout::tile>(mine, protocol_args, 0, WORLD, rank, lines_m, lines_n,
+                       first_row, 0, 1, connection);
   }
   recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-       Layout::tile>(
-      unfenced_ptr_array, unfenced_ptr_array_size, rank, 0,
-      unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n,
-      unfenced_size_slot, unfenced_size_m, unfenced_size_n, lines_m, lines_n,
-      copies, first_row, 0, 1, connection, counters_ptr_array,
-      counters_ptr_array_size, counters_stride_kind, counters_stride_block,
-      counters_stride_peer, counters_size_block, counters_size_peer, status_ptr,
-      status_stride_field, status_size_field, timeout_ticks);
+       Layout::tile>(protocol_args, rank, 0, lines_m, lines_n, copies,
+                     first_row, 0, 1, connection);
 }
 
 }  // namespace internal
@@ -118,30 +94,18 @@ template <AllGatherAlgorithm ALGORITHM, Protocol PROTOCOL, bool QUANTIZE_INT4,
           typename DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CONTIGUOUS,
           bool TAIL, typename INPUT, typename OUTPUT>
-DINLINE void all_gather(
-    INPUT&& input, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, OUTPUT&& output,
-    int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-    int output_size_n, int offs_m, int offs_n, int clip_m, int clip_n,
-    int slice, char* const* unfenced_ptr_array, int unfenced_ptr_array_size,
-    int64_t unfenced_stride_slot, int64_t unfenced_stride_m,
-    int64_t unfenced_stride_n, int unfenced_size_slot, int unfenced_size_m,
-    int unfenced_size_n, Connection* connection,
-    uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
-    int64_t counters_stride_kind, int64_t counters_stride_block,
-    int64_t counters_stride_peer, int counters_size_block,
-    int counters_size_peer, uint32_t* status_ptr, int64_t status_stride_field,
-    int status_size_field, int rank, uint64_t timeout_ticks) {
+DINLINE void all_gather(INPUT&& input, int64_t input_stride_m,
+                        int64_t input_stride_n, int input_size_m,
+                        int input_size_n, OUTPUT&& output,
+                        int64_t output_stride_m, int64_t output_stride_n,
+                        int output_size_m, int output_size_n, int offs_m,
+                        int offs_n, int clip_m, int clip_n, int slice,
+                        const ProtocolArgs& protocol_args,
+                        Connection* connection, int rank) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
     internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                               TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
-        input, input_stride_m, input_stride_n, unfenced_ptr_array,
-        unfenced_ptr_array_size, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n,
-        connection, counters_ptr_array, counters_ptr_array_size,
-        counters_stride_kind, counters_stride_block, counters_stride_peer,
-        counters_size_block, counters_size_peer, status_ptr,
-        status_stride_field, status_size_field, rank, timeout_ticks,
+        input, input_stride_m, input_stride_n, protocol_args, connection, rank,
         input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 

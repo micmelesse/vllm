@@ -155,6 +155,29 @@ enum class Protocol { ll, lamport, simple_write, simple_read };
 // another's.
 enum class Counter : int { tail, head };
 
+// A launch's protocol values, read-only: the protocol's inbox (every rank's
+// address, and its layout), its counters, where its blocks' connections are
+// kept, the status record and the wait limit. The kernel builds it from its
+// arguments; stages hand it to send and recv unread. The step itself is the
+// Connection.
+struct ProtocolArgs {
+  char* const* inbox_ptr_array;
+  int inbox_ptr_array_size;
+  int64_t inbox_stride_slot, inbox_stride_m, inbox_stride_n;
+  int inbox_size_slot, inbox_size_m, inbox_size_n;
+  uint32_t* const* counters_ptr_array;
+  int counters_ptr_array_size;
+  int64_t counters_stride_kind, counters_stride_block, counters_stride_peer;
+  int counters_size_block, counters_size_peer;
+  int32_t* connection_ptr;
+  int64_t connection_stride_block, connection_stride_word;
+  int connection_size_block, connection_size_word;
+  uint32_t* status_ptr;
+  int64_t status_stride_field;
+  int status_size_field;
+  uint64_t timeout_ticks;
+};
+
 namespace internal {
 
 // A checked build's failed check: it says where, from the wave's first active

@@ -233,6 +233,30 @@ ErrorCode hip_custom_communicator_all_reduce(
       protocol == Protocol::simple_read
           ? s.symmetric.simple_read_counters_ptr_array
           : s.symmetric.simple_write_counters_ptr_array;
+  const ProtocolArgs protocol_args{inbox_ptr_array,
+                                   s.world,
+                                   unfenced_stride_slot,
+                                   unfenced_stride_m,
+                                   unfenced_stride_n,
+                                   static_cast<int>(unfenced_size_slot),
+                                   static_cast<int>(unfenced_size_m),
+                                   static_cast<int>(unfenced_size_n),
+                                   counters_ptr_array,
+                                   s.world,
+                                   s.symmetric.max_blocks * s.world,
+                                   int64_t{s.world},
+                                   int64_t{1},
+                                   static_cast<int>(s.symmetric.max_blocks),
+                                   s.world,
+                                   connections,
+                                   s.connection_words,
+                                   int64_t{1},
+                                   static_cast<int>(s.connection_blocks),
+                                   static_cast<int>(s.connection_words),
+                                   s.status_device,
+                                   int64_t{1},
+                                   kStatusFields,
+                                   s.timeout_ticks};
   const auto launch = [&]<typename T, typename W>() {
     const auto typed = reinterpret_cast<AllReduceKernel<T, W>>(kernel);
     typed<<<grid, block, shared_memory_bytes, stream>>>(
@@ -240,15 +264,7 @@ ErrorCode hip_custom_communicator_all_reduce(
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        inbox_ptr_array, s.world, unfenced_stride_slot, unfenced_stride_m,
-        unfenced_stride_n, static_cast<int>(unfenced_size_slot),
-        static_cast<int>(unfenced_size_m), static_cast<int>(unfenced_size_n),
-        connections, s.connection_words, int64_t{1},
-        static_cast<int>(s.connection_blocks),
-        static_cast<int>(s.connection_words), counters_ptr_array, s.world,
-        int64_t{s.symmetric.max_blocks * s.world}, int64_t{s.world}, int64_t{1},
-        static_cast<int>(s.symmetric.max_blocks), s.world, s.status_device,
-        int64_t{1}, int64_t{kStatusFields}, s.rank, s.timeout_ticks);
+        protocol_args, s.rank);
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();
