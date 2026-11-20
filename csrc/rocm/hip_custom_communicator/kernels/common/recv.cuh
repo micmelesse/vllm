@@ -1879,6 +1879,8 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
           block_steps + int64_t{lane} * protocol_buffers.steps_stride_wave,
           advanced, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
   }
+  // The step's stores land before this wave's next send or recv reads it.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
 }  // namespace hip_custom_communicator
