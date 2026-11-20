@@ -94,7 +94,8 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
   uint32_t* const* const counters_ptr_array =
       protocol == Protocol::simple_read ? m.simple_read_counters_ptr_array
                                         : m.simple_write_counters_ptr_array;
-  uint32_t* const steps = s.steps + static_cast<int>(protocol) * s.step_blocks;
+  uint32_t* const steps =
+      s.steps + static_cast<int>(protocol) * s.step_blocks * kStepWaves;
   return ProtocolBuffers{inbox_ptr_array,
                          s.world,
                          stride_slot,
@@ -111,8 +112,10 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
                          static_cast<int>(m.max_blocks),
                          s.world,
                          steps,
+                         int64_t{kStepWaves},
                          int64_t{1},
                          static_cast<int>(s.step_blocks),
+                         kStepWaves,
                          s.status_device,
                          int64_t{1},
                          kStatusFields,

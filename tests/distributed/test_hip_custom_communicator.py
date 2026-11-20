@@ -118,20 +118,25 @@ def _inspect(comm):
 def _check_state(comm, group, where):
     """What every launch must leave, once every rank's has ended: this rank's
     Lamport inbox all the sentinel (whatever was written was read and
-    re-armed); each protocol's steps, a step a block, equal on every rank; and
-    each Simple protocol's counters, tail and head for every block and peer, at
-    that block's step (every round posted was read)."""
+    re-armed); each protocol's steps, a slot a block and wave, at one step a
+    block (whatever the launch's block size) and equal on every rank; and each
+    Simple protocol's counters, tail and head for every block and peer, at that
+    block's step (every round posted was read)."""
     torch.accelerator.synchronize()
     dist.barrier(group=group.cpu_group)
     inbox, steps, counters = _inspect(comm)
     assert bool((inbox == 0xFF).all()), (where, "inbox armed")
+    assert torch.equal(steps, steps[:, :, :1].expand_as(steps)), (
+        where,
+        "a block's waves at different steps",
+    )
     got = [torch.empty_like(steps) for _ in range(comm.arguments.world)]
     dist.all_gather(got, steps.contiguous(), group=group.device_group)
     for r, other in enumerate(got):
         assert torch.equal(other, got[0]), (where, "steps differ on rank", r)
     blocks = steps.shape[1]
     for t, protocol in enumerate(("simple_write", "simple_read")):
-        step = steps[2 + t][:, None].expand(blocks, counters.shape[3])
+        step = steps[2 + t][:, :1].expand(blocks, counters.shape[3])
         for k, kind in enumerate(("tail", "head")):
             assert torch.equal(counters[t][k][:blocks], step), (
                 where,

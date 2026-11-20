@@ -1262,13 +1262,21 @@ DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
   const int64_t status_stride_field = protocol_buffers.status_stride_field;
   const int status_size_field = protocol_buffers.status_size_field;
   const uint64_t timeout_ticks = protocol_buffers.timeout_ticks;
-  // The block's step (STEPS), as the leaves take it.
+  // This wave's step (STEPS), as the leaves take it.
+  constexpr int kWaves = BLOCK_X * BLOCK_Y / WAVE_SIZE;
+  static_assert(kWaves >= 1 && kWaves <= kStepWaves,
+                "a block's waves have their steps");
+  const int wave = __builtin_amdgcn_readfirstlane(
+      static_cast<int>(threadIdx.y * BLOCK_X + threadIdx.x) / WAVE_SIZE);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block)
+      (static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block ||
+       protocol_buffers.steps_size_wave != kStepWaves))
     internal::check_failed();
-  uint32_t* const step_at =
+  uint32_t* const block_steps =
       protocol_buffers.steps_ptr +
       int64_t{blockIdx.x} * protocol_buffers.steps_stride_block;
+  uint32_t* const step_at =
+      block_steps + int64_t{wave} * protocol_buffers.steps_stride_wave;
   Connection step{};
   step[0][0][0] = static_cast<int32_t>(
       __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));

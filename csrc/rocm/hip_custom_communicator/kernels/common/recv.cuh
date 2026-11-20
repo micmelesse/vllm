@@ -1811,13 +1811,21 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   const int64_t status_stride_field = protocol_buffers.status_stride_field;
   const int status_size_field = protocol_buffers.status_size_field;
   const uint64_t timeout_ticks = protocol_buffers.timeout_ticks;
-  // The block's step (STEPS), as the leaves take it.
+  // This wave's step (STEPS), as the leaves take it.
+  constexpr int kWaves = BLOCK_X * BLOCK_Y / WAVE_SIZE;
+  static_assert(kWaves >= 1 && kWaves <= kStepWaves,
+                "a block's waves have their steps");
+  const int wave = __builtin_amdgcn_readfirstlane(
+      static_cast<int>(threadIdx.y * BLOCK_X + threadIdx.x) / WAVE_SIZE);
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-      static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block)
+      (static_cast<int>(blockIdx.x) >= protocol_buffers.steps_size_block ||
+       protocol_buffers.steps_size_wave != kStepWaves))
     internal::check_failed();
-  uint32_t* const step_at =
+  uint32_t* const block_steps =
       protocol_buffers.steps_ptr +
       int64_t{blockIdx.x} * protocol_buffers.steps_stride_block;
+  uint32_t* const step_at =
+      block_steps + int64_t{wave} * protocol_buffers.steps_stride_wave;
   Connection step{};
   step[0][0][0] = static_cast<int32_t>(
       __scoped_atomic_load_n(step_at, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
@@ -1859,14 +1867,18 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
         row_step, *connection, status_ptr, status_stride_field,
         status_size_field, timeout_ticks);
   }
-  // Every wave has read this round's step before any writes the next: the
-  // Simple recvs and a recv of several rows of threads end on the block's
-  // barrier already.
-  if constexpr ((PROTOCOL == Protocol::ll || PROTOCOL == Protocol::lamport) &&
-                BLOCK_Y == 1 && BLOCK_X > WAVE_SIZE)
-    __syncthreads();
-  __scoped_atomic_store_n(step_at, static_cast<uint32_t>(step[0][0][0]),
-                          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+  // This wave's slot, and wave 0 the slots of the waves the block does not
+  // have (a lane each: no wave reads them in this launch).
+  const uint32_t advanced = static_cast<uint32_t>(step[0][0][0]);
+  __scoped_atomic_store_n(step_at, advanced, __ATOMIC_RELAXED,
+                          __MEMORY_SCOPE_DEVICE);
+  if constexpr (kWaves < kStepWaves) {
+    const int lane = static_cast<int>(threadIdx.x) % WAVE_SIZE;
+    if (wave == 0 && lane >= kWaves && lane < kStepWaves)
+      __scoped_atomic_store_n(
+          block_steps + int64_t{lane} * protocol_buffers.steps_stride_wave,
+          advanced, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+  }
 }
 
 }  // namespace hip_custom_communicator

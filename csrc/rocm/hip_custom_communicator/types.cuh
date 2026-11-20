@@ -161,7 +161,7 @@ struct CommsState {
 
   // The protocols' steps (STEPS, kernels/common/types.cuh): a region a
   // protocol, at its Protocol value (LL, Lamport, simple_write, simple_read),
-  // a step a block, step_blocks of them.
+  // step_blocks blocks of kStepWaves waves each.
   uint32_t* steps = nullptr;
   int64_t step_blocks = 0;
   uint32_t* status_device = nullptr;
