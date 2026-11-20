@@ -195,7 +195,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         residual_output_stride_n, eps);
 }
 
-template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
+template <Protocol PROTOCOL, bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
           typename WEIGHT_DTYPE, int WORLD, int TILE_M, int TILE_N, int BLOCK_X,
           int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES, bool CHUNKED, bool TAIL>
 DINLINE void all_reduce_add_rms_norm_one_shot_pull(
@@ -208,101 +208,205 @@ DINLINE void all_reduce_add_rms_norm_one_shot_pull(
     int64_t output_stride_m, int64_t output_stride_n,
     DTYPE* residual_output_ptr, int64_t residual_output_stride_m,
     int64_t residual_output_stride_n, char* const* staging_ptr_array,
-    int staging_ptr_array_size, uint32_t* const* signals_ptr_array,
-    int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
-    int rank, uint64_t timeout_ticks, float eps) {
-  constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks =
-      (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
-  constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
-  const int m = input_size_m, n = input_size_n;
-
-  if constexpr (QUANTIZE_INT4)
-    for (int t = blockIdx.x; t * TILE_M < m; t += gridDim.x)
+    int staging_ptr_array_size, char* const* inbox_ptr_array,
+    int inbox_ptr_array_size, int64_t inbox_stride_slot, int64_t inbox_stride_m,
+    int64_t inbox_stride_n, int inbox_size_slot, int inbox_size_m,
+    int inbox_size_n, int32_t* connection_ptr, int64_t connection_stride_block,
+    int64_t connection_stride_word, int connection_size_block,
+    int connection_size_word, uint32_t* const* counters_ptr_array,
+    int counters_ptr_array_size, int64_t counters_stride_kind,
+    int64_t counters_stride_block, int64_t counters_stride_peer,
+    int counters_size_block, int counters_size_peer,
+    uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
+    int64_t signals_stride_parity, int64_t signals_stride_block,
+    int64_t signals_stride_writer, int signals_size_parity,
+    int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
+    int64_t status_stride_field, int status_size_field, int rank,
+    uint64_t timeout_ticks, float eps) {
+  if constexpr (PROTOCOL == Protocol::simple_write ||
+                PROTOCOL == Protocol::simple_read) {
+    // A tile is a round: this rank's tile to every rank, every rank's from
+    // each, through the protocol's inbox (the block's row); the sum and the
+    // norm as the pull's.
+    static_assert(
+        !QUANTIZE_INT4 && TILE_M == 1,
+        "the Simple protocols' fused one-shot is exact, a row a tile");
+    constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
+    constexpr int kPacks =
+        (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+    constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
+    const int m = input_size_m, n = input_size_n;
+    const int inbox_row = static_cast<int>(blockIdx.x);
+    // The block's connection, a line of its own (CONNECTION).
+    Connection connection;
+    load<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+        connection_ptr, 0, 0, connection_stride_block, connection_stride_word,
+        1, connection_size_block, connection_size_word, connection_size_block,
+        connection_size_word, connection, inbox_row, 0, 1);
+    WEIGHT_DTYPE w[1][kPacks][kPackElems];
+    if constexpr (!CHUNKED)
+      load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+          weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+    for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
       for (int c = 0; c < n; c += kSpan) {
         DTYPE mine[TILE_M][kPacks][kPackElems];
         load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
             input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
-            mine, t * TILE_M, c, 1);
-        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, Protocol::simple,
-             Layout::tile, TAIL>(mine, staging_ptr_array,
-                                 staging_ptr_array_size, rank, 1, 0, 0, n, 1, 1,
-                                 m, n, m, n, t * TILE_M, c, 1);
+            mine, row, c, 1);
+        send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::tile>(
+            mine, inbox_ptr_array, inbox_ptr_array_size, 0, WORLD, rank,
+            inbox_stride_slot, inbox_stride_m, inbox_stride_n, inbox_size_slot,
+            inbox_size_m, inbox_size_n, inbox_row + 1, min(kSpan, n - c),
+            inbox_row, 0, 1, &connection, counters_ptr_array,
+            counters_ptr_array_size, counters_stride_kind,
+            counters_stride_block, counters_stride_peer, counters_size_block,
+            counters_size_peer, status_ptr, status_stride_field,
+            status_size_field, timeout_ticks);
+        DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
+        recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
+             Layout::tile>(
+            inbox_ptr_array, inbox_ptr_array_size, rank, 0, inbox_stride_slot,
+            inbox_stride_m, inbox_stride_n, inbox_size_slot, inbox_size_m,
+            inbox_size_n, inbox_row + 1, min(kSpan, n - c), copies, inbox_row,
+            0, 1, &connection, counters_ptr_array, counters_ptr_array_size,
+            counters_stride_kind, counters_stride_block, counters_stride_peer,
+            counters_size_block, counters_size_peer, status_ptr,
+            status_stride_field, status_size_field, timeout_ticks);
+        DTYPE sum[TILE_M][kPacks][kPackElems];
+#pragma unroll
+        for (int i = 0; i < TILE_M; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+            for (int j = 0; j < kPackElems; ++j) {
+              float acc = static_cast<float>(copies[0][i][k][j]);
+#pragma unroll
+              for (int r = 1; r < WORLD; ++r)
+                acc += static_cast<float>(copies[r][i][k][j]);
+              sum[i][k][j] = static_cast<DTYPE>(acc);
+            }
+
+        if constexpr (CHUNKED)
+          store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+              sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n,
+              m, n, row, c, 1);
+        else
+          add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+              row, sum, w, m, n, residual_ptr, residual_stride_m,
+              residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+              residual_output_ptr, residual_output_stride_m,
+              residual_output_stride_n, eps);
       }
-
-  std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) {
-    if constexpr (QUANTIZE_INT4)
-      entries[r] = address(staging_ptr_array, staging_ptr_array_size, r);
-    else
-      entries[r] = address(input_ptr_array, input_ptr_array_size, r);
-  }
-  constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::started;
-  barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                 signals_stride_parity, signals_stride_block,
-                 signals_stride_writer, signals_size_parity, signals_size_block,
-                 signals_size_writer, status_ptr, status_stride_field,
-                 status_size_field, rank, timeout_ticks, kFirst, 0);
-
-  WEIGHT_DTYPE w[1][kPacks][kPackElems];
-  if constexpr (!CHUNKED)
-    load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
-        weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
-
-  for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
-    for (int c = 0; c < n; c += kSpan) {
-      DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
-      all_gather<AllGatherAlgorithm::tile_pull, Protocol::simple, QUANTIZE_INT4,
-                 DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE,
-                 PACK_BYTES, false, TAIL>(
-          entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
-          QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
-          0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
-          nullptr, 0, 0, rank, 0);
-      DTYPE sum[TILE_M][kPacks][kPackElems];
-#pragma unroll
-      for (int i = 0; i < TILE_M; ++i)
-#pragma unroll
-        for (int k = 0; k < kPacks; ++k)
-#pragma unroll
-          for (int j = 0; j < kPackElems; ++j) {
-            float acc = static_cast<float>(copies[0][i][k][j]);
-#pragma unroll
-            for (int r = 1; r < WORLD; ++r)
-              acc += static_cast<float>(copies[r][i][k][j]);
-            sum[i][k][j] = static_cast<DTYPE>(acc);
-          }
-
       if constexpr (CHUNKED)
-        store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
-            sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n, m,
-            n, row, c, 1);
-      else
-        add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
-            row, sum, w, m, n, residual_ptr, residual_stride_m,
-            residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+        add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
+                          BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+            row, output_ptr, output_stride_m, output_stride_n, m, n,
+            residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
+            weight_stride_n, output_ptr, output_stride_m, output_stride_n,
             residual_output_ptr, residual_output_stride_m,
             residual_output_stride_n, eps);
     }
-    if constexpr (CHUNKED)
-      add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N, BLOCK_X,
-                        BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
-          row, output_ptr, output_stride_m, output_stride_n, m, n, residual_ptr,
-          residual_stride_m, residual_stride_n, weight_ptr, weight_stride_n,
-          output_ptr, output_stride_m, output_stride_n, residual_output_ptr,
-          residual_output_stride_m, residual_output_stride_n, eps);
-  }
 
-  barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                 signals_stride_parity, signals_stride_block,
-                 signals_stride_writer, signals_size_parity, signals_size_block,
-                 signals_size_writer, status_ptr, status_stride_field,
-                 status_size_field, rank, timeout_ticks, Until::read, 1);
+    store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::block>(
+        connection, connection_ptr, 0, 0, connection_stride_block,
+        connection_stride_word, 1, connection_size_block, connection_size_word,
+        connection_size_block, connection_size_word, inbox_row, 0, 1);
+  } else {
+    static_assert(PROTOCOL == Protocol::simple,
+                  "the fused one-shot is Simple, simple_write or simple_read");
+    constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
+    constexpr int kPacks =
+        (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
+    constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
+    const int m = input_size_m, n = input_size_n;
+
+    if constexpr (QUANTIZE_INT4)
+      for (int t = blockIdx.x; t * TILE_M < m; t += gridDim.x)
+        for (int c = 0; c < n; c += kSpan) {
+          DTYPE mine[TILE_M][kPacks][kPackElems];
+          load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+              input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n,
+              mine, t * TILE_M, c, 1);
+          send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true,
+               Protocol::simple, Layout::tile, TAIL>(
+              mine, staging_ptr_array, staging_ptr_array_size, rank, 1, 0, 0, n,
+              1, 1, m, n, m, n, t * TILE_M, c, 1);
+        }
+
+    std::conditional_t<QUANTIZE_INT4, char*, const DTYPE*> entries[WORLD];
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) {
+      if constexpr (QUANTIZE_INT4)
+        entries[r] = address(staging_ptr_array, staging_ptr_array_size, r);
+      else
+        entries[r] = address(input_ptr_array, input_ptr_array_size, r);
+    }
+    constexpr Until kFirst = QUANTIZE_INT4 ? Until::launched : Until::started;
+    barrier<WORLD>(
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+        signals_stride_block, signals_stride_writer, signals_size_parity,
+        signals_size_block, signals_size_writer, status_ptr,
+        status_stride_field, status_size_field, rank, timeout_ticks, kFirst, 0);
+
+    WEIGHT_DTYPE w[1][kPacks][kPackElems];
+    if constexpr (!CHUNKED)
+      load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+          weight_ptr, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+
+    for (int row = blockIdx.x * TILE_M; row < m; row += gridDim.x * TILE_M) {
+      for (int c = 0; c < n; c += kSpan) {
+        DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
+        all_gather<AllGatherAlgorithm::tile_pull, Protocol::simple,
+                   QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, BLOCK_X,
+                   BLOCK_Y, WAVE_SIZE, PACK_BYTES, false, TAIL>(
+            entries, 0, QUANTIZE_INT4 ? int64_t{n} : input_ptr_array_stride_m,
+            QUANTIZE_INT4 ? int64_t{1} : input_ptr_array_stride_n, m, n, copies,
+            0, 0, 0, 0, row, c, 0, n, 0, nullptr, 0, nullptr, 0, 0, 0, 0, 0, 0,
+            0, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0,
+            nullptr, 0, 0, rank, 0);
+        DTYPE sum[TILE_M][kPacks][kPackElems];
+#pragma unroll
+        for (int i = 0; i < TILE_M; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+            for (int j = 0; j < kPackElems; ++j) {
+              float acc = static_cast<float>(copies[0][i][k][j]);
+#pragma unroll
+              for (int r = 1; r < WORLD; ++r)
+                acc += static_cast<float>(copies[r][i][k][j]);
+              sum[i][k][j] = static_cast<DTYPE>(acc);
+            }
+
+        if constexpr (CHUNKED)
+          store<1, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
+              sum, output_ptr, 0, 0, output_stride_m, output_stride_n, 1, m, n,
+              m, n, row, c, 1);
+        else
+          add_rms_norm_rows<RESIDUAL, BLOCK_X, BLOCK_Y, WAVE_SIZE>(
+              row, sum, w, m, n, residual_ptr, residual_stride_m,
+              residual_stride_n, output_ptr, output_stride_m, output_stride_n,
+              residual_output_ptr, residual_output_stride_m,
+              residual_output_stride_n, eps);
+      }
+      if constexpr (CHUNKED)
+        add_rms_norm_rows<RESIDUAL, DTYPE, WEIGHT_DTYPE, TILE_M, TILE_N,
+                          BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED>(
+            row, output_ptr, output_stride_m, output_stride_n, m, n,
+            residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
+            weight_stride_n, output_ptr, output_stride_m, output_stride_n,
+            residual_output_ptr, residual_output_stride_m,
+            residual_output_stride_n, eps);
+    }
+
+    barrier<WORLD>(signals_ptr_array, signals_ptr_array_size,
+                   signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, signals_size_parity,
+                   signals_size_block, signals_size_writer, status_ptr,
+                   status_stride_field, status_size_field, rank, timeout_ticks,
+                   Until::read, 1);
+  }
 }
 
 template <bool RESIDUAL, bool QUANTIZE_INT4, typename DTYPE,
@@ -574,27 +678,45 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size,
         int64_t staging_stride_m, int64_t staging_stride_n, int staging_size_m,
-        int staging_size_n, uint32_t* const* __restrict__ signals_ptr_array,
+        int staging_size_n, char* const* inbox_ptr_array,
+        int inbox_ptr_array_size, int64_t inbox_stride_slot,
+        int64_t inbox_stride_m, int64_t inbox_stride_n, int inbox_size_slot,
+        int inbox_size_m, int inbox_size_n, int32_t* connection_ptr,
+        int64_t connection_stride_block, int64_t connection_stride_word,
+        int connection_size_block, int connection_size_word,
+        uint32_t* const* counters_ptr_array, int counters_ptr_array_size,
+        int64_t counters_stride_kind, int64_t counters_stride_block,
+        int64_t counters_stride_peer, int counters_size_block,
+        int counters_size_peer, uint32_t* const* __restrict__ signals_ptr_array,
         int signals_ptr_array_size, int64_t signals_stride_parity,
         int64_t signals_stride_block, int64_t signals_stride_writer,
         int signals_size_parity, int signals_size_block,
         int signals_size_writer, uint32_t* __restrict__ status_ptr,
         int64_t status_stride_field, int status_size_field, int rank,
         uint64_t timeout_ticks, float eps) {
-  // Its stages synchronize with barriers until they move to a protocol.
-  static_assert(PROTOCOL == Protocol::simple,
-                "the fused add_rms_norm's stages are Simple's still");
+  // Its stages synchronize with barriers until they move to a protocol; the
+  // one-shot has.
+  static_assert(
+      PROTOCOL == Protocol::simple ||
+          ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull,
+      "the fused add_rms_norm's other stages are Simple's still");
   if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::one_shot_pull)
     all_reduce_add_rms_norm_one_shot_pull<
-        RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M, TILE_N,
-        BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
+        PROTOCOL, RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M,
+        TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, PACK_BYTES, CHUNKED, TAIL>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
         input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
         input_ptr_array_stride_n, residual_ptr, residual_stride_m,
         residual_stride_n, weight_ptr, weight_stride_n, output_ptr,
         output_stride_m, output_stride_n, residual_output_ptr,
         residual_output_stride_m, residual_output_stride_n, staging_ptr_array,
-        staging_ptr_array_size, signals_ptr_array, signals_ptr_array_size,
+        staging_ptr_array_size, inbox_ptr_array, inbox_ptr_array_size,
+        inbox_stride_slot, inbox_stride_m, inbox_stride_n, inbox_size_slot,
+        inbox_size_m, inbox_size_n, connection_ptr, connection_stride_block,
+        connection_stride_word, connection_size_block, connection_size_word,
+        counters_ptr_array, counters_ptr_array_size, counters_stride_kind,
+        counters_stride_block, counters_stride_peer, counters_size_block,
+        counters_size_peer, signals_ptr_array, signals_ptr_array_size,
         signals_stride_parity, signals_stride_block, signals_stride_writer,
         signals_size_parity, signals_size_block, signals_size_writer,
         status_ptr, status_stride_field, status_size_field, rank, timeout_ticks,

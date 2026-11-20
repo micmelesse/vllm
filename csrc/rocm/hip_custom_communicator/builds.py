@@ -219,18 +219,22 @@ def parse_table(path: Path) -> dict[str, list[Build]]:
                 if build.block_z != 1:
                     raise SystemExit(f"{path}: {arch}: {build}: no block_z")
                 # simple_write and simple_read are the exact one-shot's and
-                # two-shot's so far, one row of whole waves.
+                # two-shot's so far, and the fused add_rms_norm's one-shot, one
+                # row of whole waves.
+                moved = {
+                    "all_reduce": ("one_shot_push", "two_shot_push"),
+                    "all_reduce_add_rms_norm": ("one_shot_pull",),
+                }
                 if build.protocol in ("simple_write", "simple_read") and (
-                    build.kernel != "all_reduce"
-                    or build.algorithm not in ("one_shot_push", "two_shot_push")
+                    build.algorithm not in moved.get(build.kernel, ())
                     or build.quantization != "exact"
                     or build.block_y != 1
                     or build.tile_m != 1
                     or build.block_x % WAVE_SIZE != 0
                 ):
                     raise SystemExit(
-                        f"{path}: {arch}: {build}: {build.protocol} is the "
-                        "exact one-shot and two-shot push's, one row"
+                        f"{path}: {arch}: {build}: {build.protocol} is not "
+                        "this kernel's, or not exact and one row, yet"
                     )
                 if build not in builds:
                     builds.append(build)
