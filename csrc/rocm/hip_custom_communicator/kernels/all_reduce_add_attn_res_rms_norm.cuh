@@ -519,9 +519,9 @@ DINLINE void all_reduce_add_attn_res_rms_norm_two_shot_push(
   }
 }
 
-template <AllReduceAddAttnResRmsNormAlgorithm ALGORITHM, bool QUANTIZE_INT4,
-          typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K,
-          int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES,
+template <AllReduceAddAttnResRmsNormAlgorithm ALGORITHM, Protocol PROTOCOL,
+          bool QUANTIZE_INT4, typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+          int TILE_K, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE, int PACK_BYTES,
           int WAVES_PER_EU, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
     all_reduce_add_attn_res_rms_norm(
@@ -557,6 +557,9 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         int signals_size_writer, uint32_t* __restrict__ status_ptr,
         int64_t status_stride_field, int status_size_field, int rank,
         uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
+  // Its stages synchronize with barriers until they move to a protocol.
+  static_assert(PROTOCOL == Protocol::simple,
+                "the fused add_attn_res_rms_norm's stages are Simple's still");
   if constexpr (ALGORITHM == AllReduceAddAttnResRmsNormAlgorithm::one_shot_pull)
     all_reduce_add_attn_res_rms_norm_one_shot_pull<
         QUANTIZE_INT4, DTYPE, WORLD, TILE_M, TILE_N, TILE_K, BLOCK_X, BLOCK_Y,

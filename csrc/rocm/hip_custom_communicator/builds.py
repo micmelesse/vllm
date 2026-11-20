@@ -49,9 +49,11 @@ SPLIT_ROWS = {
 TEMPLATE_ARGS = {
     "all_reduce": "algorithm protocol quantize_int4 T world tile_m tile_n block_x "
     "block_y wave_size pack_bytes waves_per_eu contiguous tail",
-    "all_reduce_add_rms_norm": "algorithm residual quantize_int4 T W world tile_m "
+    "all_reduce_add_rms_norm": "algorithm protocol residual quantize_int4 T W world "
+    "tile_m "
     "tile_n block_x block_y wave_size pack_bytes waves_per_eu chunked tail",
-    "all_reduce_add_attn_res_rms_norm": "algorithm quantize_int4 T world tile_m "
+    "all_reduce_add_attn_res_rms_norm": "algorithm protocol quantize_int4 T world "
+    "tile_m "
     "tile_n tile_k block_x block_y wave_size pack_bytes waves_per_eu chunked tail",
     "add_rms_norm": "residual T W tile_m tile_n block_x block_y wave_size pack_bytes "
     "waves_per_eu chunked",

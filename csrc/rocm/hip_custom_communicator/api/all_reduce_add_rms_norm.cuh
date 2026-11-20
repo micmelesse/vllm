@@ -461,8 +461,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         quantize_int4 && (n % kInt4Group != 0 || n / kInt4Group % s.world != 0);
 
     for (const auto& i : kAllReduceAddRmsNormInstances)
-      if (i.algorithm == algorithm && i.residual == add &&
-          i.block_x == block_x && i.block_y == block_y &&
+      if (i.algorithm == algorithm && i.protocol == protocol &&
+          i.residual == add && i.block_x == block_x && i.block_y == block_y &&
           i.block_z == block_z && i.waves_per_eu == waves_per_eu &&
           i.tile_m == tile_m && i.tile_n == tile_n &&
           i.quantization ==

@@ -281,10 +281,10 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     void* kernel = nullptr;
 
     for (const auto& i : kAllReduceAddAttnResRmsNormInstances)
-      if (i.algorithm == algorithm && i.block_x == block_x &&
-          i.block_y == block_y && i.block_z == block_z &&
-          i.waves_per_eu == waves_per_eu && i.tile_m == tile_m &&
-          i.tile_n == tile_n && i.tile_k == tile_k &&
+      if (i.algorithm == algorithm && i.protocol == protocol &&
+          i.block_x == block_x && i.block_y == block_y &&
+          i.block_z == block_z && i.waves_per_eu == waves_per_eu &&
+          i.tile_m == tile_m && i.tile_n == tile_n && i.tile_k == tile_k &&
           i.quantization == quantization && i.pack_bytes == pack &&
           i.world == s.world && i.wave_size == s.device.wave_size &&
           i.dtype == dtype && i.weight_dtype == dtype &&
