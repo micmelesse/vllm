@@ -169,7 +169,7 @@ DINLINE void all_reduce_add_rms_norm_one_shot(
     int64_t output_stride_m, int64_t output_stride_n,
     DTYPE* residual_output_ptr, int64_t residual_output_stride_m,
     int64_t residual_output_stride_n, const ProtocolBuffers& protocol_buffers,
-    int rank, float eps) {
+    float eps) {
   // A tile is a round: this rank's tile to every rank, every rank's from
   // each, through the protocol's inbox (the block's row), summed and
   // normalized.
@@ -180,7 +180,6 @@ DINLINE void all_reduce_add_rms_norm_one_shot(
       (TILE_N + kPackElems * BLOCK_X - 1) / (kPackElems * BLOCK_X);
   constexpr int kSpan = kPacks * kPackElems * BLOCK_X;
   const int m = input_size_m, n = input_size_n;
-  const int inbox_row = static_cast<int>(blockIdx.x);
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
   if constexpr (!CHUNKED)
     load<1, 1, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
@@ -192,12 +191,11 @@ DINLINE void all_reduce_add_rms_norm_one_shot(
           input_ptr, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, mine,
           row, c, 1);
       send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-           Layout::tile>(mine, protocol_buffers, 0, WORLD, rank, inbox_row + 1,
-                         min(kSpan, n - c), inbox_row, 0, 1);
+           Layout::tile>(mine, protocol_buffers, 0, WORLD, 1,
+                         min(kSpan, n - c));
       DTYPE copies[WORLD][TILE_M][kPacks][kPackElems];
       recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-           Layout::tile>(protocol_buffers, rank, 0, inbox_row + 1,
-                         min(kSpan, n - c), copies, inbox_row, 0, 1);
+           Layout::tile>(protocol_buffers, 0, 1, min(kSpan, n - c), copies);
       DTYPE sum[TILE_M][kPacks][kPackElems];
 #pragma unroll
       for (int i = 0; i < TILE_M; ++i)
@@ -250,7 +248,7 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
   // shares is two rounds: the reduce-scatter (share w's chunk to rank w,
   // this rank's from every rank, summed) and the all-gather (the sum to
   // every rank, share w's chunk from rank w). Each lane group talks to one
-  // peer, w; the inbox row is the block's. The gathered row is stored and
+  // peer, w. The gathered row is stored and
   // normalized there, a chunk at a time.
   // INT4: a share is whole groups, and a lane holds a group a
   // round; the parts go quantized, are summed in float from their
@@ -275,7 +273,6 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
   const int slice = (units + WORLD - 1) / WORLD * kUnit;
   // The INT4 payload's scales follow every slot's and row's values.
   const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
-  const int inbox_row = static_cast<int>(blockIdx.x);
   // A share is slice long, the last one cut at the row's end.
   const int share_w = max(0, min(slice, n - w * slice));
   const int share_me = max(0, min(slice, n - rank * slice));
@@ -295,13 +292,11 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
                TAIL>(input_ptr, w, slice, input_stride_m, input_stride_n, WORLD,
                      m, n, m, end_w, part, row, lo, 1);
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(part, protocol_buffers, w, 1, rank,
-                                      inbox_row + 1, max(end_w - lo, 0),
-                                      inbox_row, 0, 1);
+             Layout::group_run, TAIL>(part, protocol_buffers, w, 1, 1,
+                                      max(end_w - lo, 0));
         uint32_t got[1][1][kInt4GroupPacks][2];
         recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(protocol_buffers, rank, w, inbox_row + 1,
-                                      read_me, got, inbox_row, 0, 1);
+             Layout::group_run, TAIL>(protocol_buffers, w, 1, read_me, got);
         DTYPE parts[kInt4GroupPacks][kPackElems];
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
@@ -310,13 +305,11 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
         reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(parts, sum[0]);
 
         send<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(sum, protocol_buffers, w, 1, rank,
-                                      inbox_row + 1, max(end_me - lo, 0),
-                                      inbox_row, 0, 1);
+             Layout::group_run, TAIL>(sum, protocol_buffers, w, 1, 1,
+                                      max(end_me - lo, 0));
         uint32_t words[1][1][kInt4GroupPacks][2];
         recv<WORLD, WORLD, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-             Layout::group_run, TAIL>(protocol_buffers, rank, w, inbox_row + 1,
-                                      read_w, words, inbox_row, 0, 1);
+             Layout::group_run, TAIL>(protocol_buffers, w, 1, read_w, words);
         DTYPE out[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
@@ -338,22 +331,18 @@ DINLINE void all_reduce_add_rms_norm_two_shot(
               input_ptr, w, slice, input_stride_m, input_stride_n, WORLD, m, n,
               m, end_w, part, row, lo, 1);
         send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::run>(part, protocol_buffers, w, 1, rank, inbox_row + 1,
-                          max(end_w - lo, 0), inbox_row, 0, 1);
+             Layout::run>(part, protocol_buffers, w, 1, 1, max(end_w - lo, 0));
         DTYPE got[1][kPacks][kPackElems];
         recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::run>(protocol_buffers, rank, w, inbox_row + 1, read_me,
-                          got, inbox_row, 0, 1);
+             Layout::run>(protocol_buffers, w, 1, read_me, got);
         DTYPE sum[1][kPacks][kPackElems];
         reduce<WORLD, BLOCK_X, WAVE_SIZE, ReduceAxis::m_all>(got[0], sum[0]);
 
         send<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::run>(sum, protocol_buffers, w, 1, rank, inbox_row + 1,
-                          max(end_me - lo, 0), inbox_row, 0, 1);
+             Layout::run>(sum, protocol_buffers, w, 1, 1, max(end_me - lo, 0));
         DTYPE out[1][kPacks][kPackElems];
         recv<WORLD, 1, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-             Layout::run>(protocol_buffers, rank, w, inbox_row + 1, read_w, out,
-                          inbox_row, 0, 1);
+             Layout::run>(protocol_buffers, w, 1, read_w, out);
         store<WORLD, 1, BLOCK_X, WAVE_SIZE, false, Layout::flat>(
             out, output_ptr, w, slice, output_stride_m, output_stride_n, WORLD,
             m, n, m, end_w, row, lo, 1);
@@ -388,7 +377,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         DTYPE* residual_output_ptr, int64_t residual_output_stride_m,
         int64_t residual_output_stride_n, int residual_output_size_m,
         int residual_output_size_n, const ProtocolBuffers protocol_buffers,
-        int rank, float eps) {
+        float eps) {
   // Every stage synchronizes in send and recv, on simple_write or
   // simple_read.
   static_assert(
@@ -402,7 +391,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
         weight_stride_n, output_ptr, output_stride_m, output_stride_n,
         residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-        protocol_buffers, rank, eps);
+        protocol_buffers, eps);
   else if constexpr (ALGORITHM == AllReduceAddRmsNormKernelAlgorithm::two_shot)
     all_reduce_add_rms_norm_two_shot<
         PROTOCOL, RESIDUAL, QUANTIZE_INT4, DTYPE, WEIGHT_DTYPE, WORLD, TILE_M,
@@ -411,7 +400,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y, WAVES_PER_EU)
         residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
         weight_stride_n, output_ptr, output_stride_m, output_stride_n,
         residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-        protocol_buffers, rank, eps);
+        protocol_buffers, protocol_buffers.rank, eps);
 }
 
 }  // namespace hip_custom_communicator

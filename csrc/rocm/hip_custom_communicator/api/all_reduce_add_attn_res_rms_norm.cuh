@@ -318,8 +318,8 @@ ErrorCode hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(output_size_n), static_cast<T*>(block_output_ptr),
         block_output_stride_m, block_output_stride_n,
         static_cast<int>(block_output_size_m),
-        static_cast<int>(block_output_size_n), *protocol_buffers, s.rank,
-        num_blocks, eps, output_eps);
+        static_cast<int>(block_output_size_n), *protocol_buffers, num_blocks,
+        eps, output_eps);
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();

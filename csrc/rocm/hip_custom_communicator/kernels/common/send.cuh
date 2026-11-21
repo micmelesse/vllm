@@ -1245,9 +1245,14 @@ template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
           bool TAIL = false, typename INPUT>
 DINLINE void send(const INPUT& input, const ProtocolBuffers& protocol_buffers,
-                  int output_rank, int output_rank_count, int output_slot,
-                  int clip_m, int clip_n, int offs_m, int offs_n,
-                  int row_step) {
+                  int output_rank, int output_rank_count, int rows, int cols) {
+  // This rank's slot, and the block's own rows of it: a tile's TILE_M from the
+  // block's first, a flat walk's one. Of them, `rows` exist, of `cols`
+  // columns.
+  const int output_slot = protocol_buffers.rank;
+  const int offs_m =
+      static_cast<int>(blockIdx.x) * (LAYOUT == Layout::tile ? TILE_M : 1);
+  const int clip_m = offs_m + rows, clip_n = cols, offs_n = 0, row_step = 1;
   // The protocol's values, as the leaves take them.
   char* const* const output_ptr_array = protocol_buffers.inbox_ptr_array;
   const int output_ptr_array_size = protocol_buffers.inbox_ptr_array_size;

@@ -1791,8 +1791,15 @@ template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Protocol PROTOCOL, Layout LAYOUT,
           bool TAIL = false, typename OUTPUT>
 DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
-                  int input_slot, int clip_m, int clip_n, OUTPUT& output,
-                  int offs_m, int offs_n, int row_step) {
+                  int rows, int cols, OUTPUT& output) {
+  // The writers from input_rank on, read as this rank (`self`; a leaf takes
+  // the reader, then the first writer), at the block's own rows: a tile's
+  // TILE_M from the block's first, a flat walk's one. Of them, `rows` exist,
+  // of `cols` columns.
+  const int self = protocol_buffers.rank;
+  const int offs_m =
+      static_cast<int>(blockIdx.x) * (LAYOUT == Layout::tile ? TILE_M : 1);
+  const int clip_m = offs_m + rows, clip_n = cols, offs_n = 0, row_step = 1;
   // The protocol's values, as the leaves take them.
   char* const* const input_ptr_array = protocol_buffers.inbox_ptr_array;
   const int input_ptr_array_size = protocol_buffers.inbox_ptr_array_size;
@@ -1841,7 +1848,7 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   if constexpr (PROTOCOL == Protocol::ll) {
     internal::recv_ll<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4,
                       LAYOUT, TAIL>(
-        input_ptr_array, input_ptr_array_size, input_rank, input_slot,
+        input_ptr_array, input_ptr_array_size, self, input_rank,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step, *connection, status_ptr, status_stride_field,
@@ -1849,7 +1856,7 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   } else if constexpr (PROTOCOL == Protocol::simple_write) {
     internal::recv_simple_write<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                                 QUANTIZE_INT4, LAYOUT, TAIL>(
-        input_ptr_array, input_ptr_array_size, input_rank, input_slot,
+        input_ptr_array, input_ptr_array_size, self, input_rank,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step, *connection, counters_ptr_array, counters_ptr_array_size,
@@ -1859,7 +1866,7 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   } else if constexpr (PROTOCOL == Protocol::simple_read) {
     internal::recv_simple_read<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                                QUANTIZE_INT4, LAYOUT, TAIL>(
-        input_ptr_array, input_ptr_array_size, input_rank, input_slot,
+        input_ptr_array, input_ptr_array_size, self, input_rank,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step, *connection, counters_ptr_array, counters_ptr_array_size,
@@ -1869,7 +1876,7 @@ DINLINE void recv(const ProtocolBuffers& protocol_buffers, int input_rank,
   } else {
     internal::recv_lamport<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE,
                            QUANTIZE_INT4, LAYOUT, TAIL>(
-        input_ptr_array, input_ptr_array_size, input_rank, input_slot,
+        input_ptr_array, input_ptr_array_size, self, input_rank,
         input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step, *connection, status_ptr, status_stride_field,

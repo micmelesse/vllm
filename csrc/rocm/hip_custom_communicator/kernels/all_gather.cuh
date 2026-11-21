@@ -46,7 +46,7 @@ template <Protocol PROTOCOL, bool QUANTIZE_INT4, typename DTYPE, int WORLD,
           bool TAIL, int ROWS, int PACKS, int ELEMS>
 DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
                              int64_t input_stride_n,
-                             const ProtocolBuffers& protocol_buffers, int rank,
+                             const ProtocolBuffers& protocol_buffers,
                              int input_size_m, int input_size_n, int offs_m,
                              int offs_n, int clip_m, int clip_n,
                              DTYPE (&copies)[WORLD][ROWS][PACKS][ELEMS]) {
@@ -54,9 +54,6 @@ DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
                     PROTOCOL == Protocol::simple_write ||
                     PROTOCOL == Protocol::simple_read,
                 "a tile gather is LL, Lamport, simple_write or simple_read");
-  // The block's row of the inbox (CONNECTION).
-  const int first_row = static_cast<int>(blockIdx.x) * TILE_M;
-  const int lines_m = first_row + clip_m;
   const int lines_n = min(TILE_N, input_size_n - offs_n);
   DTYPE mine[ROWS][PACKS][ELEMS];
   load<WORLD, TILE_M, BLOCK_X, WAVE_SIZE, false, Layout::tile>(
@@ -72,16 +69,13 @@ DINLINE void all_gather_tile(const DTYPE* input_ptr, int64_t input_stride_m,
         quantize(reinterpret_cast<const DTYPE(&)[1][ELEMS]>(mine[i][k]),
                  reinterpret_cast<uint32_t (&)[1][2]>(payload[i][k]));
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, true, PROTOCOL,
-         Layout::tile>(payload, protocol_buffers, 0, WORLD, rank, lines_m,
-                       lines_n, first_row, 0, 1);
+         Layout::tile>(payload, protocol_buffers, 0, WORLD, clip_m, lines_n);
   } else {
     send<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, false, PROTOCOL,
-         Layout::tile>(mine, protocol_buffers, 0, WORLD, rank, lines_m, lines_n,
-                       first_row, 0, 1);
+         Layout::tile>(mine, protocol_buffers, 0, WORLD, clip_m, lines_n);
   }
   recv<WORLD, TILE_M, BLOCK_X, BLOCK_Y, WAVE_SIZE, QUANTIZE_INT4, PROTOCOL,
-       Layout::tile>(protocol_buffers, rank, 0, lines_m, lines_n, copies,
-                     first_row, 0, 1);
+       Layout::tile>(protocol_buffers, 0, clip_m, lines_n, copies);
 }
 
 }  // namespace internal
@@ -99,12 +93,12 @@ DINLINE void all_gather(INPUT&& input, int64_t input_stride_m,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int clip_m, int clip_n, int slice,
-                        const ProtocolBuffers& protocol_buffers, int rank) {
+                        const ProtocolBuffers& protocol_buffers) {
   if constexpr (ALGORITHM == AllGatherAlgorithm::tile)
     internal::all_gather_tile<PROTOCOL, QUANTIZE_INT4, DTYPE, WORLD, TILE_M,
                               TILE_N, BLOCK_X, BLOCK_Y, WAVE_SIZE, TAIL>(
-        input, input_stride_m, input_stride_n, protocol_buffers, rank,
-        input_size_m, input_size_n, offs_m, offs_n, clip_m, clip_n, output);
+        input, input_stride_m, input_stride_n, protocol_buffers, input_size_m,
+        input_size_n, offs_m, offs_n, clip_m, clip_n, output);
 }
 
 }  // namespace hip_custom_communicator

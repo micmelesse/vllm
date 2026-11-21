@@ -245,8 +245,7 @@ ErrorCode hip_custom_communicator_all_reduce_add_rms_norm(
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
         static_cast<T*>(residual_output_ptr), residual_output_stride_m,
         residual_output_stride_n, static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), *protocol_buffers, s.rank,
-        eps);
+        static_cast<int>(residual_output_size_n), *protocol_buffers, eps);
   };
   if (dtype == at::ScalarType::BFloat16 &&
       weight_dtype == at::ScalarType::Float)

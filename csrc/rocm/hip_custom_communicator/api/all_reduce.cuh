@@ -178,7 +178,7 @@ ErrorCode hip_custom_communicator_all_reduce(
         static_cast<int>(input_size_m), static_cast<int>(input_size_n),
         static_cast<T*>(output_ptr), output_stride_m, output_stride_n,
         static_cast<int>(output_size_m), static_cast<int>(output_size_n),
-        *protocol_buffers, s.rank);
+        *protocol_buffers);
   };
   if (dtype == at::ScalarType::BFloat16)
     launch.template operator()<c10::BFloat16, c10::BFloat16>();

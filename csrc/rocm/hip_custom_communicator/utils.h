@@ -96,7 +96,8 @@ inline std::optional<ProtocolBuffers> layout_protocol_buffers(
                                         : m.simple_write_counters_ptr_array;
   uint32_t* const steps =
       s.steps + static_cast<int>(protocol) * s.step_blocks * kStepWaves;
-  return ProtocolBuffers{inbox_ptr_array,
+  return ProtocolBuffers{s.rank,
+                         inbox_ptr_array,
                          s.world,
                          stride_slot,
                          stride_m,

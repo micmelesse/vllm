@@ -156,11 +156,13 @@ enum class Protocol { ll, lamport, simple_write, simple_read };
 // another's.
 enum class Counter : int { tail, head };
 
-// A launch's protocol buffers, read-only: the protocol's inbox (every rank's
-// address, and its layout), its counters, its steps (STEPS), and the status
-// record and wait limit a send or recv waits by. The host lays it out and
-// passes it as one kernel argument; stages hand it to send and recv unread.
+// A launch's protocol buffers, read-only: this rank (its slot in every inbox),
+// the protocol's inbox (every rank's address, and its layout), its counters,
+// its steps (STEPS), and the status record and wait limit a send or recv waits
+// by. The host lays it out and passes it as one kernel argument; stages hand it
+// to send and recv unread.
 struct ProtocolBuffers {
+  int rank;
   char* const* inbox_ptr_array;
   int inbox_ptr_array_size;
   int64_t inbox_stride_slot, inbox_stride_m, inbox_stride_n;
