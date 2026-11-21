@@ -24,12 +24,10 @@ ErrorCode hip_custom_communicator_close(int64_t state, bool alone) {
   if (!alone && !all_gathered(*s->group, "1", s->timeout_seconds) && !first)
     first = error_code(Error::exchange_failed);
   for (const void* p :
-       {static_cast<const void*>(s->symmetric.signals),
-        static_cast<const void*>(s->symmetric.unfenced),
+       {static_cast<const void*>(s->symmetric.unfenced),
         static_cast<const void*>(s->symmetric.lamport),
-        static_cast<const void*>(s->symmetric.simple_write_inbox),
-        static_cast<const void*>(s->symmetric.simple_read_inbox),
-        static_cast<const void*>(s->symmetric.signals_ptr_array),
+        static_cast<const void*>(s->symmetric.simple_write),
+        static_cast<const void*>(s->symmetric.simple_read),
         static_cast<const void*>(s->symmetric.simple_write_counters_ptr_array),
         static_cast<const void*>(s->symmetric.simple_read_counters_ptr_array),
         static_cast<const void*>(s->symmetric.unfenced_ptr_array),

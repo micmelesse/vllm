@@ -109,9 +109,9 @@ def _int4_sum(xs, config):
 
 
 def _inspect(comm):
-    """This rank's Lamport inbox, the protocols' steps, the Simple protocols'
-    counters and the status record, as views. Module-level, so ray ships the test's body
-    without torch.ops."""
+    """This rank's Lamport inbox, the protocols' steps, simple_write's and
+    simple_read's counters and the status record, as views. Module-level, so
+    ray ships the test's body without torch.ops."""
     return torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
 
 
@@ -126,7 +126,10 @@ def _check_state(comm, group, where):
     rank's next launch posts into what is read."""
     torch.accelerator.synchronize()
     dist.barrier(group=group.cpu_group)
-    inbox, steps, counters, status = (t.clone() for t in _inspect(comm))
+    inbox, steps, write_counters, read_counters, status = (
+        t.clone() for t in _inspect(comm)
+    )
+    counters = torch.stack([write_counters, read_counters])
     torch.accelerator.synchronize()
     dist.barrier(group=group.cpu_group)
     fields = ("abort", "state", "where", "rank", "block", "peer", "count", "want")

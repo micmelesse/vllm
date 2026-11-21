@@ -66,9 +66,9 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
     return {error_code(Error::hip_failed), 0, ""};
 
   const int64_t max_blocks = int64_t{cus} * (threads_a_cu / wave);
-  // simple_write's counters, then simple_read's, the same shape.
-  const int64_t signals_bytes =
-      2 * 2 * max_blocks * world * int64_t{sizeof(uint32_t)};
+  // A Simple protocol's counters, after its inbox in its buffer.
+  const int64_t counters_bytes =
+      2 * max_blocks * world * int64_t{sizeof(uint32_t)};
 
   const int64_t unfenced_blocks = 128, unfenced_slot_bytes = 2048;
   const int64_t unfenced_bytes = 2 * unfenced_blocks * world *
@@ -110,10 +110,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
   symmetric.unfenced_blocks = unfenced_blocks;
   symmetric.unfenced_slot_bytes = unfenced_slot_bytes;
   symmetric.lamport_blocks = lamport_blocks;
-  symmetric.signals_bytes = signals_bytes;
   symmetric.unfenced_bytes = unfenced_bytes;
   symmetric.lamport_bytes = lamport_bytes;
   symmetric.inbox_bytes = lamport_blocks * world * unfenced_slot_bytes;
+  symmetric.counters_bytes = counters_bytes;
   s->step_blocks = lamport_blocks;
 
   bool made = true;
@@ -128,27 +128,27 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
     buffer = static_cast<std::remove_reference_t<decltype(buffer)>>(p);
   };
   const int64_t ptr_array_bytes = world * int64_t{sizeof(char*)};
-  allocate(symmetric.signals, symmetric.signals_bytes, true);
   allocate(symmetric.unfenced, symmetric.unfenced_bytes, true);
   allocate(symmetric.lamport, symmetric.lamport_bytes, true);
-  allocate(symmetric.simple_write_inbox, symmetric.inbox_bytes, true);
-  allocate(symmetric.simple_read_inbox, symmetric.inbox_bytes, true);
+  allocate(symmetric.simple_write,
+           symmetric.inbox_bytes + symmetric.counters_bytes, true);
+  allocate(symmetric.simple_read,
+           symmetric.inbox_bytes + symmetric.counters_bytes, true);
   made = made &&
          hipMemset(symmetric.lamport, kLamportEmpty & 0xff,
                    static_cast<size_t>(symmetric.lamport_bytes)) == hipSuccess;
   // A checked build fills the Simple protocols' inboxes with 0xff, a NaN in
   // bf16 and fp16 and in an INT4 group's scale, where zeros would read as
   // finite data: a read of what no rank wrote fails a check or a test on its
-  // first call. The signals, the steps and the other inboxes keep the
-  // start their protocols need.
+  // first call. The counters after them, the steps and the other inboxes keep
+  // the start their protocols need.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG)
     made =
         made &&
-        hipMemset(symmetric.simple_write_inbox, 0xff,
+        hipMemset(symmetric.simple_write, 0xff,
                   static_cast<size_t>(symmetric.inbox_bytes)) == hipSuccess &&
-        hipMemset(symmetric.simple_read_inbox, 0xff,
+        hipMemset(symmetric.simple_read, 0xff,
                   static_cast<size_t>(symmetric.inbox_bytes)) == hipSuccess;
-  allocate(symmetric.signals_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_write_counters_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.simple_read_counters_ptr_array, ptr_array_bytes, false);
   allocate(symmetric.unfenced_ptr_array, ptr_array_bytes, false);
@@ -159,13 +159,11 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
            4 * lamport_blocks * kStepWaves * int64_t{sizeof(uint32_t)}, false);
   allocate(s->status_device, kStatusFields * int64_t{sizeof(uint32_t)}, false);
 
-  constexpr int kRegions = 5;
+  constexpr int kRegions = 4;
   constexpr size_t kHandleBytes = sizeof(hipIpcMemHandle_t);
   std::string mine(reinterpret_cast<const char*>(&uuid), sizeof(uuid));
-  char* const own[kRegions] = {reinterpret_cast<char*>(symmetric.signals),
-                               symmetric.unfenced, symmetric.lamport,
-                               symmetric.simple_write_inbox,
-                               symmetric.simple_read_inbox};
+  char* const own[kRegions] = {symmetric.unfenced, symmetric.lamport,
+                               symmetric.simple_write, symmetric.simple_read};
   for (char* region : own) {
     hipIpcMemHandle_t h{};
     made = made && hipIpcGetMemHandle(&h, region) == hipSuccess;
@@ -199,10 +197,10 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
           reachable == 0)
         failed = Error::peer_not_accessible;
     }
-  const void* const arrays[kRegions] = {
-      symmetric.signals_ptr_array, symmetric.unfenced_ptr_array,
-      symmetric.lamport_ptr_array, symmetric.simple_write_inbox_ptr_array,
-      symmetric.simple_read_inbox_ptr_array};
+  const void* const arrays[kRegions] = {symmetric.unfenced_ptr_array,
+                                        symmetric.lamport_ptr_array,
+                                        symmetric.simple_write_inbox_ptr_array,
+                                        symmetric.simple_read_inbox_ptr_array};
   for (int region = 0; region < kRegions && !failed; ++region) {
     std::vector<char*> addresses(world);
     for (int r = 0; r < world && !failed; ++r) {
@@ -227,21 +225,19 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
         hipMemcpy(const_cast<void*>(arrays[region]), addresses.data(),
                   world * sizeof(char*), hipMemcpyHostToDevice) != hipSuccess)
       failed = Error::hip_failed;
-    if (!failed && region == 0) {
-      // Each Simple protocol's counters, a region each.
-      uint32_t* const* const tables[2] = {
-          symmetric.simple_write_counters_ptr_array,
-          symmetric.simple_read_counters_ptr_array};
-      for (int t = 0; t < 2 && !failed; ++t) {
-        std::vector<uint32_t*> counters(world);
-        for (int r = 0; r < world; ++r)
-          counters[r] = reinterpret_cast<uint32_t*>(addresses[r]) +
-                        t * 2 * max_blocks * world;
-        if (hipMemcpy(const_cast<uint32_t**>(tables[t]), counters.data(),
-                      world * sizeof(uint32_t*),
-                      hipMemcpyHostToDevice) != hipSuccess)
-          failed = Error::hip_failed;
-      }
+    if (!failed && region >= 2) {
+      // A Simple protocol's counters, after its inbox in each rank's buffer.
+      uint32_t* const* const table =
+          region == 2 ? symmetric.simple_write_counters_ptr_array
+                      : symmetric.simple_read_counters_ptr_array;
+      std::vector<uint32_t*> counters(world);
+      for (int r = 0; r < world; ++r)
+        counters[r] =
+            reinterpret_cast<uint32_t*>(addresses[r] + symmetric.inbox_bytes);
+      if (hipMemcpy(const_cast<uint32_t**>(table), counters.data(),
+                    world * sizeof(uint32_t*),
+                    hipMemcpyHostToDevice) != hipSuccess)
+        failed = Error::hip_failed;
     }
   }
   (void)hipGetLastError();
@@ -263,8 +259,8 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 
 // For the tests: views of the state the protocols keep from launch to launch,
 // this rank's Lamport inbox (bytes), the steps ([protocol][block][wave],
-// STEPS), the Simple protocols' counters ([simple_write, simple_read][tail,
-// head] [block][peer], COUNTERS) and the status record (StatusField), so a test
+// STEPS), simple_write's counters and simple_read's (each [tail, head][block]
+// [peer], COUNTERS) and the status record (StatusField), so a test
 // can check what every launch must leave: the inbox all the sentinel, every
 // slot of a block at one step and the steps equal on every rank, every counter
 // of a block at its step (every round posted was read), and no wait given up.
@@ -280,8 +276,11 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
                        on.dtype(torch::kUInt8)),
       torch::from_blob(s.steps, {4, s.step_blocks, int64_t{kStepWaves}},
                        on.dtype(torch::kInt32)),
-      torch::from_blob(s.symmetric.signals,
-                       {2, 2, s.symmetric.max_blocks, int64_t{s.world}},
+      torch::from_blob(s.symmetric.simple_write + s.symmetric.inbox_bytes,
+                       {2, s.symmetric.max_blocks, int64_t{s.world}},
+                       on.dtype(torch::kInt32)),
+      torch::from_blob(s.symmetric.simple_read + s.symmetric.inbox_bytes,
+                       {2, s.symmetric.max_blocks, int64_t{s.world}},
                        on.dtype(torch::kInt32)),
       torch::from_blob(s.status_device, {int64_t{kStatusFields}},
                        on.dtype(torch::kInt32)),

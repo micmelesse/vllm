@@ -112,24 +112,23 @@ struct SymmetricMemory {
   int64_t max_blocks = 0, unfenced_blocks = 0, unfenced_slot_bytes = 0,
           lamport_blocks = 0;
 
-  int64_t signals_bytes = 0, unfenced_bytes = 0, lamport_bytes = 0,
-          inbox_bytes = 0;
+  int64_t unfenced_bytes = 0, lamport_bytes = 0, inbox_bytes = 0,
+          counters_bytes = 0;
 
-  uint32_t* signals = nullptr;
   char* unfenced = nullptr;
   // Lamport's inbox, LL's rows but lamport_blocks of them a bank, all data;
   // its every position is the sentinel until its data arrives.
   char* lamport = nullptr;
-  // simple_write's inbox and simple_read's, each Lamport's rows in one bank.
-  // A protocol owns its buffers, counters and steps and touches no
-  // other protocol's, so any order of calls across protocols is safe.
-  char* simple_write_inbox = nullptr;
-  char* simple_read_inbox = nullptr;
+  // simple_write's buffer and simple_read's, one each: its inbox (Lamport's
+  // rows in one bank, inbox_bytes) then its counters (COUNTERS,
+  // kernels/common/types.cuh; [tail, head][block][peer], counters_bytes).
+  // A protocol owns its buffer and its steps and touches no other
+  // protocol's, so any order of calls across protocols is safe.
+  char* simple_write = nullptr;
+  char* simple_read = nullptr;
 
-  uint32_t* const* signals_ptr_array = nullptr;
-  // Each rank's simple_write counters and its simple_read counters (COUNTERS,
-  // kernels/common/types.cuh), in its signals, a region each:
-  // [tail, head][block][peer].
+  // Each rank's simple_write counters and its simple_read counters, in its
+  // buffer of that protocol.
   uint32_t* const* simple_write_counters_ptr_array = nullptr;
   uint32_t* const* simple_read_counters_ptr_array = nullptr;
   char* const* unfenced_ptr_array = nullptr;
