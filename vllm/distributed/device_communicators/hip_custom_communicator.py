@@ -19,6 +19,7 @@ from types import FrameType
 from typing import Any, ClassVar, Literal, cast, final, get_args
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm.logger import init_logger
@@ -387,6 +388,9 @@ class Lifecycle:
     status: Status = "closed"
     error: Error | None = None
     detail: str = ""
+    # What a capture recorded, a line a launch: every rank must record the
+    # same, or a replay's rounds do not meet.
+    captured: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     teardown: threading.Lock = field(default_factory=threading.Lock)
 
@@ -872,6 +876,8 @@ class HipCustomCommunicator:
                 f"an exact communicator given an INT4 config: {config}"
             )
 
+        if capturing:
+            self.lifecycle.captured.append(f"all_reduce {config}")
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
             state=self.state.handle,
             input=input,
@@ -984,6 +990,8 @@ class HipCustomCommunicator:
                 f"an exact communicator given an INT4 config: {config}"
             )
 
+        if torch.cuda.is_current_stream_capturing():
+            self.lifecycle.captured.append(f"all_reduce_add_rms_norm {add} {config}")
         error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             state=self.state.handle,
             input=input,
@@ -1134,6 +1142,10 @@ class HipCustomCommunicator:
             )
 
         block_output = blocks[:, write_index] if write_index >= 0 else None
+        if torch.cuda.is_current_stream_capturing():
+            self.lifecycle.captured.append(
+                f"all_reduce_add_attn_res_rms_norm {write_index} {config}"
+            )
         error = (
             torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
                 state=self.state.handle,
@@ -1179,18 +1191,30 @@ class HipCustomCommunicator:
                     f"capture_not_open: capture() while {self.lifecycle.status}"
                 )
             self.lifecycle.status = "capturing"
+            self.lifecycle.captured = []
         raised: BaseException | None = None
         try:
             yield
         except BaseException as e:
             raised = e
+        # Every rank recorded the same launches, or the graph's replays would
+        # wait on rounds a peer never runs.
+        everyone: list[list[str] | None] = [None] * self.arguments.world
+        dist.all_gather_object(
+            everyone, self.lifecycle.captured, group=self.arguments.cpu_group
+        )
+        disagree = any(theirs != everyone[0] for theirs in everyone)
         refused = (
             isinstance(raised, RuntimeError)
             and str(raised).split(":")[0] in Error.__members__
             and not str(raised).startswith(Error.hip_failed.name)
         )
         why = (
-            None if raised is None or refused else f"{type(raised).__name__}: {raised}"
+            f"{Error.ranks_disagree.name}: the captured calls"
+            if disagree
+            else None
+            if raised is None or refused
+            else f"{type(raised).__name__}: {raised}"
         )
         life = self.lifecycle
         with life.lock:
@@ -1203,6 +1227,8 @@ class HipCustomCommunicator:
                 life.status = "open"
         if raised is not None:
             raise raised
+        if disagree:
+            raise RuntimeError(f"{Error.ranks_disagree.name}: the captured calls")
 
     @final
     def tuned(
