@@ -262,13 +262,13 @@ OpenWire hip_custom_communicator_open(const std::string& group, int64_t device,
 }
 
 // For the tests: views of the state the protocols keep from launch to launch,
-// this rank's Lamport inbox (bytes), the steps ([protocol][block][wave], STEPS)
-// and the Simple protocols' counters ([simple_write, simple_read][tail, head]
-// [block][peer], COUNTERS), so a test can check what every launch must leave:
-// the inbox all the sentinel, every slot of a block at one step and the steps
-// equal on every rank, and every
-// counter of a block at its step (every round posted was read). No copy; the
-// views live as long as the communicator.
+// this rank's Lamport inbox (bytes), the steps ([protocol][block][wave],
+// STEPS), the Simple protocols' counters ([simple_write, simple_read][tail,
+// head] [block][peer], COUNTERS) and the status record (StatusField), so a test
+// can check what every launch must leave: the inbox all the sentinel, every
+// slot of a block at one step and the steps equal on every rank, every counter
+// of a block at its step (every round posted was read), and no wait given up.
+// No copy; the views live as long as the communicator.
 std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
   using namespace hip_custom_communicator;
   using namespace hip_custom_communicator::internal;
@@ -282,6 +282,8 @@ std::vector<torch::Tensor> hip_custom_communicator_inspect(int64_t state) {
                        on.dtype(torch::kInt32)),
       torch::from_blob(s.symmetric.signals,
                        {2, 2, s.symmetric.max_blocks, int64_t{s.world}},
+                       on.dtype(torch::kInt32)),
+      torch::from_blob(s.status_device, {int64_t{kStatusFields}},
                        on.dtype(torch::kInt32)),
   };
 }

@@ -109,8 +109,8 @@ def _int4_sum(xs, config):
 
 
 def _inspect(comm):
-    """This rank's Lamport inbox, the protocols' steps and the Simple
-    protocols' counters, as views. Module-level, so ray ships the test's body
+    """This rank's Lamport inbox, the protocols' steps, the Simple protocols'
+    counters and the status record, as views. Module-level, so ray ships the test's body
     without torch.ops."""
     return torch.ops._rocm_C.hip_custom_communicator_inspect(comm.state.handle)
 
@@ -121,10 +121,20 @@ def _check_state(comm, group, where):
     re-armed); each protocol's steps, a slot a block and wave, at one step a
     block (whatever the launch's block size) and equal on every rank; and each
     Simple protocol's counters, tail and head for every block and peer, at that
-    block's step (every round posted was read)."""
+    block's step (every round posted was read); and no wait given up (a block
+    that gives up ends without its stores). Read between two barriers, so no
+    rank's next launch posts into what is read."""
     torch.accelerator.synchronize()
     dist.barrier(group=group.cpu_group)
-    inbox, steps, counters = _inspect(comm)
+    inbox, steps, counters, status = (t.clone() for t in _inspect(comm))
+    torch.accelerator.synchronize()
+    dist.barrier(group=group.cpu_group)
+    fields = ("abort", "state", "where", "rank", "block", "peer", "count", "want")
+    assert int(status[1]) == 0, (
+        where,
+        "a wait given up",
+        dict(zip(fields, status.tolist())),
+    )
     assert bool((inbox == 0xFF).all()), (where, "inbox armed")
     assert torch.equal(steps, steps[:, :, :1].expand_as(steps)), (
         where,
@@ -204,8 +214,8 @@ def test_all_reduce_correctness(monkeypatch, tp_size, quantization):
                         want = _int4_sum(xs, used).to(dtype)
                     else:
                         want = summed
-                    _compare(got, want, used, (rows, dtype), exact=True)
                     _check_state(comm, group, (rows, dtype, used))
+                    _compare(got, want, used, (rows, dtype), exact=True)
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 
@@ -269,11 +279,11 @@ def test_one_shot_every_build(monkeypatch, tp_size, quantization):
                             want = _int4_sum(xs, config).to(dtype)
                         else:
                             want = summed
+                        _check_state(comm, group, where)
                         _compare(got, want, config, where, exact=True)
                         if first is None:
                             first = got
                         assert torch.equal(got, first), (where, "bits differ")
-                        _check_state(comm, group, where)
 
     _on_ranks(monkeypatch, tp_size, quantization, body)
 
