@@ -10,6 +10,14 @@ namespace hip_custom_communicator {
 
 namespace internal {
 
+// Whether a receiver's head, polled before a Simple send, is where the protocol
+// can have it: the block's last round, or the one before it (still being read).
+// The rounds run 0, 1, 2, ... kLastStep, then 3 again (COUNTERS), so before 3
+// is 2 the first time and kLastStep after.
+DINLINE bool head_in_reach(uint32_t seen, uint32_t last) {
+  return seen == last || seen == last - 1u || (last == 3u && seen == kLastStep);
+}
+
 // A Simple send: a store into the peer's memory, in any layout.
 template <int WORLD, int TILE_M, int BLOCK_X, int BLOCK_Y, int WAVE_SIZE,
           bool QUANTIZE_INT4, Layout LAYOUT, bool TAIL, typename INPUT,
@@ -875,6 +883,8 @@ DINLINE void send_simple_write(
     for (uint32_t n = 1;; ++n) {
       const uint32_t seen =
           __scoped_atomic_load_n(head, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && !head_in_reach(seen, last))
+        internal::check_failed();
       if (__builtin_amdgcn_ballot_w64(seen != last) == 0) break;
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
@@ -968,6 +978,8 @@ DINLINE void send_simple_write(
     for (uint32_t n = 1;; ++n) {
       const uint32_t seen =
           __scoped_atomic_load_n(head, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && !head_in_reach(seen, last))
+        internal::check_failed();
       if (__builtin_amdgcn_ballot_w64(seen != last) == 0) break;
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
@@ -1063,6 +1075,8 @@ DINLINE void send_simple_read(
     for (uint32_t n = 1;; ++n) {
       const uint32_t seen =
           __scoped_atomic_load_n(head, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && !head_in_reach(seen, last))
+        internal::check_failed();
       if (__builtin_amdgcn_ballot_w64(seen != last) == 0) break;
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
@@ -1163,6 +1177,8 @@ DINLINE void send_simple_read(
         const uint32_t v =
             __scoped_atomic_load_n(counter(output_slot, Counter::head, reader),
                                    __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && !head_in_reach(v, last))
+          internal::check_failed();
         if (v != last) missing = true, seen = v, peer = reader;
       }
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;

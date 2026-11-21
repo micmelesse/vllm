@@ -1407,6 +1407,8 @@ DINLINE void recv_simple_write(
     for (uint32_t n = 1;; ++n) {
       const uint32_t seen =
           __scoped_atomic_load_n(tail, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && seen != last && seen != next)
+        internal::check_failed();
       if (__builtin_amdgcn_ballot_w64(seen != next) == 0) break;
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
@@ -1511,6 +1513,8 @@ DINLINE void recv_simple_write(
         const uint32_t v =
             __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
                                    __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && v != last && v != next)
+          internal::check_failed();
         if (v != next) missing = true, seen = v;
       }
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
@@ -1615,6 +1619,8 @@ DINLINE void recv_simple_read(
     for (uint32_t n = 1;; ++n) {
       const uint32_t seen =
           __scoped_atomic_load_n(tail, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && seen != last && seen != next)
+        internal::check_failed();
       if (__builtin_amdgcn_ballot_w64(seen != next) == 0) break;
       if ((n & 255u) != 0) continue;
       const uint64_t waited = wall_clock64() - t0;
@@ -1717,6 +1723,8 @@ DINLINE void recv_simple_read(
         const uint32_t v =
             __scoped_atomic_load_n(mine + offset(Counter::tail, input_slot + c),
                                    __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && v != last && v != next)
+          internal::check_failed();
         if (v != next) missing = true, seen = v;
       }
       if (__builtin_amdgcn_ballot_w64(missing) == 0) break;
